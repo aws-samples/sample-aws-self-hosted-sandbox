@@ -1,0 +1,45 @@
+# Claude Code 沙盒 Pod —— 跑在 Kata microVM 里(验 H3)
+# 用法:envsubst < sandbox.yaml | kubectl apply -f -   (替换 ACCT/REGION)
+# 或手动把 <ACCT>/<REGION> 替成实际值。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: claude-sbx-1
+  labels: { app: claude-sbx, sandboxId: "1" }
+spec:
+  runtimeClassName: kata-clh        # ← 关键:跑在 microVM 里(arm64 不行则回退 kata-qemu)
+  nodeSelector: { sandbox: "true" }
+  containers:
+  - name: agent
+    image: ACCT.dkr.ecr.REGION.amazonaws.com/claude-sbx:poc
+    command: ["sleep", "infinity"]
+    ports:
+    - { containerPort: 8080 }
+    env:
+    - { name: CLAUDE_CODE_USE_BEDROCK, value: "1" }
+    - { name: AWS_REGION, value: "us-east-1" }
+    - { name: ANTHROPIC_MODEL, value: "us.anthropic.claude-opus-4-8" }
+    # 节点已挂 Bedrock IAM 角色,沙盒走节点凭据链(POC);生产改 IRSA / 出口代理,凭据不进沙盒
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbx-1
+spec:
+  type: ClusterIP                   # 不是 LoadBalancer —— 外部暴露统一走共享 ingress
+  selector: { sandboxId: "1" }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sbx-1-ing
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: 8080-sbx1.sbx.example.com   # 端口-沙盒ID.域名(通配符子域名方案)
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: { service: { name: sbx-1, port: { number: 8080 } } }
