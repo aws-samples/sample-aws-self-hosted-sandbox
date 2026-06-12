@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook —— 提交前用 Claude 做 AI code review。
+# 此文件通过 scripts/install-hooks.sh 安装到 .git/hooks/pre-commit。
+#
+set -uo pipefail
+
+# 允许临时跳过：SKIP_CODE_REVIEW=1 git commit ...
+if [[ "${SKIP_CODE_REVIEW:-}" == "1" ]]; then
+  echo "[pre-commit] SKIP_CODE_REVIEW=1，跳过 AI code review。"
+  exit 0
+fi
+
+# 定位仓库根目录并调用审查脚本
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+REVIEW_SCRIPT="$REPO_ROOT/scripts/code-review.sh"
+
+if [[ ! -x "$REVIEW_SCRIPT" ]]; then
+  echo "[pre-commit] 未找到可执行的 $REVIEW_SCRIPT，跳过审查。" >&2
+  exit 0
+fi
+
+exec "$REVIEW_SCRIPT"
