@@ -2,6 +2,10 @@
 .DS_Store
 .idea/
 .vscode/
+*.bak
+
+# Tool runtime artifacts
+.playwright-mcp/
 
 # Python
 __pycache__/

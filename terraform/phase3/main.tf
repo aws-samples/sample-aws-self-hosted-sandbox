@@ -1,9 +1,9 @@
 # Phase 3 基础设施 —— EKS 集群 + Graviton .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c7g.metal 节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c6g.metal 节点组(打 sandbox=true label)。
 #       Kata 安装、RuntimeClass、ingress-nginx、ACM、测试 Pod 是集群内操作(kubectl/helm),不归此处。
 #
-# ⚠️ 计费:EKS 控制平面 $0.10/hr + c7g.metal 节点 $2.32/hr。用完务必 destroy。
+# ⚠️ 计费:EKS 控制平面 $0.10/hr + c6g.metal 节点 $2.32/hr。用完务必 destroy。
 #
 # 用法:
 #   terraform init

@@ -49,7 +49,7 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 
 | 用途 | 选型 | 说明 |
 |---|---|---|
-| **计算(裸金属)** | **Graviton .metal**:POC 用 `c7g.metal`(64 vCPU/128 GiB,~$2.32/hr*)或 `m7g.metal`(64 vCPU/256 GiB,~$2.61/hr*) | KVM 只在 `.metal` 暴露。Graviton(arm64)$/vCPU、$/GiB 最优,Claude Code(Node)原生跑 arm64。生产做密度可上 Graviton4 `m8g.metal-48xl`(192 vCPU/768 GiB) |
+| **计算(裸金属)** | **Graviton .metal**:POC 实测用 `c6g.metal`(64 vCPU/128 GiB,~$2.18/hr*);更新代可用 `c7g.metal`/`m7g.metal` | KVM 只在 `.metal` 暴露。Graviton(arm64)$/vCPU、$/GiB 最优,Claude Code(Node)原生跑 arm64。生产做密度可上 Graviton4 `m8g.metal-48xl`(192 vCPU/768 GiB) |
 | 编排(Phase 3) | **EKS** + `.metal` 托管节点组 + **Kata RuntimeClass** | K8s 接管调度/健康/扩缩,比自管 Nomad 轻 |
 | 节点 OS | **Amazon Linux 2023 (arm64)** 或 Bottlerocket | POC 用 AL2023 配合 `kata-deploy` 最直接 |
 | 自动扩缩 | Karpenter(生产) | POC 阶段手动管节点即可 |
@@ -57,7 +57,7 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 | 网络/任意端口 | VPC + **NLB**(L4,保留任意 TCP/UDP)+ 安全组 | ALB 仅 HTTP;任意端口须用 NLB |
 | 对象存储 | **S3** | JuiceFS 数据后端 + Firecracker 快照存储 |
 | JuiceFS 元数据 | **ElastiCache for Redis**(POC 可先用单机 Redis 容器) | JuiceFS 需独立元数据引擎 |
-| 块存储 | 本地 NVMe(`i` 系列 .metal)或 **EBS gp3** | rootfs / 快照暂存。`c7g.metal` 无本地盘,用 EBS gp3 |
+| 块存储 | 本地 NVMe(`i` 系列 .metal)或 **EBS gp3** | rootfs / 快照暂存。`c6g.metal` 无本地盘,用 EBS gp3 |
 
 > *价格为 us-east-1 按需近似值,做成本模型前请用 AWS Pricing / vantage.sh 复核当前值与所选区域可用性。
 
@@ -75,11 +75,11 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 │  /workspace   ← 本地 ext4 目录(POC 阶段)           │
 │               用户项目/数据,直接落在 rootfs 盘上     │
 └─────────────────────────────────────────┘
-        宿主块存储:c7g.metal 无本地 NVMe → 用 EBS gp3
+        宿主块存储:c6g.metal 无本地 NVMe → 用 EBS gp3
 ```
 
 - **rootfs 与 workspace 都放本地 ext4**:Claude Code 二进制、Node、编译器、用户项目全在本地盘 —— 启动快、I/O 行为与裸机一致、无外部依赖。
-- 宿主块存储:`c7g.metal` 无本地 NVMe,POC 用 **EBS gp3**(文档 Phase 0 已挂 200 GiB)即可;若需更高 IOPS / 本地盘,可换 `i` 系列 .metal。
+- 宿主块存储:`c6g.metal` 无本地 NVMe,POC 用 **EBS gp3**(文档 Phase 0 已挂 200 GiB)即可;若需更高 IOPS / 本地盘,可换 `i` 系列 .metal。
 - microVM 自带完整内核,本地 ext4 上的 inotify、ulimit、fork/exec 等行为天然与裸机一致,不会出现普通容器的偏差。
 
 **H2(后续可选)—— 对齐客户 JuiceFS + S3 架构:**
@@ -120,13 +120,13 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 export AWS_REGION=us-east-1
 export AZ=us-east-1a
 export KEY_NAME=claude-sbx-poc
-export METAL_TYPE=c7g.metal          # POC 主力;需更多内存用 m7g.metal
+export METAL_TYPE=c6g.metal          # POC 实测机型;更新代可用 c7g.metal/m7g.metal
 
 # 0.2 检查 .metal 服务配额(On-Demand 标准实例 vCPU 配额,代码 L-1216C47A)
 aws service-quotas get-service-quota \
   --service-code ec2 --quota-code L-1216C47A --region $AWS_REGION \
   --query 'Quota.Value'
-# c7g.metal=64 vCPU。若配额不足,提 quota increase(可能需要 1–2 天审批)
+# c6g.metal=64 vCPU。若配额不足,提 quota increase(可能需要 1–2 天审批)
 
 # 0.3 创建密钥对
 aws ec2 create-key-pair --key-name $KEY_NAME \
@@ -189,15 +189,23 @@ firecracker --version
 
 #### 1.4 准备 guest 内核(aarch64)
 
+> ⚠️ **实测结论(2026-06-12,坐实 R3):Firecracker CI 默认内核【没有】编 FUSE。**
+> guest 内 `# CONFIG_FUSE_FS is not set` → `/dev/fuse` 不存在 → JuiceFS / s3fs / mountpoint-s3
+> 任何 FUSE 文件系统在 guest 内**全部挂不上**(`fusermount: fuse device not found`)。
+> **所以只要 workspace 要用 JuiceFS/S3,必须自编带 FUSE 的 guest 内核**——这不是可选项。
+
 ```bash
-# 方式 A(最快):用 Firecracker CI 提供的内核(确认 arch=aarch64)
-# 参见 https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
-# 该文档提供从 S3 CI 桶拉取 vmlinux 的 spec 脚本。
-# 方式 B(可控):自行 make,启用 FUSE/overlay/cgroup/inotify 等(生产推荐自编内核)
-# POC 先用方式 A 拿到 vmlinux-aarch64,放到 ~/vmlinux
+# 方式 A(仅当 workspace 用本地 ext4、不挂任何 FUSE 时可用):CI 内核
+#   curl -fL https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223 -o vmlinux
+#   ⚠️ 此内核无 FUSE,挂不了 JuiceFS
+
+# 方式 B(推荐,JuiceFS 场景必需):自编带 FUSE/overlay/inotify 的内核
+#   bash scripts/build-fuse-kernel.sh   # 产出 /opt/sbx/vmlinux-fuse
+#   实测:c6g.metal 64 核 native 编译仅几分钟;启动后 /dev/fuse 正常、JuiceFS 可挂
 ```
 
-> ⚠️ 必须确认内核启用:`CONFIG_FUSE_FS`(挂 JuiceFS)、`CONFIG_OVERLAY_FS`、cgroup v2、`CONFIG_INOTIFY_USER`。CI 默认内核通常已带,Phase 2 前请 `zcat /proc/config.gz | grep -E 'FUSE|OVERLAY|INOTIFY'` 复核。
+> `scripts/setup-host.sh` 默认走方式 B(自动编 FUSE 内核);设 `SKIP_FUSE_KERNEL=1` 回退方式 A。
+> 复核 config:`grep -E 'CONFIG_FUSE_FS=|CONFIG_OVERLAY_FS=|CONFIG_INOTIFY_USER=' .config`(应均为 `=y`)。
 
 #### 1.5 构建带 Claude Code 的 rootfs(arm64)
 
@@ -618,7 +626,7 @@ curl -fsSL https://get.docker.com | sh && sudo docker run --rm hello-world
 
 ## 5. 压力测试步骤(验 H4:密度/启动/快照)
 
-> 目标数据:单台 `c7g.metal` 能稳定承载多少并发 Claude Code microVM、冷启动与快照恢复延迟、超售 vCPU 下的表现。这些直接喂给成本模型。
+> 目标数据:单台 `c6g.metal` 能稳定承载多少并发 Claude Code microVM、冷启动与快照恢复延迟、超售 vCPU 下的表现。这些直接喂给成本模型。
 
 ### 5.1 并发密度(按内存装箱、超售 vCPU)
 ```bash
@@ -664,7 +672,7 @@ eksctl delete cluster --name claude-sbx --region $AWS_REGION
 aws s3 rb s3://$SBX_BUCKET --force
 aws ec2 delete-security-group --group-id $SG_ID
 ```
-- 省钱建议:Phase 1/2 在**同一台** `c7g.metal` 上做完再开 Phase 3 的 EKS;不并行开多台 .metal。
+- 省钱建议:Phase 1/2 在**同一台** `c6g.metal` 上做完再开 Phase 3 的 EKS;不并行开多台 .metal。
 - 生产成本模型:Graviton .metal + Savings Plan/RI 覆盖稳态基线、快照回收空闲内存、Spot 仅用于可恢复层。
 
 ---
@@ -673,9 +681,9 @@ aws ec2 delete-security-group --group-id $SG_ID
 
 | # | 事项 | 影响 | 建议 |
 |---|---|---|---|
-| R1 | **JuiceFS(FUSE)上的 inotify/文件监听是否可靠** | 直接决定能否沿用客户 JuiceFS 架构 | Phase 2 用真实 dev server HMR 实测;若不行,workspace 改本地盘 + 异步同步 S3 |
-| R2 | Kata + Cloud Hypervisor 在 **arm64** 的成熟度 | 影响 Phase 3 后端选择 | 先试 `kata-clh`,不稳则回退 `kata-qemu`(保真度相同) |
-| R3 | guest 内核 config(FUSE/overlay/cgroup/inotify) | 决定 JuiceFS / nested docker 能否用 | 用 CI 内核先验,生产自编内核固化 config |
+| R1 | ~~JuiceFS 上 inotify/重 I/O 是否可靠~~ **已部分实测(见 `文件系统方案对比.md` §二点五)** | 决定能否沿用客户 JuiceFS 架构 | ✅ 真实 npm install 在调优 JuiceFS 上**成功**,慢 ~4.5×(18s vs 本地 4s);基础 inotify 触发 ✅。**仍需验:dev server HMR 大量文件持续监听** |
+| R2 | ~~Kata + Cloud Hypervisor 在 arm64 成熟度~~ **已实测:kata-clh 默认未注册,回退 kata-qemu 成功** | 影响 Phase 3 后端选择 | ✅ `kata-qemu` 在 arm64 跑通(保真度同 clh);要 clh 需在 kata-deploy 显式启用 clh shim(见 `Kata快照定位机制.md`) |
+| R3 | ~~guest 内核 config~~ **已实测坐实:Firecracker CI 内核【无 FUSE】,JuiceFS 挂不上** | 决定 JuiceFS / FUSE 能否用 | ✅ **必须自编 FUSE 内核**(`scripts/build-fuse-kernel.sh`,几分钟);已验证带 FUSE 后 JuiceFS 可挂 |
 | R4 | ~~Claude Code 鉴权方式~~ **已确认:POC 用 Bedrock(API key 或 IAM Role);客户生产用自有网关管理 key** | 影响沙盒凭据注入设计 | ✅ POC 见 1.8;生产凭据由网关注入,不进沙盒 |
 | R5 | ~~镜像/工具链 arm64-clean~~ **已确认:假设无 amd64-only 依赖,只需兼容 Claude Code** | 全 Graviton,无需 x86 池 | ✅ 已确认;Phase 1 构建若暴露 amd64 依赖再调整 |
 | R6 | .metal 服务配额与区域可用性 | 影响压测规模与排期 | Phase 0 提前申请 quota(us-east-1) |

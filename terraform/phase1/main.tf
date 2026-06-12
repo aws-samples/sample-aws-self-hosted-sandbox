@@ -37,7 +37,7 @@ variable "az" {
 
 variable "metal_instance_type" {
   type    = string
-  default = "c7g.metal" # Graviton 64 vCPU / 128 GiB。需更多内存改 m7g.metal(256 GiB)
+  default = "c6g.metal" # Graviton 64 vCPU / 128 GiB。需更多内存改 m7g.metal(256 GiB)
 }
 
 variable "my_ip_cidr" {
@@ -200,14 +200,20 @@ resource "aws_instance" "host" {
     volume_type = "gp3"
   }
 
-  # 开机装好 Firecracker / docker 依赖,省去手动步骤(详见 POC 文档 1.3–1.7)
+  # 开机装好 docker/git 依赖。.metal 的 cloud-init 偶发不可靠(实测有一次没装上 docker),
+  # 故加重试 + 落完成标记;setup-host.sh 里也会再次防御性安装 docker(双保险)。
   user_data = <<-EOF
     #!/bin/bash
-    set -eux
-    dnf install -y docker git
-    systemctl enable --now docker
+    set -ux
+    for i in 1 2 3 4 5; do
+      dnf install -y docker git && break || sleep 15
+    done
+    systemctl enable --now docker || true
+    for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break; sleep 3; done
+    docker version > /var/log/userdata-docker.log 2>&1 || echo "WARN: docker 未就绪(setup-host.sh 会补装)"
     # 校验 KVM(关键前提)
-    ls -l /dev/kvm || echo "WARN: /dev/kvm missing — 选错实例?必须是 .metal"
+    ls -l /dev/kvm > /var/log/userdata-kvm.log 2>&1 || echo "WARN: /dev/kvm missing — 选错实例?必须是 .metal"
+    touch /var/log/userdata-done
   EOF
 
   tags = { Name = "claude-sbx-host" }
