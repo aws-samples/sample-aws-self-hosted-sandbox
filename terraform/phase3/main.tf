@@ -1,13 +1,13 @@
 # Phase 3 基础设施 —— EKS 集群 + Graviton .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c7g.metal 节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c6g.metal 节点组(打 sandbox=true label)。
 #       Kata 安装、RuntimeClass、ingress-nginx、ACM、测试 Pod 是集群内操作(kubectl/helm),不归此处。
 #
-# ⚠️ 计费:EKS 控制平面 $0.10/hr + c7g.metal 节点 $2.32/hr。用完务必 destroy。
+# ⚠️ 计费:EKS 控制平面 $0.10/hr + c6g.metal 节点 $2.32/hr。用完务必 destroy。
 #
 # 用法:
 #   terraform init
-#   terraform apply
+#   terraform apply -var='endpoint_public_access_cidrs=["'$(curl -s https://checkip.amazonaws.com)'/32"]'
 #   aws eks update-kubeconfig --name claude-sbx --region us-east-1
 #   kubectl get nodes
 #
@@ -39,7 +39,12 @@ variable "cluster_name" {
 
 variable "metal_instance_type" {
   type    = string
-  default = "c7g.metal" # Graviton 裸金属,KVM 可用,Kata 才能跑
+  default = "c6g.metal" # Graviton 裸金属,KVM 可用,Kata 才能跑
+}
+
+variable "endpoint_public_access_cidrs" {
+  type        = list(string)
+  description = "允许访问 EKS 公网 API endpoint 的来源 CIDR(必填,无默认值以避免误开全网)。收窄到自己的 IP,apply 时传入:terraform apply -var='endpoint_public_access_cidrs=[\"'$(curl -s https://checkip.amazonaws.com)'/32\"]'"
 }
 
 # ---------- VPC(EKS 专用,3 AZ;裸金属在多 AZ 提高可得性) ----------
@@ -56,8 +61,8 @@ module "vpc" {
 
   # POC:禁用 NAT(此共享账号 EIP 配额已被占满,AllocateAddress 会失败)。
   # 节点组改放公有子网 + 自动分配公网 IP,直接出网,无需 NAT。
-  enable_nat_gateway   = false
-  enable_dns_hostnames = true
+  enable_nat_gateway      = false
+  enable_dns_hostnames    = true
   map_public_ip_on_launch = true
 
   # EKS + NLB(ingress)所需子网标签
@@ -80,6 +85,8 @@ module "eks" {
   cluster_version = "1.31"
 
   cluster_endpoint_public_access = true
+  # 收窄到指定 CIDR;留空时模块默认 0.0.0.0/0(对全网开放)——生产/共享账号务必传入自己的 IP。
+  cluster_endpoint_public_access_cidrs     = var.endpoint_public_access_cidrs
   enable_cluster_creator_admin_permissions = true
 
   vpc_id = module.vpc.vpc_id

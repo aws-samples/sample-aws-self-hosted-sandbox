@@ -1,8 +1,11 @@
-# POC 实测结果 —— H1 + H4(Phase 1)
+# POC 实测结果 —— H1 / H3 / H4 + 快照 + 文件系统
 
-> 实测日期:2026-06-11 · 区域:us-east-1 · 机型:`c7g.metal`(Graviton, 64 vCPU / 128 GiB)
-> 实例:`i-0beb3ffeb377b7990` · 基础设施由 `terraform/phase1` 创建
-> 验证方式:全程通过 AWS SSM(SSH 因出口 IP 与安全组不匹配未用,SSM 通道更安全)
+> 实测日期:2026-06-11 ~ 06-12 · 区域:us-east-1 · 验证方式:全程经 AWS SSM
+> 机型:H1/H4/快照初轮用 `c7g.metal`,H3/JuiceFS/跨机轮用 `c6g.metal`(两者同为 Graviton 64vCPU/128GiB,结论通用)
+> 基础设施由 `terraform/phase1`(单机)与 `terraform/phase3`(EKS)创建
+>
+> **相关专题文档**:文件系统对比见 `文件系统方案对比.md`;快照存储架构见 `快照存储架构.md`;
+> Kata 快照定位见 `Kata快照定位机制.md`。本文件汇总各轮实测的核心数字与结论。
 
 ## 一、H1 —— Claude Code 在 Firecracker microVM 内原生跑通(✅ 通过)
 
@@ -111,9 +114,33 @@
 4. **节点网络重建会让 Pod 短暂 NotReady**:Terraform 改子网/重建节点组时,运行中的节点会经历 unreachable→恢复;生产变更网络需滚动、避开业务高峰。
 5. **Kata Pod 需设 resources**:`BestEffort`(无 requests/limits)的 Kata Pod 实测不稳定(Exit 9 / CrashLoopBackOff);设明确 `requests/limits`(2vCPU/4Gi)后稳定 0 重启。沙盒模板必须带资源声明。
 
+## 四点六、H2 文件系统(JuiceFS)—— 已实测(详见 `文件系统方案对比.md`)
+
+在 microVM guest 内挂调优 JuiceFS(writeback+cache+buffer),对比本地 ext4:
+
+| 指标 | 调优 JuiceFS | 本地 ext4 | 差距 |
+|---|---|---|---|
+| **真实 npm install**(8依赖/7160文件) | ✅ **成功 18s** | ✅ 成功 4s | ~4.5× |
+| 纯小文件写 500×4k | 729 files/s | 24358 files/s | 33×(最差画像) |
+| inotify 基础触发 | ✅ 2 events | ✅ 2 events | 持平 |
+
+**两个关键发现:**
+1. **Firecracker CI 内核无 FUSE(坐实 R3)**:`# CONFIG_FUSE_FS is not set` → JuiceFS 挂不上。
+   自编带 FUSE 的 arm64 内核(`scripts/build-fuse-kernel.sh`,几分钟)后 JuiceFS 成功挂载。
+2. **真实 npm 只慢 ~4.5×(可接受),远小于纯小文件微基准的 33×**:writeback 把网络下载/解压/大文件
+   摊平了。**结论:JuiceFS+S3 跑 Claude Code 的 npm/build 可行**,代价约 4.5× 时间,换来"数据天然在 S3、
+   免 S3 同步、跨机/跨 AZ"。代价:必须维护 HA 元数据引擎(ElastiCache)。
+
+## 四点七、快照跨机 resume —— 已实测(详见 `快照存储架构.md`)
+
+模拟 A 机 suspend → 删除 A 机 → B 机从三件套(mem+snapshot+rootfs)独立 resume:
+- ✅ **成功**:内存计数(HB)与磁盘标记精确续上,resume ~9.8ms。
+- ⚠️ **关键坑**:Firecracker snapshot 硬编码磁盘**绝对路径**,跨机必须把 rootfs 放到**与 A 机一致的路径**
+  再 load(否则 `No such file or directory`)。生产要统一沙盒路径约定。
+
 ## 五、尚未验证(后续)
 
-- **H2**:JuiceFS + S3 上的 inotify/重 I/O(文档标注的最大不确定点)
-- **H4 完整**:真实 Claude Code 负载下的工作集峰值、快照 create/restore 延迟与空闲回收比例
-- **H3**:EKS + Kata(Cloud Hypervisor)在 arm64 的编排 + NLB/Ingress 任意端口暴露
-- **多租户凭据隔离**:宿主侧出口代理 / 每租户 STS 短期凭据(互不可信前提下的生产必做)
+- **dev server HMR 持续监听**:本轮只验了基础 inotify 触发;Vite/Next.js 大量文件持续监听需专门压。
+- **H4 完整密度**:真实 Claude Code 负载下的工作集峰值、diff 快照、空闲回收比例(本轮是空载密度)。
+- **多租户凭据隔离落地**:LiteLLM 网关 / 每租户 STS 短期凭据(见 `Workshop方案借鉴与优化.md` §1)。
+- **JuiceFS 元数据引擎 HA**:生产用 ElastiCache(多AZ),非 POC 的单机 Redis。

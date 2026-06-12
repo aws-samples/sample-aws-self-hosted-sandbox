@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -219,10 +220,32 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 静音默认日志
 
     def _read_body(self):
-        n = int(self.headers.get("Content-Length", 0))
+        # 容错:非法 Content-Length 当作 0;请求体非法 JSON 抛 ValueError,由 handler 兜底转 400/500。
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = 0
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
+    def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
+    def do_DELETE(self):
+        try:
+            self._do_DELETE()
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
+    def _do_GET(self):
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if path == "/sandboxes":
@@ -242,10 +265,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
-    def do_POST(self):
+    def _do_POST(self):
         path = urlparse(self.path).path
         if path == "/sandboxes":
-            sid = str(int(time.time()))[-6:]           # 简单唯一 ID
+            sid = uuid.uuid4().hex[:8]                  # 唯一 ID(避免同秒并发碰撞)
             rc, out, err = kubectl(["apply", "-f", "-"], stdin=sandbox_manifest(sid))
             if rc != 0:
                 return self._send(500, {"error": err})
@@ -264,7 +287,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
-    def do_DELETE(self):
+    def _do_DELETE(self):
         path = urlparse(self.path).path
         if path.startswith("/sandboxes/"):
             sid = path.split("/")[2]
