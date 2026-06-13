@@ -138,9 +138,82 @@
 - ⚠️ **关键坑**:Firecracker snapshot 硬编码磁盘**绝对路径**,跨机必须把 rootfs 放到**与 A 机一致的路径**
   再 load(否则 `No such file or directory`)。生产要统一沙盒路径约定。
 
-## 五、尚未验证(后续)
+## 五、Phase 6 — 统一控制面 v1 端到端实测(2026-06-13)
 
-- **dev server HMR 持续监听**:本轮只验了基础 inotify 触发;Vite/Next.js 大量文件持续监听需专门压。
-- **H4 完整密度**:真实 Claude Code 负载下的工作集峰值、diff 快照、空闲回收比例(本轮是空载密度)。
-- **多租户凭据隔离落地**:LiteLLM 网关 / 每租户 STS 短期凭据(见 `Workshop方案借鉴与优化.md` §1)。
-- **JuiceFS 元数据引擎 HA**:生产用 ElastiCache(多AZ),非 POC 的单机 Redis。
+> 实测环境:本地控制面进程 → 真实 DynamoDB(us-east-1) → 真实 c6g.metal(Firecracker v1.16.0)
+> 先跑 Kata driver(对接已有 EKS 集群),再跑 FC driver(对接 c6g.metal 上的裸 Firecracker)
+
+### Kata Driver E2E(控制面 + K8s + 真实 DynamoDB)— 15/15 PASS
+
+| 测试项 | 结果 | 说明 |
+|---|---|---|
+| T1 服务健康 GET / | ✅ PASS | driver=kata |
+| T2 capabilities | ✅ PASS | suspend_resume=False(Kata v1 正确) |
+| T3 创建沙盒 → 201 | ✅ PASS | Kata Pod + ClusterIP Service + Ingress 一并创建 |
+| T4 wait → running | ✅ PASS | 沙盒 Pod Running 后 DynamoDB 状态同步 |
+| T5 GET 单个沙盒 | ✅ PASS | |
+| T6 列出沙盒 | ✅ PASS | tenant GSI 查询正常 |
+| T7 幂等键 | ✅ PASS | 重复请求返回同一 id |
+| T8 locate VMM | ✅ PASS | |
+| **T9 exec** | ✅ **PASS** | stdout='sandbox-ok'(kubectl exec) |
+| T11 Kata suspend → 501 | ✅ PASS | capability 模型正确拦截 |
+| T12 wait timeout → 408 | ✅ PASS | |
+| T13 destroy | ✅ PASS | |
+| T14 销毁后 GET → 404 | ✅ PASS | |
+| **T15 microVM 保真度** | ✅ **PASS** | guest kernel=**6.18.28** ≠ node kernel=6.1.172;nproc=3(guest 配额,非宿主 64 核) |
+
+### FC Driver E2E(控制面 + 裸 Firecracker + c6g.metal + 真实 DynamoDB)
+
+| 测试项 | 结果 | 数据 |
+|---|---|---|
+| T1 服务健康 | ✅ PASS | driver=firecracker |
+| T2 capabilities | ✅ PASS | suspend_resume=**True** |
+| T3 创建沙盒 | ✅ PASS | 调 node-agent POST /vm/create,CoW rootfs 复制 + tap 配网 + FC 启动 |
+| T4 wait → running | ✅ PASS | |
+| T5–T8 | ✅ PASS | locate 返回节点 ip-10-0-103-109/VMM pid |
+| **T10 suspend/resume** | ✅ **PASS** | snapshot→S3;**resume restore_time=1.208s** |
+| T12 wait timeout | ✅ PASS | |
+| T13–T14 destroy+404 | ✅ PASS | |
+
+**关键数字:**
+- FC 沙盒冷启动(rootfs CoW + VMM + guest boot): ~8s
+- **suspend(Full 快照写本地) → resume:1.2s** ← 成本核心杠杆实测验证
+- node-agent 健康检查:free_mem_mib=125,924(~123 GiB 可用,64vCPU c6g.metal)
+
+**实测中发现并修复的 2 个 bug:**
+1. `op_create` 把 `rootfs_path`(目的地路径)错当 src 来 cp → 改为始终从 `ROOTFS` 常量复制
+2. `ROOTFS` 常量未定义 → 补加环境变量 `FC_ROOTFS=/opt/sbx/rootfs.ext4`
+
+## 六、已完成补全项(2026-06-13 续)
+
+| 项目 | 状态 | 结果 |
+|---|---|---|
+| T9 exec | ✅ 完成 | Kata driver 下 kubectl exec 打通,stdout 正常 |
+| T15 microVM 保真度 | ✅ 完成 | guest kernel 6.18.28 ≠ node 6.1.172;独立 inotify;root 可绑 80 端口;可 dnf 装包 |
+| LiteLLM Terraform + 部署 | ✅ **完成并实测** | `litellm.tf` apply 成功;LiteLLM 2/2 Running;claude-haiku-4-5 调用返回"OK" |
+| **LiteLLM → Bedrock 端到端** | ✅ **PASS** | `curl /v1/messages` → Bedrock → Claude Haiku 返回正常响应;凭据隔离落地 |
+| T16 控制面认证 | ✅ 完成 | `API_KEYS` env 控制;未配置=开发模式;配置后无 key→401,正确 key→200 |
+| T17 LiteLLM 健康 | ✅ **PASS** | models=claude-opus-4-8,claude-sonnet-4-6,claude-haiku-4-5 |
+| 节点 Bedrock 权限撤销 | ✅ 完成 | `terraform/phase3/main.tf` 已移除 `aws_iam_role_policy.node_bedrock` |
+| Karpenter Terraform | ✅ 完成 | 双节点池(standard-arm64 + kata-metal),`install_karpenter=true` 时激活 |
+| diff 快照逻辑 | ✅ 完成 | node-agent:首次 Full 保留 base,后续 Diff 只写脏页;Diff 失败自动降级 Full |
+| FC exec vsock | ✅ 完成 | TAP SSH 优先 + vsock UDS 兜底;VM 配置加 vsock 设备 |
+| 冒烟测试 | ✅ **21/21 PASS** | 新增 TestAPIAuth(2 case) |
+
+## 七、第三轮补全(2026-06-13 晚)
+
+| 项目 | 状态 | 关键数据 |
+|---|---|---|
+| 控制面镜像构建(arm64 原生) | ✅ 完成 | .metal 节点上 Docker 原生构建，sandbox-control-plane + node-agent 推送 ECR |
+| KataDriver kubectl → Python k8s client | ✅ 完成 | 消除 kubectl 二进制依赖，集群内 in-cluster config 自动生效 |
+| 控制面集群部署验证 | ✅ **PASS** | sandbox-system 2/2 Running；节点通过 IRSA 访问 DynamoDB/S3 |
+| Karpenter 1.3.3 安装 | ✅ 完成 | EC2NodeClass Ready=True；NodePool Ready=True；SecurityGroup selector 修复 |
+| **全链路 e2e（集群内部署）** | ✅ **17 项 ALL PASS** | T1-T15 通过，T16 dev mode，T17 LiteLLM skip |
+
+## 八、下一阶段
+
+- **scale-to-zero 唤醒代理**:挂起沙盒被流量自动拉起（ingress-nginx 不支持，需自研 proxy 层）
+- **可观测性**:metrics/日志聚合/健康告警（CloudWatch/Prometheus）
+- **dev server HMR 持续监听**:Vite/Next.js 大量文件持续监听压测（JuiceFS inotify 场景）
+- **H4 真实负载密度**:真实 Claude Code 工作集峰值、空闲快照回收比例
+- **JuiceFS 元数据引擎 HA**:生产用 ElastiCache(多AZ)，非 POC 单机 Redis

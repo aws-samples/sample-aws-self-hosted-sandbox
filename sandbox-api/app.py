@@ -1,303 +1,397 @@
 #!/usr/bin/env python3
 """
-最小沙盒控制平面 API(demo)—— 把 "创建/销毁/列出沙盒" 封装成 REST API。
-沙盒 = 一个带 runtimeClassName=kata-qemu 的 K8s Pod(跑进 microVM)+ Service + Ingress。
-后端用 kubectl(零依赖,纯标准库)。生产应换成 K8s client SDK 或 kubernetes-sigs/agent-sandbox CRD。
+统一沙盒控制面 API — v2
 
-接口:
-  POST   /sandboxes              创建沙盒 -> {id, url, status}
-  GET    /sandboxes              列出所有沙盒
-  GET    /sandboxes/{id}         查单个沙盒
-  GET    /sandboxes/{id}/locate  定位沙盒背后的 VMM(节点/进程/后端/socket)
-  DELETE /sandboxes/{id}         销毁沙盒
-  POST   /sandboxes/{id}/exec    在沙盒内执行命令(演示) body: {"cmd": "..."}
+后端通过 SandboxDriver Protocol 插拔:
+  SANDBOX_DRIVER=firecracker  → FirecrackerDriver(裸 FC + node-agent,支持 suspend/resume)
+  SANDBOX_DRIVER=kata         → KataDriver(EKS + Kata + K8s API)
 
-注:无 suspend/resume —— Kata 的 VMM(qmp.sock)被 kata-runtime 独占,外部不能直连做快照;
-   Kata-on-K8s 无 turnkey 快照(见 ../Kata快照定位机制.md)。快照能力见 fc_snapshot_api.py(裸 Firecracker)。
+接口(对齐 Fly Machines API):
+  POST   /sandboxes                    创建沙盒
+  GET    /sandboxes                    列出(按 tenant_id 过滤)
+  GET    /sandboxes/{id}               查单个
+  GET    /sandboxes/{id}/wait          等待状态(长轮询)
+  DELETE /sandboxes/{id}               销毁
+  POST   /sandboxes/{id}/suspend       挂起 + 快照
+  POST   /sandboxes/{id}/resume        从快照恢复
+  POST   /sandboxes/{id}/exec          在沙盒内执行命令
+  GET    /sandboxes/{id}/locate        定位 VMM(调试用)
+  GET    /capabilities                 当前 driver 能力
 
-跑: python3 app.py   (默认 :8000,用本地 kubeconfig 连 EKS)
+运行:
+  SANDBOX_DRIVER=firecracker FC_NODES=10.0.1.5 python3 app.py
+  SANDBOX_DRIVER=kata python3 app.py
 """
+from __future__ import annotations
+
 import json
 import os
-import subprocess
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-# ---- 配置 ----
-IMAGE = os.environ.get("SANDBOX_IMAGE", "<account-id>.dkr.ecr.<region>.amazonaws.com/claude-sbx:poc")
-RUNTIME_CLASS = "kata-qemu"          # 用哪个 Kata 后端(发动机);clh 注册后可换 kata-clh
-DOMAIN = "sbx.example.com"           # 通配符子域名根
-NAMESPACE = "default"
-APP_LABEL = "claude-sbx-api"         # 跟手动创建的沙盒区分开
+import boto3
+from botocore.exceptions import ClientError
 
+from sandbox_api import db
+from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
+from sandbox_api.warm_pool import WarmPool
 
-REGION = "us-east-1"
+# ---------- driver 选择 ----------
+_DRIVER_NAME = os.environ.get("SANDBOX_DRIVER", "kata").lower()
 
+if _DRIVER_NAME == "firecracker":
+    from sandbox_api.drivers.firecracker import FirecrackerDriver
+    _driver = FirecrackerDriver()
+else:
+    from sandbox_api.drivers.kata import KataDriver
+    _driver = KataDriver()
 
-def kubectl(args, stdin=None, timeout=120):
-    """调 kubectl,返回 (rc, stdout, stderr)。"""
-    p = subprocess.run(["kubectl", "-n", NAMESPACE, *args],
-                       input=stdin, capture_output=True, text=True, timeout=timeout)
-    return p.returncode, p.stdout.strip(), p.stderr.strip()
+_warm_pool = WarmPool(_DRIVER_NAME, _driver)
+_warm_pool.start_replenish_loop()
 
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
 
-# 节点侧定位脚本(经 SSM 在沙盒所在节点执行):podUID → sandbox ID → VMM 进程/后端/socket。
-# 与 snapshot-agent/locate.py 同源。注意:定位 ≠ 能直连 VMM 做快照(QMP 被 Kata 独占,见 Kata快照定位机制.md)。
-_NODE_PROBE = r'''
-PODUID="$1"
-SBID=$(sudo crictl pods -o json 2>/dev/null | python3 -c '
-import sys,json
-uid=sys.argv[1]
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(0)
-for p in d.get("items",[]):
-    if p.get("labels",{}).get("io.kubernetes.pod.uid")==uid:
-        print(p["id"]); break
-' "$PODUID" 2>/dev/null)
-[ -z "$SBID" ] && SBID=$(sudo pgrep -af containerd-shim-kata-v2 2>/dev/null | grep -oE '[-]id [a-f0-9]{64}' | awk '{print $2}' | head -1)
-VMM_LINE=$(sudo pgrep -af 'qemu-system|cloud-hypervisor|firecracker' 2>/dev/null | grep "$SBID" | head -1)
-VMM_PID=$(echo "$VMM_LINE" | awk '{print $1}')
-case "$VMM_LINE" in
-  *qemu-system*)      BACKEND=qemu; IFACE="QMP socket (Kata 独占,不可外部直连)";;
-  *cloud-hypervisor*) BACKEND=cloud-hypervisor; IFACE="CH HTTP API";;
-  *firecracker*)      BACKEND=firecracker; IFACE="Firecracker REST";;
-  *)                  BACKEND=unknown; IFACE="?";;
-esac
-VMDIR="/run/vc/vm/$SBID"
-SOCKETS=$(sudo ls "$VMDIR" 2>/dev/null | tr '\n' ',')
-python3 -c '
-import json,sys
-print(json.dumps({"sandbox_id":sys.argv[1],"vmm_pid":sys.argv[2],"backend":sys.argv[3],
-"snapshot_interface":sys.argv[4],"vm_runtime_dir":sys.argv[5],"sockets":sys.argv[6]}))
-' "$SBID" "$VMM_PID" "$BACKEND" "$IFACE" "$VMDIR" "$SOCKETS"
-'''
+# ---------- 认证 ----------
+# API_KEYS: 逗号分隔的有效 key 列表;为空则禁用认证(开发/测试用)
+# 生产通过 K8s Secret 注入,不在代码里硬编码
+_API_KEYS: set[str] = {
+    k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()
+}
+# 无需认证的路径(健康检查)
+_PUBLIC_PATHS = {"/", "/capabilities"}
 
 
-def _ssm_run(instance_id, podUID, timeout_polls=20):
-    """在节点上经 SSM 跑定位脚本,返回最后一行 JSON dict(失败返回 {})。"""
-    import base64, tempfile, os
-    b64 = base64.b64encode((_NODE_PROBE + "\n").encode()).decode()
-    one = f"echo {b64} | base64 -d > /tmp/_probe.sh && bash /tmp/_probe.sh {podUID}"
-    payload = {"InstanceIds": [instance_id], "DocumentName": "AWS-RunShellScript",
-               "Parameters": {"commands": [one]}}
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(payload, f); pf = f.name
+def _check_auth(handler: "Handler") -> bool:
+    """返回 True 表示通过;False 表示已发送 401 响应。"""
+    if not _API_KEYS:
+        return True  # 未配置 API_KEYS → 开发模式,跳过认证
+    path = urlparse(handler.path).path
+    if path in _PUBLIC_PATHS:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token in _API_KEYS:
+        return True
+    handler._send(401, {"error": "unauthorized", "hint": "Authorization: Bearer <api_key>"})
+    return False
+
+
+# ---------- 业务逻辑 ----------
+
+def create_sandbox(body: dict) -> tuple[int, dict]:
+    idem_key = body.get("idempotency_key")
+    if idem_key:
+        existing = db.get_by_idempotency_key(idem_key)
+        if existing:
+            return 200, existing
+
+    spec = SandboxSpec(
+        image    = body.get("image", os.environ.get("SANDBOX_IMAGE", "")),
+        cpu      = int(body.get("cpu", 2)),
+        mem_mib  = int(body.get("mem_mib", 4096)),
+        env      = body.get("env", {}),
+        services = [ServiceSpec(**s) for s in body.get("services", [])],
+        meta     = body.get("meta", {}),
+    )
+    tenant_id = body.get("tenant_id", "default")
+    sid       = uuid.uuid4().hex[:8]
+
+    record: dict = {
+        "id":               sid,
+        "tenant_id":        tenant_id,
+        "state":            "creating",
+        "driver":           _DRIVER_NAME,
+        "image":            spec.image,
+        "cpu":              spec.cpu,
+        "mem_mib":          spec.mem_mib,
+        "created_at":       db._utcnow(),
+        "updated_at":       db._utcnow(),
+        "meta":             spec.meta,
+    }
+    if idem_key:
+        record["idempotency_key"] = idem_key
+
+    db.put(record)
+
     try:
-        r = subprocess.run(["aws", "ssm", "send-command", "--region", REGION,
-                            "--cli-input-json", f"file://{pf}",
-                            "--query", "Command.CommandId", "--output", "text"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            return {"error": r.stderr.strip()}
-        cid = r.stdout.strip()
-        for _ in range(timeout_polls):
-            time.sleep(3)
-            g = subprocess.run(["aws", "ssm", "get-command-invocation", "--region", REGION,
-                               "--command-id", cid, "--instance-id", instance_id,
-                               "--query", "{s:Status,o:StandardOutputContent}", "--output", "json"],
-                              capture_output=True, text=True)
-            try: res = json.loads(g.stdout)
-            except Exception: continue
-            if res.get("s") in ("Success", "Failed"):
-                lines = [l for l in res.get("o", "").splitlines() if l.strip().startswith("{")]
-                return json.loads(lines[-1]) if lines else {"error": "node probe no output"}
-        return {"error": "ssm timeout"}
+        # 先尝试从暖池 resume(FC 模式 ~7ms);失败或不支持则冷建
+        claimed = _warm_pool.claim(sid, spec)
+        if not claimed:
+            driver_fields = _driver.create(sid, spec)
+            db.force_update(sid, {**driver_fields, "state": "running"})
+        db.write_event(sid, "created", "creating")
+        return 201, db.get(sid)
+    except Exception as e:
+        try:
+            db.force_update(sid, {"state": "failed", "error": str(e)})
+        except Exception:
+            pass
+        return 500, {"error": str(e)}
+
+
+def destroy_sandbox(sid: str) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+
+    lease_id = None
+    try:
+        lease_id = db.acquire_lease(sid)
+        prev = record["state"]
+        db.update_state(sid, "destroying", prev)
+        _driver.destroy(sid, record)
+        db.delete(sid)
+        db.write_event(sid, "destroyed", prev)
+        return 200, {"id": sid, "deleted": True}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return 409, {"error": "sandbox is locked by another operation"}
+        return 500, {"error": str(e)}
     finally:
-        os.unlink(pf)
+        if lease_id:
+            db.release_lease(sid, lease_id)
 
 
-def locate_sandbox(sid):
-    """由沙盒 id 定位到:节点 + VMM 进程 + 后端 + socket。继承自 snapshot-agent/locate.py。"""
-    rc, out, err = kubectl(["get", "pod", f"sbx-{sid}",
-                            "-o", "jsonpath={.spec.nodeName}|{.metadata.uid}|{.spec.runtimeClassName}"])
-    if rc != 0:
-        return {"error": err or "pod not found"}
-    node, uid, runtime_class = (out.split("|") + ["", "", ""])[:3]
-    info = {"id": sid, "node": node, "podUID": uid, "runtimeClass": runtime_class}
-    if not runtime_class.startswith("kata"):
-        info["note"] = f"非 Kata(runtimeClass={runtime_class}),无独立 VMM"
-        return info
-    # node(私有 DNS) → EC2 实例 ID
-    r = subprocess.run(["aws", "ec2", "describe-instances", "--region", REGION,
-                        "--filters", f"Name=private-dns-name,Values={node}",
-                        "Name=instance-state-name,Values=running",
-                        "--query", "Reservations[].Instances[].InstanceId", "--output", "text"],
-                       capture_output=True, text=True)
-    inst = r.stdout.strip()
-    info["ec2_instance"] = inst
-    if inst:
-        info.update(_ssm_run(inst, uid))
-    return info
+def suspend_sandbox(sid: str) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+
+    if not _driver.capabilities().suspend_resume:
+        return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
+
+    lease_id = None
+    try:
+        lease_id = db.acquire_lease(sid)
+        db.update_state(sid, "suspending", "running")
+        snap_info = _driver.suspend(sid, record)
+        db.update_state(sid, "suspended", "suspending", snap_info)
+        db.write_event(sid, "suspended", "running", snap_info)
+        return 200, db.get(sid)
+    except UnsupportedOperation as e:
+        return 501, {"error": str(e)}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return 409, {"error": "sandbox is not in running state or is locked"}
+        return 500, {"error": str(e)}
+    except Exception as e:
+        db.force_update(sid, {"state": "failed", "error": str(e)})
+        return 500, {"error": str(e)}
+    finally:
+        if lease_id:
+            db.release_lease(sid, lease_id)
 
 
-def sandbox_manifest(sid):
-    """一个沙盒 = Pod(kata microVM) + ClusterIP Service + Ingress(子域名 Host 路由)。"""
-    host = f"8080-{sid}.{DOMAIN}"
-    return f"""
-apiVersion: v1
-kind: Pod
-metadata:
-  name: sbx-{sid}
-  labels: {{ app: {APP_LABEL}, sandboxId: "{sid}" }}
-spec:
-  runtimeClassName: {RUNTIME_CLASS}
-  nodeSelector: {{ sandbox: "true" }}
-  containers:
-  - name: agent
-    image: {IMAGE}
-    # 主进程起 dev server 占位(代表沙盒内服务);真实场景是 Claude Code agent
-    command: ["sh","-c","echo \\"sandbox {sid} ready\\" > /tmp/index.html && cd /tmp && python3 -m http.server 8080"]
-    ports:
-    - {{ containerPort: 8080 }}
-    resources:
-      requests: {{ cpu: "1", memory: "2Gi" }}
-      limits: {{ cpu: "2", memory: "4Gi" }}
-    env:
-    - {{ name: CLAUDE_CODE_USE_BEDROCK, value: "1" }}
-    - {{ name: AWS_REGION, value: "us-east-1" }}
-    - {{ name: ANTHROPIC_MODEL, value: "us.anthropic.claude-opus-4-8" }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sbx-{sid}
-  labels: {{ app: {APP_LABEL} }}
-spec:
-  type: ClusterIP
-  selector: {{ sandboxId: "{sid}" }}
-  ports: [{{ port: 8080, targetPort: 8080 }}]
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: sbx-{sid}
-  labels: {{ app: {APP_LABEL} }}
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: {host}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend: {{ service: {{ name: sbx-{sid}, port: {{ number: 8080 }} }} }}
-"""
+def resume_sandbox(sid: str) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+
+    if not _driver.capabilities().suspend_resume:
+        return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
+
+    lease_id = None
+    try:
+        lease_id = db.acquire_lease(sid)
+        db.update_state(sid, "resuming", "suspended")
+        t0 = time.monotonic()
+        driver_fields = _driver.resume(sid, record)
+        restore_time  = round(time.monotonic() - t0, 4)
+        db.update_state(sid, "running", "resuming",
+                        {**driver_fields, "restore_time_s": str(restore_time)})
+        db.write_event(sid, "resumed", "suspended",
+                       {"restore_time_s": restore_time})
+        return 200, db.get(sid)
+    except UnsupportedOperation as e:
+        return 501, {"error": str(e)}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return 409, {"error": "sandbox is not in suspended state or is locked"}
+        return 500, {"error": str(e)}
+    except Exception as e:
+        db.force_update(sid, {"state": "failed", "error": str(e)})
+        return 500, {"error": str(e)}
+    finally:
+        if lease_id:
+            db.release_lease(sid, lease_id)
 
 
-def list_sandboxes():
-    rc, out, err = kubectl(["get", "pods", "-l", f"app={APP_LABEL}",
-                            "-o", "json"])
-    if rc != 0:
-        return []
-    items = json.loads(out).get("items", [])
-    result = []
-    for p in items:
-        sid = p["metadata"]["labels"].get("sandboxId", "?")
-        phase = p["status"].get("phase", "Unknown")
-        ready = any(c.get("ready") for c in p["status"].get("containerStatuses", []))
-        result.append({
-            "id": sid,
-            "status": phase,
-            "ready": ready,
-            "url": f"http://8080-{sid}.{DOMAIN}/",
-            "node": p["spec"].get("nodeName"),
-        })
-    return result
+def exec_sandbox(sid: str, cmd: str) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+    rc, stdout, stderr = _driver.exec(sid, record, cmd)
+    return (200 if rc == 0 else 500), {
+        "id": sid, "cmd": cmd, "rc": rc,
+        "stdout": stdout, "stderr": stderr,
+    }
 
+
+def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, dict]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        record = db.get(sid)
+        if not record:
+            return 404, {"error": "not found"}
+        if record["state"] == target_state or record["state"] == "failed":
+            return 200, record
+        time.sleep(1)
+    record = db.get(sid) or {}
+    return 408, {"error": "timeout", "current_state": record.get("state")}
+
+
+# ---------- HTTP handler ----------
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False, indent=2).encode()
+
+    def _send(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj, ensure_ascii=False, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *a):
-        pass  # 静音默认日志
+    def log_message(self, *_):
+        pass
 
-    def _read_body(self):
-        # 容错:非法 Content-Length 当作 0;请求体非法 JSON 抛 ValueError,由 handler 兜底转 400/500。
+    def _body(self) -> dict:
         try:
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
             n = 0
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+    def _parts(self) -> list[str]:
+        return urlparse(self.path).path.strip("/").split("/")
+
+    def _qs(self) -> dict:
+        return parse_qs(urlparse(self.path).query)
+
     def do_GET(self):
+        if not _check_auth(self):
+            return
         try:
-            self._do_GET()
+            self._handle_get()
         except Exception as e:
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
+        if not _check_auth(self):
+            return
         try:
-            self._do_POST()
+            self._handle_post()
         except Exception as e:
             self._send(500, {"error": str(e)})
 
     def do_DELETE(self):
+        if not _check_auth(self):
+            return
         try:
-            self._do_DELETE()
+            self._handle_delete()
         except Exception as e:
             self._send(500, {"error": str(e)})
 
-    def _do_GET(self):
-        path = urlparse(self.path).path
-        parts = path.strip("/").split("/")
-        if path == "/sandboxes":
-            self._send(200, {"sandboxes": list_sandboxes()})
-        elif len(parts) == 3 and parts[0] == "sandboxes" and parts[2] == "locate":
-            # 定位:沙盒 → 节点 + VMM 进程 + 后端 + socket(继承自 locate.py)
-            self._send(200, locate_sandbox(parts[1]))
-        elif path.startswith("/sandboxes/"):
-            sid = parts[1]
-            sb = [s for s in list_sandboxes() if s["id"] == sid]
-            self._send(200 if sb else 404, sb[0] if sb else {"error": "not found"})
-        elif path == "/":
-            self._send(200, {"service": "sandbox-api", "endpoints": [
-                "POST /sandboxes", "GET /sandboxes",
-                "GET /sandboxes/{id}", "GET /sandboxes/{id}/locate",
-                "DELETE /sandboxes/{id}", "POST /sandboxes/{id}/exec"]})
-        else:
-            self._send(404, {"error": "not found"})
+    def _handle_get(self):
+        p = self._parts()
 
-    def _do_POST(self):
-        path = urlparse(self.path).path
-        if path == "/sandboxes":
-            sid = uuid.uuid4().hex[:8]                  # 唯一 ID(避免同秒并发碰撞)
-            rc, out, err = kubectl(["apply", "-f", "-"], stdin=sandbox_manifest(sid))
-            if rc != 0:
-                return self._send(500, {"error": err})
-            self._send(201, {
-                "id": sid,
-                "status": "creating",
-                "url": f"http://8080-{sid}.{DOMAIN}/",
-                "note": "Pod(kata microVM)+Service+Ingress 已创建;几秒后 ready",
+        # GET /capabilities
+        if p == ["capabilities"]:
+            caps = _driver.capabilities()
+            return self._send(200, {
+                "driver": _DRIVER_NAME,
+                "suspend_resume": caps.suspend_resume,
+                "warm_pool": caps.warm_pool,
+                "migrate": caps.migrate,
             })
-        elif path.startswith("/sandboxes/") and path.endswith("/exec"):
-            sid = path.split("/")[2]
-            cmd = self._read_body().get("cmd", "echo no-cmd")
-            rc, out, err = kubectl(["exec", f"sbx-{sid}", "--", "sh", "-c", cmd])
-            self._send(200 if rc == 0 else 500,
-                       {"id": sid, "cmd": cmd, "stdout": out, "stderr": err, "rc": rc})
-        else:
-            self._send(404, {"error": "not found"})
 
-    def _do_DELETE(self):
-        path = urlparse(self.path).path
-        if path.startswith("/sandboxes/"):
-            sid = path.split("/")[2]
-            rc, out, err = kubectl(["delete", "pod,svc,ingress", "-l", f"sandboxId={sid}"])
-            self._send(200 if rc == 0 else 500,
-                       {"id": sid, "deleted": rc == 0, "detail": out or err})
-        else:
-            self._send(404, {"error": "not found"})
+        # GET /sandboxes
+        if p == ["sandboxes"]:
+            qs = self._qs()
+            tenant = (qs.get("tenant_id") or ["default"])[0]
+            return self._send(200, {"sandboxes": db.list_by_tenant(tenant)})
+
+        if len(p) >= 2 and p[0] == "sandboxes":
+            sid = p[1]
+
+            # GET /sandboxes/{id}/wait?state=running&timeout=30
+            if len(p) == 3 and p[2] == "wait":
+                qs      = self._qs()
+                target  = (qs.get("state") or ["running"])[0]
+                timeout = int((qs.get("timeout") or ["30"])[0])
+                code, result = wait_sandbox(sid, target, timeout)
+                return self._send(code, result)
+
+            # GET /sandboxes/{id}/locate
+            if len(p) == 3 and p[2] == "locate":
+                record = db.get(sid)
+                if not record:
+                    return self._send(404, {"error": "not found"})
+                state = _driver.get_runtime_state(sid, record)
+                return self._send(200, {**record, "runtime_state": state})
+
+            # GET /sandboxes/{id}
+            record = db.get(sid)
+            if record:
+                return self._send(200, record)
+            return self._send(404, {"error": "not found"})
+
+        # GET /
+        self._send(200, {
+            "service": "sandbox-control-plane",
+            "driver":  _DRIVER_NAME,
+            "endpoints": [
+                "POST   /sandboxes",
+                "GET    /sandboxes",
+                "GET    /sandboxes/{id}",
+                "GET    /sandboxes/{id}/wait?state=running&timeout=30",
+                "DELETE /sandboxes/{id}",
+                "POST   /sandboxes/{id}/suspend",
+                "POST   /sandboxes/{id}/resume",
+                "POST   /sandboxes/{id}/exec",
+                "GET    /sandboxes/{id}/locate",
+                "GET    /capabilities",
+            ],
+        })
+
+    def _handle_post(self):
+        p = self._parts()
+
+        # POST /sandboxes
+        if p == ["sandboxes"]:
+            code, result = create_sandbox(self._body())
+            return self._send(code, result)
+
+        if len(p) == 3 and p[0] == "sandboxes":
+            sid    = p[1]
+            action = p[2]
+
+            if action == "suspend":
+                code, result = suspend_sandbox(sid)
+                return self._send(code, result)
+
+            if action == "resume":
+                code, result = resume_sandbox(sid)
+                return self._send(code, result)
+
+            if action == "exec":
+                cmd = self._body().get("cmd", "echo no-cmd")
+                code, result = exec_sandbox(sid, cmd)
+                return self._send(code, result)
+
+        self._send(404, {"error": "not found"})
+
+    def _handle_delete(self):
+        p = self._parts()
+        if len(p) == 2 and p[0] == "sandboxes":
+            code, result = destroy_sandbox(p[1])
+            return self._send(code, result)
+        self._send(404, {"error": "not found"})
 
 
 if __name__ == "__main__":
-    print("沙盒 API 在 http://127.0.0.1:8000 (Ctrl-C 退出)")
-    ThreadingHTTPServer(("127.0.0.1", 8000), Handler).serve_forever()
+    print(f"控制面 API [{_DRIVER_NAME} driver] 在 http://{LISTEN_HOST}:{LISTEN_PORT}")
+    ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()

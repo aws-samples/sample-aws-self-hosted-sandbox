@@ -97,11 +97,12 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 | 阶段 | 目标 | 产出 | 预估时长 |
 |---|---|---|---|
 | Phase 0 | 账号/配额/网络准备 | VPC、配额、密钥、IAM | 0.5 天 |
-| **Phase 1** | 单 .metal 裸 Firecracker + Claude Code,**全本地 ext4**(验 H1) | 能跑真实任务的 microVM + 保真度报告 | 1–2 天 |
-| Phase 2(可选) | JuiceFS + S3 文件系统(验 H2,H1 通过后再做) | workspace 落 S3,含 inotify/性能结论 | 1 天 |
-| Phase 3 | EKS + Kata 编排 + 任意端口(验 H3) | 沙盒 Pod + NLB 暴露端口 | 2–3 天 |
-| Phase 4 | 功能与保真度测试 | 测试清单结果 | 与上重叠 |
-| Phase 5 | 密度/启动/快照压测(验 H4) | 密度与成本数据 | 1–2 天 |
+| **Phase 1** | 单 .metal 裸 Firecracker + Claude Code,**全本地 ext4**(验 H1) | 能跑真实任务的 microVM + 保真度报告 ✅ 已完成 | 1–2 天 |
+| Phase 2(可选) | JuiceFS + S3 文件系统(验 H2,H1 通过后再做) | workspace 落 S3,含 inotify/性能结论 ✅ 已完成 | 1 天 |
+| Phase 3 | EKS + Kata 编排 + 任意端口(验 H3) | 沙盒 Pod + NLB 暴露端口 ✅ 已完成 | 2–3 天 |
+| Phase 4 | 功能与保真度测试 | 测试清单结果 ✅ 已完成 | 与上重叠 |
+| Phase 5 | 密度/启动/快照压测(验 H4) | 密度与成本数据 ✅ 已完成 | 1–2 天 |
+| **Phase 6** | **统一控制面 v1**(生产化,见第 8 节) | DynamoDB 状态层 + FirecrackerDriver + KataDriver + Warm Pool + Machine API + Fargate 部署 | 进行中 |
 
 ---
 
@@ -663,7 +664,126 @@ free -h            # 每批后记录
 
 ---
 
-## 6. 成本与清理
+## 6. Phase 6 — 统一控制面 v1(生产化)
+
+> 本阶段在 Phase 3 的 EKS 集群基础上叠加,把 POC 阶段的两个独立 demo(`app.py` / `fc_snapshot_api.py`)
+> 替换为一套统一的、后端可插拔的生产级控制面。
+
+### 6.1 架构概览
+
+```
+┌─ EKS cluster ─────────────────────────────────────────────────────┐
+│                                                                      │
+│  Fargate(sandbox-system namespace)    .metal 节点组(沙盒池)          │
+│  ┌────────────────────────┐           ┌──────────────────────────┐  │
+│  │ sandbox-control-plane  │  HTTP     │  node-agent DaemonSet    │  │
+│  │ Deployment(2 replica)  │──────────►│  (每 .metal 节点一个)    │  │
+│  │  - KataDriver          │           │  - Firecracker REST      │  │
+│  │  - FirecrackerDriver   │           │  - jailer/tap 管理       │  │
+│  │  - WarmPool            │           │  - snapshot 本地/S3      │  │
+│  │  无状态,读写 DynamoDB   │           └──────────────────────────┘  │
+│  └────────────────────────┘                                          │
+│                                                                      │
+│  DynamoDB(状态/lease/幂等/暖池/tap_idx)                              │
+│  ingress-nginx(共享 NLB,按 Host 路由)                               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**设计原则:**
+- 控制面**无状态**:所有沙盒状态写 DynamoDB,Pod 崩了重启不丢数据
+- **driver 可插拔**:同一套 HTTP API,后端切换只改 `SANDBOX_DRIVER` 环境变量
+- **Capability 模型**:Kata v1 的 suspend 返回 501,不假装支持
+- **乐观锁**:DynamoDB 条件写替代 in-process LOCK,多 Pod 并发安全
+
+### 6.2 核心组件
+
+| 组件 | 文件 | 说明 |
+|---|---|---|
+| 统一 API | `sandbox-api/app.py` | HTTP 服务,Fly Machines 风格接口 |
+| 抽象接口 | `sandbox-api/driver.py` | `SandboxDriver` Protocol + `Capabilities` |
+| 状态层 | `sandbox-api/db.py` | DynamoDB CRUD / lease / 幂等 / warm pool |
+| FC Driver | `sandbox-api/drivers/firecracker.py` | 调 node-agent,支持 suspend/resume |
+| Kata Driver | `sandbox-api/drivers/kata.py` | kubectl + LiteLLM env,suspend → 501 |
+| 暖池 | `sandbox-api/warm_pool.py` | FC: 预快照池;Kata: SandboxWarmPool CRD |
+| on-host 执行手 | `node-agent/main.py` | tap/jailer/FC REST/S3 快照,替代 fc_snapshot_api.py |
+
+### 6.3 Machine API(对齐 Fly Machines)
+
+| 端点 | 说明 | 新增能力 |
+|---|---|---|
+| `POST /sandboxes` | 创建(支持 `idempotency_key`) | 幂等键防重复创建 |
+| `GET /sandboxes/{id}/wait` | 等待目标状态 | 长轮询,替代客户端盲等 |
+| `POST /sandboxes/{id}/suspend` | 挂起+快照(FC)/Hibernation(Kata) | 成本核心杠杆 |
+| `POST /sandboxes/{id}/resume` | 从快照恢复 | FC 实测 ~7ms |
+| `GET /capabilities` | 当前 driver 能力声明 | capability 模型 |
+| `GET /sandboxes/{id}/locate` | 定位 VMM 进程/节点 | 调试/监控 |
+
+### 6.4 DynamoDB 表结构
+
+```
+sandboxes          主状态表(PK: id)
+  GSI: tenant_id-updated_at-index   按租户列出
+  GSI: idempotency_key-index        幂等键查找
+  GSI: pool_state-driver-index      暖池查询
+
+sandbox_events     事件历史(PK: id, SK: ts,TTL 30天)
+
+sandbox_tap_idx    tap_idx 分布式分配器(原子 ADD)
+```
+
+### 6.5 部署步骤
+
+```bash
+# Step 1: DynamoDB
+cd terraform/stage1-dynamodb && terraform apply
+
+# Step 2: EKS 集群(Phase 3,若已有跳过)
+cd terraform/phase3
+terraform apply -var='endpoint_public_access_cidrs=["<your-ip>/32"]'
+aws eks update-kubeconfig --name claude-sbx --region us-east-1
+
+# Step 3: 构建并推送镜像(arm64)
+bash scripts/build_and_push.sh
+
+# Step 4: 部署控制面
+cd terraform/stage2-control-plane && terraform init && terraform apply \
+  -var="sandbox_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/claude-sbx:poc" \
+  -var="control_plane_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
+  -var="node_agent_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest"
+
+# Step 5: 端到端测试
+bash scripts/e2e_test.sh
+```
+
+### 6.6 Warm Pool 机制
+
+**FC 模式(v1 首选,成本核心杠杆):**
+```
+后台 loop: 预启动 N 个空白沙盒 → suspend → 快照 → 标记 warm
+用户 create: claim 一个 warm 沙盒 → resume(~7ms) → 注入配置
+                                   ↓ 池空时
+                                   冷建(正常 boot)+ 异步补池
+```
+
+**Kata 模式:**
+使用 `kubernetes-sigs/agent-sandbox` 的 `SandboxWarmPool` CRD,
+controller 预热 Pod 并维持水位,`create` 通过 `SandboxClaim` 秒级绑定。
+
+### 6.7 待完成项(下一阶段)
+
+| 优先级 | 项目 | 说明 |
+|---|---|---|
+| P0 | LiteLLM 网关部署 | 凭据隔离落地(当前 Kata 还走节点 IAM) |
+| P0 | jailer 配置验证 | node-agent 裸 FC fallback 需生产化 |
+| P1 | Karpenter 双节点池 | .metal 按需扩缩 + Kata UserData 自动化 |
+| P1 | 请求驱动唤醒(proxy) | 挂起沙盒被流量自动拉起(scale-to-zero 闭环) |
+| P1 | 可观测性 | metrics / 日志聚合 / 健康告警 |
+| P2 | rclone workspace 备份 | 节点故障数据兜底 |
+| P2 | 多租户 NetworkPolicy | 沙盒间网络隔离 + IMDS 屏蔽 |
+
+---
+
+## 7. 成本与清理
 
 ```bash
 # POC 用完务必销毁(.metal 按小时计费,较贵)

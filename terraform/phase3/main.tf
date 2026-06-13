@@ -130,26 +130,9 @@ module "eks" {
   }
 }
 
-# 给节点 IAM 角色附加 Bedrock 权限
-resource "aws_iam_role_policy" "node_bedrock" {
-  name = "bedrock-invoke"
-  role = module.eks.eks_managed_node_groups["metal_arm64"].iam_role_name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
-      ]
-      Resource = [
-        "arn:aws:bedrock:*::foundation-model/anthropic.*",
-        "arn:aws:bedrock:*:*:inference-profile/us.anthropic.*",
-      ]
-    }]
-  })
-}
+# Bedrock 权限已迁移到 LiteLLM IRSA(terraform/stage2-control-plane/litellm.tf)
+# 节点角色不再持有 Bedrock 权限 —— 沙盒内代码无法直接调 Bedrock(R8 凭据隔离落地)
+# 沙盒走: Claude Code → ANTHROPIC_BASE_URL=http://litellm.litellm:4000 → LiteLLM Pod → Bedrock
 
 # ---------- ECR(复用 Phase 1 的也行;这里独立声明便于单独 apply) ----------
 data "aws_ecr_repository" "sbx" {
