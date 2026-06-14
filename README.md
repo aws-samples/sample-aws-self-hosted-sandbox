@@ -462,16 +462,34 @@ for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
 done
 sleep 30  # 等 NLB 的 ENI 释放
 
-# 再删 EKS 集群（含 .metal 节点组，整体约 15-20 分钟）
+# 删除 Karpenter 节点遗留的孤儿 pod ENI（VPC CNI 创建，节点终止后不自动清理，
+# 会让下面 phase3 destroy 卡在子网/安全组删除约 7+ 分钟）：
+VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
+  --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
+if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
+      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
+  done
+fi
+
+# 再删 EKS 集群（含 .metal 节点组，整体约 15-20 分钟；c6g.metal 终止本身较慢）
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 cd ../phase3 && terraform destroy -auto-approve \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
+# 若 VPC 删除卡住（>5min），多半是 EKS 自建的 eks-cluster-sg 滞留，手动删除它即可解除：
+#   SG=$(aws ec2 describe-security-groups --region us-east-1 \
+#     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" --query 'SecurityGroups[0].GroupId' --output text)
+#   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
+
 # 最后删 DynamoDB
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # 清理 terraform destroy 不会自动删、但会阻塞下次重建的残留资源：
 aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
+# S3 快照桶（按需）：aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
 ```
 
 ---
@@ -902,14 +920,31 @@ for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
 done
 sleep 30  # wait for NLB ENIs to release
 
+# Delete orphaned pod ENIs left by Karpenter nodes (VPC CNI creates them; they are NOT
+# cleaned up when the node terminates and will stall the phase3 destroy on subnet/SG deletion):
+VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
+  --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
+if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
+      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
+  done
+fi
+
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 cd ../phase3 && terraform destroy -auto-approve \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
+# If VPC deletion stalls (>5min), the EKS-managed eks-cluster-sg is usually the culprit; delete it:
+#   SG=$(aws ec2 describe-security-groups --region us-east-1 \
+#     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" --query 'SecurityGroups[0].GroupId' --output text)
+#   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # Clean up leftovers that destroy won't remove but that block a future re-create:
 aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
+# S3 snapshot bucket (optional): aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
 ```
 
 ### Key Benchmark Numbers
