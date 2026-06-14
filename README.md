@@ -105,19 +105,19 @@ POST /sandboxes/{id}/exec
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────┐
 │                                                                      │
-│  普通/Fargate 节点（系统）          c6g.metal 节点组（沙盒）          │
+│  托管节点组（系统节点）          Karpenter c6g.metal 节点（沙盒）     │
 │  ┌──────────────────────────┐      ┌───────────────────────────┐   │
-│  │ sandbox-control-plane    │ HTTP │  node-agent DaemonSet     │   │
-│  │ (Deployment, IRSA)       │─────►│  Firecracker REST         │   │
-│  │  KataDriver (k8s client) │      │  jailer / tap / snapshot  │   │
-│  │  FirecrackerDriver       │      │  S3 upload/download       │   │
+│  │ sandbox-control-plane    │ HTTP │  Kata microVM (kata-qemu) │   │
+│  │ (Deployment, IRSA)       │─────►│  kata 由 UserData 预装    │   │
+│  │  KataDriver (k8s client) │      │  node-agent DaemonSet     │   │
+│  │  FirecrackerDriver       │      │  jailer / tap / snapshot  │   │
 │  │  WarmPool                │      └───────────────────────────┘   │
 │  │  无状态 → DynamoDB        │                                       │
 │  └──────────────────────────┘                                       │
 │         ↑ ingress-nginx (NLB)                                       │
-│         api.sbx.<domain>  ←── 生产外部访问入口                      │
+│         api.sbx.<domain>  ←── 生产外部访问（需 AWS LB Controller）  │
 │                                                                      │
-│  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩)           │
+│  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩+预装kata)  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -156,29 +156,40 @@ terraform init && terraform apply -auto-approve \
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-【Step 3: 安装 Kata Containers 3.31】
-cd /tmp
-curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
-tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
+【Step 3: 创建 kata-qemu RuntimeClass（不要用 kata-deploy DaemonSet！）】
+#
+# ⚠️⚠️ 重要架构决策：本方案【不】使用官方 kata-deploy DaemonSet 来装 Kata。
+#
+# 原因（已实测定位的阻断性问题）：
+#   kata-deploy 安装末尾会在【已运行 kubelet + 多个容器】的节点上执行
+#   `systemctl restart containerd`。在 c6g.metal + AL2023 上，这会留下孤儿
+#   containerd-shim 并导致【整个裸金属节点 hang 约 12 分钟后才重新开机】
+#   （containerd 重启本身只要 200ms，慢的是节点级挂死）。这期间 EC2 reachability
+#   检查失败，托管节点组/ASG 会把它当 unhealthy 反复替换 → 节点替换死循环。
+#
+# 正确做法：把 Kata 安装【前置到节点 bootstrap 阶段】（kubelet 向 EKS 注册之前），
+#   由 Karpenter EC2NodeClass.userData 完成（见 Step 7）。bootstrap 阶段容器为空、
+#   EKS 还看不到该节点，containerd 重启瞬时完成、零抖动（实测新 metal 节点 30-60s Ready）。
+#
+# 因此 Step 3 只需创建 sandbox pod 调度用的 RuntimeClass（集群级对象，不碰节点）：
 
-# helm dependency build 需要 node-feature-discovery repo，先添加：
-helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
-helm repo update
-# 加好 nfd repo 后 dependency build 会正常成功；|| true 仅为防御未加 repo 的情况
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
+kubectl apply -f - <<'RUNTIMECLASS'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+handler: kata-qemu
+overhead:
+  podFixed:
+    cpu: 250m
+    memory: 160Mi
+scheduling:
+  # 只调度到 Step 7 由 Karpenter UserData 预装好 Kata 的 .metal 节点
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+RUNTIMECLASS
 
-helm install kata-deploy \
-  kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system
-
-# ⚠️ 重要：kata-deploy 安装末尾会执行 `systemctl restart containerd`，
-#    在 c6g.metal + AL2023 上会触发节点自发重启一次，kubelet 失联约 10-15 分钟后才自愈。
-#    这是已知行为 —— 请耐心等待，切勿手动 reboot/terminate 节点（会打断恢复，使节点 impaired）。
-#    timeout 放宽到 1200s（chart 的 startupProbe 本身预留了 20 分钟）：
-kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=1200s
-# 等待节点从 containerd 重启中恢复 Ready：
-kubectl wait node --all --for=condition=Ready --timeout=1200s
-kubectl get runtimeclass | grep kata-qemu   # 应能看到 kata-qemu
+kubectl get runtimeclass kata-qemu   # 应能看到 kata-qemu
 
 【Step 4: 安装 ingress-nginx（共享 NLB）】
 # 注意：必须指定 namespace
@@ -265,8 +276,12 @@ KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
 # KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
 echo "Node role: $KARPENTER_NODE_ROLE"
 
-# 部署 NodePool + EC2NodeClass
-kubectl apply -f - <<NODEPOOL
+# 部署 NodePool + EC2NodeClass（kata 由 EC2NodeClass.userData 在 bootstrap 阶段预装，见 Step 3 说明）
+# 实测：用此 EC2NodeClass 起的新 c6g.metal 节点 30-60s 内 Ready，全程零抖动、不触发 ASG 替换。
+#
+# 注意：用【带引号的 heredoc】(<<'NODEPOOL') 写到文件，避免本地 shell 干扰 userData 里的
+#       $VAR / 反引号；role 用占位符后 sed 替换。这是实测可直接复制运行的写法。
+cat > /tmp/kata-metal.yaml <<'NODEPOOL'
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
@@ -274,7 +289,7 @@ metadata:
 spec:
   amiSelectorTerms:
     - alias: al2023@latest
-  role: ${KARPENTER_NODE_ROLE}
+  role: __KARPENTER_NODE_ROLE__
   subnetSelectorTerms:
     - tags:
         kubernetes.io/role/elb: "1"
@@ -286,6 +301,37 @@ spec:
       ebs:
         volumeSize: 200Gi
         volumeType: gp3
+  # ── 方案 A：bootstrap 阶段（kubelet 注册前）预装 Kata，根治 c6g.metal 节点 hang ──
+  # Karpenter 把这段 shell 包成 MIME 的第一个 part，nodeadm（启动 kubelet）排在其后，
+  # 因此 kata 安装 + containerd 重启发生在 kubelet 注册前，节点对 EKS 始终"一次就绪"。
+  userData: |
+    #!/bin/bash
+    set -euxo pipefail
+    KATA_VERSION="3.31.0"; ARCH="arm64"
+    cd /tmp
+    # 注意：release 包是 .tar.zst（不是 .tar.xz），AL2023 自带 zstd
+    curl -fsSL "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst" -o kata.tar.zst
+    tar --use-compress-program=unzstd -xf kata.tar.zst -C /   # 包内路径 ./opt/kata/...
+    # containerd 2.x（AL2023）用 v2 配置路径 io.containerd.cri.v1.runtime；只注册 kata-qemu
+    mkdir -p /opt/kata/containerd/config.d
+    cat > /opt/kata/containerd/config.d/kata-deploy.toml <<'TOML'
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+    runtime_type = "io.containerd.kata-qemu.v2"
+    runtime_path = "/opt/kata/bin/containerd-shim-kata-v2"
+    privileged_without_host_devices = true
+    pod_annotations = ["io.katacontainers.*"]
+
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
+    ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+    TOML
+    if ! grep -q "kata-deploy.toml" /etc/containerd/config.toml 2>/dev/null; then
+      if grep -q "^imports" /etc/containerd/config.toml 2>/dev/null; then
+        sed -i 's#^imports = \[#imports = ["/opt/kata/containerd/config.d/kata-deploy.toml", #' /etc/containerd/config.toml
+      else
+        sed -i '1i imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]' /etc/containerd/config.toml
+      fi
+    fi
+    systemctl restart containerd && systemctl enable containerd
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
@@ -296,6 +342,10 @@ spec:
     metadata:
       labels:
         sandbox: "true"
+        # 必填：kata-qemu RuntimeClass（Step 3）带 nodeSelector katacontainers.io/kata-runtime=true。
+        # 方案 A 下 kata 由 UserData 预装、不经 kata-deploy 打 label，必须在此显式声明，
+        # 否则 Karpenter 认为 NodePool 不满足 RuntimeClass 的 nodeSelector，拒绝起节点。
+        katacontainers.io/kata-runtime: "true"
     spec:
       requirements:
         - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
@@ -311,6 +361,13 @@ spec:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 30m
 NODEPOOL
+
+sed -i.bak "s#__KARPENTER_NODE_ROLE__#${KARPENTER_NODE_ROLE}#" /tmp/kata-metal.yaml
+kubectl apply -f /tmp/kata-metal.yaml
+
+# 触发并验证：创建一个 sandbox（或测试 pod）后，Karpenter 会起一台 c6g.metal，
+# 实测从 launch 到节点 Ready 仅 30-60s，无 NotReady 抖动：
+# kubectl get nodeclaims -w
 
 kubectl get nodepools     # kata-metal READY=True
 kubectl get ec2nodeclasses # kata-metal READY=True
@@ -329,30 +386,30 @@ kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --time
 kubectl rollout status deployment/litellm -n litellm --timeout=300s
 
 # 常见问题处理：
-# LiteLLM OOMKilled → 加内存：
+# LiteLLM OOMKilled → stage2 默认已设 4Gi+1 副本（litellm.tf）。若仍 OOM 再加大：
 #   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
-# 单节点集群 LiteLLM 第二副本 Pending（anti-affinity）→ 缩为 1 副本：
 #   kubectl scale deployment/litellm -n litellm --replicas=1
 # Terraform kubernetes provider "Unexpected Identity Change" 错误 → 清理 state 重试：
 #   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
 #   terraform apply ...（重新执行 apply）
 
-kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent 1/1
-kubectl get pods -n litellm           # LiteLLM 2/2
+kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent（DaemonSet，调度到 kata-metal 节点）
+kubectl get pods -n litellm           # LiteLLM 1/1
 kubectl get nodepools                 # kata-metal READY=True
 
-# 生产 Ingress 模式（DNS 已配好）：
-bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
-
-# 生产 Ingress 模式（DNS 未配，用 --resolve 绕过）：
-NLB_IP=$(dig +short $NLB_HOST | head -1)
-bash scripts/e2e_test.sh \
-  --api-url "http://api.sbx.example.com" \
-  --resolve "api.sbx.example.com:80:${NLB_IP}"
-
-# 本地开发模式（自动 port-forward，不依赖 DNS/Ingress）：
+# ── 推荐：本地 port-forward 模式（不依赖 DNS/Ingress，实测 ALL TESTS PASSED）──
 bash scripts/e2e_test.sh
 # 期望：脚本结尾显示 ALL TESTS PASSED（按 driver 不同，部分用例会 skip）
+
+# ── 生产 Ingress 外部访问（⚠️ 实测开箱不通，见下）──
+# ingress-nginx 用的是 in-tree NLB（target=instance + preserve_client_ip），叠加
+# Karpenter kata-metal 节点（带 taint、跨 AZ、无 ingress pod）混入 NLB 目标组、cross-zone
+# 默认关闭，会导致外部 HTTP empty reply（集群内 ClusterIP 访问正常）。
+# 生产要走外部 Ingress，请改装 AWS Load Balancer Controller（target type=ip，直接指向 pod，
+# 绕过 NodePort/SNAT），或限定 NLB 只注册系统节点。仅做功能验证用上面的 port-forward 即可。
+# （DNS/--resolve 命令保留备查）：
+# NLB_IP=$(dig +short $NLB_HOST | head -1)
+# bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" --resolve "api.sbx.example.com:80:${NLB_IP}"
 
 【Step 10: 开始使用 API】
 # 直接访问控制面（需 DNS 或 port-forward）
@@ -391,10 +448,14 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false"
 
-# 先卸载 helm 安装物 + 删 ingress-nginx 创建的 NLB，否则它占用子网公网地址，
+# 先删 Karpenter NodePool（让它回收所有 kata-metal 节点），再卸载 helm 安装物 +
+# 删 ingress-nginx 创建的 NLB，否则残留节点/NLB 占用子网公网地址，
 # 会让下面 phase3 destroy 卡在 VPC/子网删除并报 DependencyViolation：
+kubectl delete nodepool kata-metal 2>/dev/null || true     # 触发 Karpenter 回收 .metal 节点
+kubectl delete ec2nodeclass kata-metal 2>/dev/null || true
+sleep 60  # 等 Karpenter 终止 .metal 实例
+helm uninstall karpenter     -n karpenter     2>/dev/null || true
 helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
-helm uninstall kata-deploy   -n kube-system    2>/dev/null || true
 for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
     --query 'LoadBalancers[?Type==`network`].LoadBalancerArn' --output text); do
   aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn "$arn"
@@ -570,27 +631,43 @@ terraform init && terraform apply -auto-approve \
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-[Step 3: Install Kata Containers 3.31]
-cd /tmp
-curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
-tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
-# Add NFD repo first (required by helm dependency build)
-helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
-helm repo update
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
-helm install kata-deploy \
-  kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system
+[Step 3: Create the kata-qemu RuntimeClass (do NOT use the kata-deploy DaemonSet!)]
+#
+# ⚠️⚠️ Key architecture decision: this project does NOT use the official kata-deploy
+#       DaemonSet to install Kata.
+#
+# Why (a measured, blocking issue): kata-deploy ends its install by running
+#   `systemctl restart containerd` on a node that ALREADY runs kubelet + many containers.
+#   On c6g.metal + AL2023 this leaves orphaned containerd-shim processes and makes the
+#   whole bare-metal node HANG for ~12 minutes before it reboots (containerd restart itself
+#   takes 200ms — the slowness is a node-level hang). During that window EC2 reachability
+#   checks fail and the managed node group / ASG keeps replacing it as "unhealthy" → a
+#   node-replacement loop.
+#
+# The fix: install Kata at node BOOTSTRAP time (before kubelet registers with EKS), via
+#   the Karpenter EC2NodeClass.userData (see Step 7). At bootstrap there are no running
+#   containers and EKS can't see the node yet, so the containerd restart is instant and
+#   causes zero churn (measured: a fresh .metal node reaches Ready in 30-60s).
+#
+# So Step 3 only creates the cluster-level RuntimeClass used to schedule sandbox pods:
 
-# ⚠️ IMPORTANT: kata-deploy runs `systemctl restart containerd` at the end of install,
-#    which on c6g.metal + AL2023 makes the node reboot once — kubelet goes unreachable
-#    for ~10-15 min before self-healing. This is expected. Be patient and DO NOT manually
-#    reboot/terminate the node (that interrupts recovery and leaves it impaired).
-#    Widen the timeout to 1200s (the chart's startupProbe already budgets 20 min):
-kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=1200s
-# Wait for the node to recover Ready after the containerd restart:
-kubectl wait node --all --for=condition=Ready --timeout=1200s
-kubectl get runtimeclass | grep kata-qemu
+kubectl apply -f - <<'RUNTIMECLASS'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+handler: kata-qemu
+overhead:
+  podFixed:
+    cpu: 250m
+    memory: 160Mi
+scheduling:
+  # Only schedule onto the .metal nodes where Karpenter's UserData pre-installed Kata (Step 7)
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+RUNTIMECLASS
+
+kubectl get runtimeclass kata-qemu
 
 [Step 4: Install ingress-nginx (shared NLB)]
 # IMPORTANT: specify namespace to avoid conflicts with Terraform later
@@ -659,7 +736,12 @@ kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
 # Get node role name (fixed naming pattern, or query AWS)
 KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
 # Alternative: KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
-kubectl apply -f - <<NODEPOOL
+#
+# Use a QUOTED heredoc (<<'NODEPOOL') into a file so the local shell does not mangle the
+# $VARs / backticks inside userData; substitute the role via sed afterwards.
+# Kata is pre-installed at bootstrap by EC2NodeClass.userData (see Step 3 rationale).
+# Measured: a fresh c6g.metal node from this NodePool reaches Ready in 30-60s, zero churn.
+cat > /tmp/kata-metal.yaml <<'NODEPOOL'
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
@@ -667,7 +749,7 @@ metadata:
 spec:
   amiSelectorTerms:
     - alias: al2023@latest
-  role: ${KARPENTER_NODE_ROLE}
+  role: __KARPENTER_NODE_ROLE__
   subnetSelectorTerms:
     - tags:
         kubernetes.io/role/elb: "1"
@@ -677,6 +759,35 @@ spec:
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs: {volumeSize: 200Gi, volumeType: gp3}
+  # ── Plan A: pre-install Kata at bootstrap (before kubelet registers) ──
+  userData: |
+    #!/bin/bash
+    set -euxo pipefail
+    KATA_VERSION="3.31.0"; ARCH="arm64"
+    cd /tmp
+    # NOTE: the release artifact is .tar.zst (NOT .tar.xz); AL2023 ships zstd
+    curl -fsSL "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst" -o kata.tar.zst
+    tar --use-compress-program=unzstd -xf kata.tar.zst -C /   # paths inside: ./opt/kata/...
+    # containerd 2.x (AL2023) uses the v2 path io.containerd.cri.v1.runtime; register kata-qemu only
+    mkdir -p /opt/kata/containerd/config.d
+    cat > /opt/kata/containerd/config.d/kata-deploy.toml <<'TOML'
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+    runtime_type = "io.containerd.kata-qemu.v2"
+    runtime_path = "/opt/kata/bin/containerd-shim-kata-v2"
+    privileged_without_host_devices = true
+    pod_annotations = ["io.katacontainers.*"]
+
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
+    ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+    TOML
+    if ! grep -q "kata-deploy.toml" /etc/containerd/config.toml 2>/dev/null; then
+      if grep -q "^imports" /etc/containerd/config.toml 2>/dev/null; then
+        sed -i 's#^imports = \[#imports = ["/opt/kata/containerd/config.d/kata-deploy.toml", #' /etc/containerd/config.toml
+      else
+        sed -i '1i imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]' /etc/containerd/config.toml
+      fi
+    fi
+    systemctl restart containerd && systemctl enable containerd
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
@@ -685,7 +796,13 @@ metadata:
 spec:
   template:
     metadata:
-      labels: {sandbox: "true"}
+      labels:
+        sandbox: "true"
+        # Required: the kata-qemu RuntimeClass (Step 3) carries nodeSelector
+        # katacontainers.io/kata-runtime=true. With Plan A, Kata is pre-installed via UserData
+        # (not by kata-deploy), so this label must be declared here or Karpenter will refuse
+        # to provision (NodePool "incompatible" with the RuntimeClass nodeSelector).
+        katacontainers.io/kata-runtime: "true"
     spec:
       requirements:
         - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
@@ -701,6 +818,9 @@ spec:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 30m
 NODEPOOL
+
+sed -i.bak "s#__KARPENTER_NODE_ROLE__#${KARPENTER_NODE_ROLE}#" /tmp/kata-metal.yaml
+kubectl apply -f /tmp/kata-metal.yaml
 kubectl get nodepools && kubectl get ec2nodeclasses
 
 [Step 8: Configure DNS for production API access]
@@ -714,27 +834,25 @@ echo "Add DNS record: api.sbx.example.com CNAME $NLB_HOST"
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
 kubectl rollout status deployment/litellm -n litellm --timeout=300s
 
-# Tip: If LiteLLM is OOMKilled, increase memory:
-#   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
-# Tip: Single-node cluster - LiteLLM defaults to 2 replicas with anti-affinity;
-# scale to 1 if second pod stays Pending:
-#   kubectl scale deployment/litellm -n litellm --replicas=1
+# Note: stage2 now defaults LiteLLM to 4Gi + 1 replica (2Gi OOMKills; see litellm.tf).
+#   If it still OOMs: kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
 
-kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent 1/1
-kubectl get pods -n litellm           # litellm 2/2
+kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent (DaemonSet on kata-metal nodes)
+kubectl get pods -n litellm           # litellm 1/1
 
-# Production Ingress mode (DNS configured):
-bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
-
-# Production Ingress mode (no DNS, use --resolve):
-NLB_IP=$(dig +short $NLB_HOST | head -1)
-bash scripts/e2e_test.sh \
-  --api-url "http://api.sbx.example.com" \
-  --resolve "api.sbx.example.com:80:${NLB_IP}"
-
-# Local dev mode (auto port-forward):
+# ── Recommended: local port-forward mode (no DNS/Ingress; measured ALL TESTS PASSED) ──
 bash scripts/e2e_test.sh
 # Expected: script ends with ALL TESTS PASSED (some tests skip depending on driver)
+
+# ── Production Ingress (⚠️ does NOT work out of the box) ──
+# ingress-nginx here uses the in-tree NLB (target=instance + preserve_client_ip). Combined
+# with Karpenter kata-metal nodes (tainted, cross-AZ, no ingress pod) joining the NLB target
+# group and cross-zone disabled by default, external HTTP returns empty replies (in-cluster
+# ClusterIP access works fine). For real external Ingress, install the AWS Load Balancer
+# Controller (target type=ip, pointing straight at pods), or restrict the NLB to system nodes.
+# (--resolve command kept for reference):
+# NLB_IP=$(dig +short $NLB_HOST | head -1)
+# bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" --resolve "api.sbx.example.com:80:${NLB_IP}"
 
 [Step 10: Use the API]
 BASE_URL="http://api.sbx.example.com"   # or http://localhost:18000
@@ -770,11 +888,14 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false"
 
-# Uninstall helm releases + delete the NLB created by ingress-nginx first — otherwise it
-# holds public addresses on the subnets and phase3 destroy stalls on VPC/subnet deletion
-# with DependencyViolation:
+# Delete the Karpenter NodePool first (so it reclaims all kata-metal nodes), then uninstall
+# helm releases + delete the NLB created by ingress-nginx — otherwise leftover nodes/NLB
+# hold public addresses on the subnets and phase3 destroy stalls with DependencyViolation:
+kubectl delete nodepool kata-metal 2>/dev/null || true     # triggers Karpenter to reclaim .metal nodes
+kubectl delete ec2nodeclass kata-metal 2>/dev/null || true
+sleep 60  # wait for Karpenter to terminate the .metal instances
+helm uninstall karpenter     -n karpenter     2>/dev/null || true
 helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
-helm uninstall kata-deploy   -n kube-system    2>/dev/null || true
 for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
     --query 'LoadBalancers[?Type==`network`].LoadBalancerArn' --output text); do
   aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn "$arn"
