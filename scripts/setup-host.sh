@@ -70,6 +70,46 @@ fi
 ls -lh "$KERNEL"
 
 # ---------- 3. 构建带 Claude Code + JuiceFS 的 arm64 rootfs ----------
+
+# 生成 sbxinit（guest PID 1：网络 + 可选 JuiceFS 挂载）
+cat > "$WORKDIR/sbxinit" <<'SBXINIT'
+#!/bin/bash
+set -e
+
+# 网络初始化
+ip link set lo up
+ip addr add 172.16.0.2/30 dev eth0
+ip link set eth0 up
+ip route add default via 172.16.0.1
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# JuiceFS workspace 挂载（方案 B）
+# JFS_REDIS / JFS_BUCKET / JFS_NAME / AWS_REGION 由 node-agent 通过 boot_args 注入
+if [ -n "${JFS_REDIS:-}" ] && [ -n "${JFS_BUCKET:-}" ]; then
+  JFS_NAME="${JFS_NAME:-sbxfs}"
+  AWS_REGION="${AWS_REGION:-us-east-1}"
+
+  # 首次：格式化文件系统（已格式化时幂等跳过）
+  juicefs format \
+    --storage s3 \
+    --bucket "https://${JFS_BUCKET}.s3.${AWS_REGION}.amazonaws.com" \
+    "${JFS_REDIS}" "${JFS_NAME}" 2>/dev/null || true
+
+  # 挂载 /workspace（writeback + 本地缓存加速小文件写）
+  mkdir -p /workspace /var/jfscache
+  juicefs mount "${JFS_REDIS}" /workspace \
+    --writeback \
+    --cache-dir /var/jfscache \
+    --cache-size 10240 \
+    --buffer-size 1024 \
+    -d 2>/dev/null || echo "[sbxinit] JuiceFS mount failed, continuing without workspace"
+fi
+
+echo "[sbxinit] ready"
+exec /bin/bash
+SBXINIT
+chmod +x "$WORKDIR/sbxinit"
+
 cat > "$WORKDIR/Dockerfile.sbx" <<'DOCKER'
 FROM node:22-bookworm
 RUN apt-get update && apt-get install -y \
@@ -77,10 +117,11 @@ RUN apt-get update && apt-get install -y \
     iproute2 iputils-ping fuse3 inotify-tools strace \
  && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code
-# JuiceFS 客户端(供 guest 内挂 S3 workspace);失败不阻断镜像构建
+# JuiceFS 客户端(供 guest 内挂 /workspace);失败不阻断镜像构建
 RUN curl -sSL https://d.juicefs.com/install | sh - || echo "juicefs install skipped"
-RUN printf '#!/bin/bash\nip link set lo up\nip addr add 172.16.0.2/30 dev eth0\nip link set eth0 up\nip route add default via 172.16.0.1\necho "nameserver 8.8.8.8" > /etc/resolv.conf\nexec /bin/bash\n' > /sbin/sbxinit \
- && chmod +x /sbin/sbxinit
+# sbxinit：网络初始化 + 可选 JuiceFS 挂载（JFS_REDIS/JFS_BUCKET 由 boot_args 注入）
+COPY sbxinit /sbin/sbxinit
+RUN chmod +x /sbin/sbxinit
 DOCKER
 
 docker build -f "$WORKDIR/Dockerfile.sbx" -t claude-sbx:poc "$WORKDIR"
