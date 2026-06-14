@@ -123,7 +123,7 @@ resource "aws_iam_role_policy" "karpenter_node_s3" {
   })
 }
 
-# aws:auth ConfigMap 中需要映射此 Role（让 Karpenter 节点能 join 集群）
+# Karpenter controller 需要 PassRole 到 worker node role
 resource "aws_iam_role_policy" "karpenter_controller_node_role" {
   name = "karpenter-grant-node-role"
   role = aws_iam_role.karpenter_controller.id
@@ -135,6 +135,25 @@ resource "aws_iam_role_policy" "karpenter_controller_node_role" {
       Resource = [aws_iam_role.karpenter_node.arn]
     }]
   })
+}
+
+# ---------- EKS Access Entry —— Karpenter 节点 Role 授权 ----------
+# Karpenter 启动的新节点使用 karpenter_node role。
+# 没有这条 Access Entry，节点虽然有 IAM 权限，但 EKS 控制面不认它，
+# kubelet 无法 join 集群（TLS bootstrap 会被拒绝）。
+#
+# EKS 1.28+ 推荐用 Access Entry API（不需要手改 aws-auth ConfigMap）。
+# 等价的手动命令（apply 后若节点仍 NotReady 时调试用）：
+#   aws eks create-access-entry \
+#     --cluster-name claude-sbx \
+#     --principal-arn arn:aws:iam::<acct>:role/claude-sbx-karpenter-node \
+#     --type EC2_LINUX
+resource "aws_eks_access_entry" "karpenter_node" {
+  cluster_name      = var.cluster_name
+  principal_arn     = aws_iam_role.karpenter_node.arn
+  # EC2_LINUX 类型自动附加 AmazonEKSWorkerNodePolicy 所需的系统组
+  # (system:bootstrappers, system:nodes)，节点才能通过 TLS bootstrap join 集群
+  type              = "EC2_LINUX"
 }
 
 # ---------- Karpenter Helm（安装 controller）----------
