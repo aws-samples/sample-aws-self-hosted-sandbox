@@ -7,7 +7,9 @@ metadata:
   name: claude-sbx-1
   labels: { app: claude-sbx, sandboxId: "1" }
 spec:
-  runtimeClassName: kata-clh        # ← 关键:跑在 microVM 里(arm64 不行则回退 kata-qemu)
+  runtimeClassName: kata-qemu       # ← 实测通过(H3/e2e 均用此)
+  # 注:kata-clh(Cloud Hypervisor)在 kata-deploy 3.31 arm64 上默认未注册 containerd handler
+  # (R2 实锤,见 POC-实测结果.md §四点五),改 kata-clh 需在 kata-deploy values 显式启用 clh shim
   nodeSelector: { sandbox: "true" }
   containers:
   - name: agent
@@ -16,10 +18,12 @@ spec:
     ports:
     - { containerPort: 8080 }
     env:
-    - { name: CLAUDE_CODE_USE_BEDROCK, value: "1" }
-    - { name: AWS_REGION, value: "us-east-1" }
-    - { name: ANTHROPIC_MODEL, value: "us.anthropic.claude-opus-4-8" }
-    # 节点已挂 Bedrock IAM 角色,沙盒走节点凭据链(POC);生产改 IRSA / 出口代理,凭据不进沙盒
+    # 生产:凭据不进沙盒,走 LiteLLM 代理(R8 凭据隔离)
+    - { name: ANTHROPIC_BASE_URL, value: "http://litellm.litellm.svc.cluster.local:4000" }
+    - { name: ANTHROPIC_MODEL,    value: "claude-opus-4-8" }
+    # ANTHROPIC_AUTH_TOKEN 由控制面按租户注入 virtual key,此处占位
+    # POC 快速验证可暂用节点凭据链:
+    #   CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION=us-east-1, ANTHROPIC_MODEL=us.anthropic.claude-opus-4-8
 ---
 apiVersion: v1
 kind: Service
