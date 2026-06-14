@@ -335,6 +335,9 @@ def op_suspend(body: dict) -> dict:
     diff_mem   = f"{snap_dir}/vm.mem"
     has_base   = os.path.exists(base_mem)
 
+    # snapshot/create 타임아웃: 메모리 크기에 따라 다름 (2GB Full = ~16s, 여유있게 120s)
+    SNAP_TIMEOUT = 120
+
     t0 = time.monotonic()
     if not has_base:
         # 首次:Full 快照,同时保留一份作 base
@@ -342,7 +345,7 @@ def op_suspend(body: dict) -> dict:
             "snapshot_type": "Full",
             "snapshot_path": diff_snap,
             "mem_file_path": diff_mem,
-        })
+        }, timeout=SNAP_TIMEOUT)
         # 复制为 base 供后续 Diff 使用
         import shutil as _sh
         _sh.copy2(diff_snap, base_snap)
@@ -354,14 +357,14 @@ def op_suspend(body: dict) -> dict:
                 "snapshot_type": "Diff",
                 "snapshot_path": diff_snap,
                 "mem_file_path": diff_mem,
-            })
+            }, timeout=SNAP_TIMEOUT)
         except Exception:
             # Diff 失败(如内核不支持)→ 降级 Full
             _fc(sock, "PUT", "/snapshot/create", {
                 "snapshot_type": "Full",
                 "snapshot_path": diff_snap,
                 "mem_file_path": diff_mem,
-            })
+            }, timeout=SNAP_TIMEOUT)
     dt = time.monotonic() - t0
 
     # kill VMM,释放 RAM

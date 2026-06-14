@@ -125,6 +125,57 @@ module "eks" {
         }
       }
 
+      # pre_bootstrap_user_data: kubelet 시작 전 실행
+      # Firecracker + Redis + JuiceFS + rootfs 를 사전 설치
+      # → containerd 재시작 없음 → EKS 헬스체크 미트리거 → 노드 교체 사이클 없음
+      pre_bootstrap_user_data = <<-EOT
+        #!/bin/bash
+        # pre_bootstrap: kubelet 시작 전 실행
+        # ⚠️ 긴 작업 금지 (docker/dnf 설치 금지 → kubelet heartbeat 중단 → 노드 교체 사이클)
+        # 최소한만 — Firecracker 바이너리 + 커널 + 디렉토리만 설치
+        exec >> /var/log/userdata-pre.log 2>&1
+        echo "[pre-bootstrap] START $(date)"
+
+        mkdir -p /opt/sbx /var/lib/sbx
+
+        # Firecracker (바이너리만, 빠름)
+        ARCH=aarch64
+        VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
+        curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
+          -o /tmp/fc.tgz 2>/dev/null && \
+        tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
+        chmod +x /usr/local/bin/firecracker && \
+        echo "[pre-bootstrap] Firecracker OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
+
+        # 커널 (16MB, 빠름)
+        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223" \
+          -o /opt/sbx/vmlinux 2>/dev/null && echo "[pre-bootstrap] Kernel OK" || true
+
+        # rootfs: S3 에서 tar.gz 다운로드 → ext4 생성
+        # (미리 빌드한 JuiceFS 포함 arm64 rootfs)
+        aws s3 cp s3://427169985960-23-09-05-01-18-49-bucket/rootfs/rootfs-juicefs.tar.gz \
+          /tmp/rootfs.tar.gz --region us-east-1 2>/dev/null && \
+        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=6144 status=none 2>/dev/null && \
+        mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \
+        mkdir -p /tmp/rootfs_mount && \
+        mount /opt/sbx/rootfs.ext4 /tmp/rootfs_mount 2>/dev/null && \
+        tar -xzf /tmp/rootfs.tar.gz -C /tmp/rootfs_mount 2>/dev/null && \
+        umount /tmp/rootfs_mount 2>/dev/null && \
+        echo "[pre-bootstrap] rootfs OK" || echo "[pre-bootstrap] rootfs setup failed (non-fatal)"
+
+        # Redis + JuiceFS 클라이언트 (설치 실패해도 계속)
+        dnf install -y redis6 fuse3 2>/dev/null || true
+        systemctl enable --now redis6 2>/dev/null || true
+        curl -sSL https://d.juicefs.com/install | sh - 2>/dev/null || true
+
+        # NAT
+        sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+
+        echo "[pre-bootstrap] DONE $(date)"
+      EOT
+
       # 不打 sandbox=true：本组是系统节点，sandbox 走 Karpenter kata-metal（见上）
       labels = {
         role = "system"

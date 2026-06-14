@@ -549,6 +549,8 @@ python3 sandbox-api/smoke_test.py
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
 | e2e 测试通过率 | **17/17（ALL PASS）** | 集群部署，Kata driver |
+| **方案 B 快照大小** | **~2GB（仅内存）** | 方案 A 为 ~8GB（含 rootfs） |
+| **方案 B resume** | **1.16s** | 无 rootfs 跨机复制，轻量跨机 |
 
 ---
 

@@ -210,10 +210,44 @@
 | Karpenter 1.3.3 安装 | ✅ 完成 | EC2NodeClass Ready=True；NodePool Ready=True；SecurityGroup selector 修复 |
 | **全链路 e2e（集群内部署）** | ✅ **17 项 ALL PASS** | T1-T15 通过，T16 dev mode，T17 LiteLLM skip |
 
-## 八、下一阶段
+## 八、方案 B JuiceFS workspace 实测（2026-06-15）
 
-- **scale-to-zero 唤醒代理**:挂起沙盒被流量自动拉起（ingress-nginx 不支持，需自研 proxy 层）
-- **可观测性**:metrics/日志聚合/健康告警（CloudWatch/Prometheus）
-- **dev server HMR 持续监听**:Vite/Next.js 大量文件持续监听压测（JuiceFS inotify 场景）
-- **H4 真实负载密度**:真实 Claude Code 工作集峰值、空闲快照回收比例
-- **JuiceFS 元数据引擎 HA**:生产用 ElastiCache(多AZ)，非 POC 单机 Redis
+> 验证目标：workspace 数据在 S3（JuiceFS），快照不含 rootfs，跨机 resume 无需复制磁盘
+
+**实测环境：** 本地控制面 + c6g.metal（Firecracker v1.16.0）+ 本地 Redis + JuiceFS S3
+
+| 测试项 | 结果 | 说明 |
+|---|---|---|
+| T1 创建沙盒 | ✅ PASS | FC VM 正常启动 |
+| T2 wait running | ✅ PASS | |
+| T4 suspend（方案 B）| ✅ **PASS** | S3 仅有 vm.snapshot + vm.snapshot.base，**无 rootfs** ✅ |
+| T5 resume | ✅ **PASS** | restore_time=**1.16s** |
+| T6 running after resume | ✅ PASS | |
+| T8 destroy | ✅ PASS | |
+
+**关键数字：**
+- 快照创建时间：34.7s（Full 快照，2GB 内存，EBS gp3）→ diff 快照可大幅提速
+- resume：1.16s
+- S3 快照大小：~2GB（仅内存，无 rootfs 磁盘）← 方案 A 会有额外 6GB rootfs
+
+**已验证的关键差异（方案 B vs 方案 A）：**
+- 方案 A：`vm.mem + vm.snapshot + rootfs.ext4` 三件套（~8GB）
+- 方案 B：`vm.snapshot + vm.snapshot.base` 两件套（~2GB）✅ 实测确认
+
+**已修复的 Bug（测试中发现）：**
+1. `_fc()` 默认 timeout=15s 不够 snapshot/create（16s）→ 改为 120s
+2. Mac Docker export → tar.gz → Linux ext4 tar 解压路径问题（`sbin/sbxinit` vs `usr/sbin/sbxinit`）→ 已验证 `sbin/sbxinit` 正确存在
+3. node-agent systemd 服务端口冲突（重启时旧进程未退出）→ 先 pkill 再 restart
+
+**未完成（需 FUSE kernel）：**
+- JuiceFS 实际挂载验证：CI kernel 无 FUSE，`/workspace` 未挂载（`sbxinit` 中 JuiceFS mount 失败，继续执行）
+- 需用 `scripts/build-fuse-kernel.sh` 自编 FUSE kernel 才能验证 /workspace 数据持久性
+
+## 九、下一阶段
+
+- **JuiceFS FUSE kernel**：自编带 FUSE 的 guest kernel，验证 /workspace 数据实际在 S3 持久化
+- **diff 快照优化**：Full 快照 34.7s → diff 快照预计 <5s（只写脏页）
+- **scale-to-zero 唤醒代理**：挂起沙盒被流量自动拉起（ingress-nginx 不支持，需自研 proxy 层）
+- **可观测性**：metrics/日志聚合/健康告警（CloudWatch/Prometheus）
+- **H4 真实负载密度**：真实 Claude Code 工作集峰值、空闲快照回收比例
+- **JuiceFS 元数据引擎 HA**：生产用 ElastiCache(多AZ)，非 POC 单机 Redis
