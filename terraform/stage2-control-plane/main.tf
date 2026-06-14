@@ -424,6 +424,10 @@ resource "kubernetes_config_map" "control_plane" {
 # ---------- Kubernetes: 控制面 Deployment ----------
 
 resource "kubernetes_deployment" "control_plane" {
+  # wait_for_rollout=false: 避免首次拉取 ECR 镜像时 apply 超时
+  # 用 kubectl rollout status -n sandbox-system deployment/sandbox-control-plane 确认就绪
+  wait_for_rollout = false
+
   metadata {
     name      = "sandbox-control-plane"
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name

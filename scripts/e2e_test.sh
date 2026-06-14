@@ -9,7 +9,7 @@
 # 用法(三种模式):
 #
 #   1) 生产 Ingress 模式（推荐）—— 通过 ingress-nginx NLB 访问控制面，无需 port-forward:
-#      NLB_HOST=$(kubectl get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+#      NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 #      bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" \
 #                               --resolve "api.sbx.example.com:80:$(dig +short $NLB_HOST | head -1)"
 #      # 或在 DNS 已配好的情况下:

@@ -141,7 +141,10 @@ resource "aws_iam_role_policy" "karpenter_controller_node_role" {
 
 variable "install_karpenter" {
   type    = bool
-  default = true
+  default = false
+  # Karpenter Helm OCI 在许多环境下需要 docker-credential-desktop，
+  # 会导致 apply 报错。默认关闭，通过 README Step 7 手动安装。
+  # 已验证可用命令：python3 -c "..." && helm upgrade --install karpenter oci://...
 }
 
 resource "helm_release" "karpenter" {

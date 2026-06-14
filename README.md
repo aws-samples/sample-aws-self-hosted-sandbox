@@ -160,7 +160,14 @@ kubectl wait node --all --for=condition=Ready --timeout=900s
 cd /tmp
 curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
 tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/
+
+# helm dependency build 需要 node-feature-discovery repo，先添加：
+helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
+helm repo update
+
+helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
+# 注：dependency build 报错不影响安装（kata-deploy 本体不依赖 nfd）
+
 helm install kata-deploy \
   kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
   --namespace kube-system
@@ -215,16 +222,89 @@ terraform apply -auto-approve \
 # - 创建控制面 Ingress（api.<sandbox_domain>）
 # - 通过 null_resource 部署 Karpenter NodePool（install_karpenter=true 时）
 
-【Step 7: 确认 Karpenter 就绪（Terraform 已自动安装）】
-kubectl get pods -n karpenter            # karpenter controller running
-kubectl get nodepools                    # kata-metal READY=True
-kubectl get ec2nodeclasses               # kata-metal READY=True
-# 如果 EC2NodeClass 未 Ready，查看日志：
-kubectl logs -n karpenter deployment/karpenter --tail=20
+【Step 7: 手动安装 Karpenter】
+# Karpenter Helm 使用 OCI registry，某些环境下需要移除 Docker credential store：
+python3 -c "
+import json, pathlib
+cfg = pathlib.Path.home() / '.docker/config.json'
+if cfg.exists():
+    d = json.loads(cfg.read_text())
+    d.pop('credsStore', None)
+    cfg.write_text(json.dumps(d))
+    print('credsStore removed')
+"
 
-# Terraform 已通过 karpenter_node_role_name output 创建了正确的节点 Role
-# 可通过以下命令确认：
-terraform output karpenter_node_role_name
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
+KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
+
+helm upgrade --install karpenter \
+  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
+  --namespace karpenter --create-namespace \
+  --set "settings.clusterName=claude-sbx" \
+  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
+  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
+  --set "controller.resources.limits.memory=1Gi"
+
+# 单节点集群：缩为 1 副本避免 anti-affinity 阻塞
+kubectl scale deployment karpenter -n karpenter --replicas=1
+kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
+
+# 获取 Terraform 创建的 worker node role 名称（格式固定为 <cluster-name>-karpenter-node）
+KARPENTER_NODE_ROLE="${ACCT}:role/claude-sbx-karpenter-node"
+# 或通过 AWS CLI 查询：
+# KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
+echo "Node role: $KARPENTER_NODE_ROLE"
+
+# 部署 NodePool + EC2NodeClass
+kubectl apply -f - <<NODEPOOL
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: kata-metal
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: ${KARPENTER_NODE_ROLE}
+  subnetSelectorTerms:
+    - tags:
+        kubernetes.io/role/elb: "1"
+  securityGroupSelectorTerms:
+    - tags:
+        kubernetes.io/cluster/claude-sbx: owned
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 200Gi
+        volumeType: gp3
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: kata-metal
+spec:
+  template:
+    metadata:
+      labels:
+        sandbox: "true"
+    spec:
+      requirements:
+        - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
+        - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+      taints:
+        - {key: kata-dedicated, value: "true", effect: NoSchedule}
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: kata-metal
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30m
+NODEPOOL
+
+kubectl get nodepools     # kata-metal READY=True
+kubectl get ec2nodeclasses # kata-metal READY=True
 
 【Step 8: 配置 DNS（生产访问控制面 API）】
 NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
@@ -235,6 +315,19 @@ echo "NLB DNS: $NLB_HOST"
 # POC 可跳过 DNS，直接用 --resolve 参数测试（见 Step 9）
 
 【Step 9: 验证部署】
+# Terraform apply 完成后，等待镜像拉取（ECR 首次拉取需 1-3 分钟）
+kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
+kubectl rollout status deployment/litellm -n litellm --timeout=300s
+
+# 常见问题处理：
+# LiteLLM OOMKilled → 加内存：
+#   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
+# 单节点集群 LiteLLM 第二副本 Pending（anti-affinity）→ 缩为 1 副本：
+#   kubectl scale deployment/litellm -n litellm --replicas=1
+# Terraform kubernetes provider "Unexpected Identity Change" 错误 → 清理 state 重试：
+#   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
+#   terraform apply ...（重新执行 apply）
+
 kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent 1/1
 kubectl get pods -n litellm           # LiteLLM 2/2
 kubectl get nodepools                 # kata-metal READY=True
@@ -457,7 +550,10 @@ kubectl wait node --all --for=condition=Ready --timeout=900s
 cd /tmp
 curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
 tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/
+# Add NFD repo first (required by helm dependency build)
+helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
+helm repo update
+helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
 helm install kata-deploy \
   kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
   --namespace kube-system
@@ -499,15 +595,78 @@ terraform apply -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false" \
   -var="sandbox_domain=sbx.example.com"
-# Terraform automatically creates Karpenter worker node IAM role (karpenter_node_role_name output)
-# and deploys NodePool/EC2NodeClass via null_resource
+# Terraform creates: IRSA roles, Karpenter worker node IAM role, K8s resources
+# Karpenter controller itself is installed manually in Step 7 (OCI Helm auth issues)
 
-[Step 7: Verify Karpenter (installed by Terraform)]
-kubectl get pods -n karpenter            # karpenter controller running
-kubectl get nodepools                    # kata-metal READY=True
-kubectl get ec2nodeclasses               # kata-metal READY=True
-# Check node role name created by Terraform:
-terraform output karpenter_node_role_name
+[Step 7: Install Karpenter manually]
+# Remove Docker credential store first (needed for OCI registry access)
+python3 -c "
+import json, pathlib
+cfg = pathlib.Path.home() / '.docker/config.json'
+if cfg.exists():
+    d = json.loads(cfg.read_text()); d.pop('credsStore', None)
+    cfg.write_text(json.dumps(d)); print('credsStore removed')
+"
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
+KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
+
+helm upgrade --install karpenter \
+  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
+  --namespace karpenter --create-namespace \
+  --set "settings.clusterName=claude-sbx" \
+  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
+  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
+  --set "controller.resources.limits.memory=1Gi"
+kubectl scale deployment karpenter -n karpenter --replicas=1
+kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
+
+# Get node role name (fixed naming pattern, or query AWS)
+KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
+# Alternative: KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
+kubectl apply -f - <<NODEPOOL
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: kata-metal
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: ${KARPENTER_NODE_ROLE}
+  subnetSelectorTerms:
+    - tags:
+        kubernetes.io/role/elb: "1"
+  securityGroupSelectorTerms:
+    - tags:
+        kubernetes.io/cluster/claude-sbx: owned
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs: {volumeSize: 200Gi, volumeType: gp3}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: kata-metal
+spec:
+  template:
+    metadata:
+      labels: {sandbox: "true"}
+    spec:
+      requirements:
+        - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
+        - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+      taints:
+        - {key: kata-dedicated, value: "true", effect: NoSchedule}
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: kata-metal
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30m
+NODEPOOL
+kubectl get nodepools && kubectl get ec2nodeclasses
 
 [Step 8: Configure DNS for production API access]
 NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
@@ -516,6 +675,16 @@ echo "Add DNS record: api.sbx.example.com CNAME $NLB_HOST"
 # Or skip DNS and use --resolve flag for testing (see Step 9)
 
 [Step 9: Run end-to-end tests]
+# Wait for image pull to complete (ECR first pull ~1-3 min)
+kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
+kubectl rollout status deployment/litellm -n litellm --timeout=300s
+
+# Tip: If LiteLLM is OOMKilled, increase memory:
+#   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
+# Tip: Single-node cluster - LiteLLM defaults to 2 replicas with anti-affinity;
+# scale to 1 if second pod stays Pending:
+#   kubectl scale deployment/litellm -n litellm --replicas=1
+
 kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent 1/1
 kubectl get pods -n litellm           # litellm 2/2
 

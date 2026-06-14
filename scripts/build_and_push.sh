@@ -25,6 +25,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ---------- 前置检查 ----------
+if ! command -v docker &>/dev/null; then
+  echo "ERROR: Docker not found."
+  echo ""
+  echo "在非 arm64 本地机器上，请用方式 B（SSM 在 .metal 节点上原生构建）："
+  echo "  详见 README Step 5 方式 B"
+  echo ""
+  echo "或在 arm64 机器（M 系列 Mac/Graviton EC2）上重新运行此脚本。"
+  exit 1
+fi
+
+if ! docker buildx version &>/dev/null; then
+  echo "WARNING: docker buildx 未找到，将尝试使用 docker build --platform"
+fi
+
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 ECR_BASE="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 

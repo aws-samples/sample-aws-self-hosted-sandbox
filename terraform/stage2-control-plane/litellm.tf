@@ -120,6 +120,10 @@ variable "litellm_master_key" {
 # ---------- LiteLLM Deployment ----------
 
 resource "kubernetes_deployment" "litellm" {
+  # 镜像较大（~750MB），首次拉取时间长；wait_for_rollout=false 避免 apply 超时
+  # 用 kubectl rollout status -n litellm deployment/litellm 手动确认就绪
+  wait_for_rollout = false
+
   metadata {
     name      = "litellm"
     namespace = kubernetes_namespace.litellm.metadata[0].name
