@@ -2,11 +2,9 @@
 
 > Build your own Fly.io-style Firecracker microVM sandbox on AWS — lower cost, full control, data stays in your account.
 
-[中文版](#中文版) | [English Version](#english-version)
+**中文** · [English](README.en.md)
 
 ---
-
-## 中文版
 
 ### 项目简介
 
@@ -105,19 +103,19 @@ POST /sandboxes/{id}/exec
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────┐
 │                                                                      │
-│  普通/Fargate 节点（系统）          c6g.metal 节点组（沙盒）          │
+│  托管节点组（系统节点）          Karpenter c6g.metal 节点（沙盒）     │
 │  ┌──────────────────────────┐      ┌───────────────────────────┐   │
-│  │ sandbox-control-plane    │ HTTP │  node-agent DaemonSet     │   │
-│  │ (Deployment, IRSA)       │─────►│  Firecracker REST         │   │
-│  │  KataDriver (k8s client) │      │  jailer / tap / snapshot  │   │
-│  │  FirecrackerDriver       │      │  S3 upload/download       │   │
+│  │ sandbox-control-plane    │ HTTP │  Kata microVM (kata-qemu) │   │
+│  │ (Deployment, IRSA)       │─────►│  kata 由 UserData 预装    │   │
+│  │  KataDriver (k8s client) │      │  node-agent DaemonSet     │   │
+│  │  FirecrackerDriver       │      │  jailer / tap / snapshot  │   │
 │  │  WarmPool                │      └───────────────────────────┘   │
 │  │  无状态 → DynamoDB        │                                       │
 │  └──────────────────────────┘                                       │
 │         ↑ ingress-nginx (NLB)                                       │
-│         api.sbx.<domain>  ←── 生产外部访问入口                      │
+│         api.sbx.<domain>  ←── 生产外部访问（需 AWS LB Controller）  │
 │                                                                      │
-│  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩)           │
+│  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩+预装kata)  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -156,29 +154,40 @@ terraform init && terraform apply -auto-approve \
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-【Step 3: 安装 Kata Containers 3.31】
-cd /tmp
-curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
-tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
+【Step 3: 创建 kata-qemu RuntimeClass（不要用 kata-deploy DaemonSet！）】
+#
+# ⚠️⚠️ 重要架构决策：本方案【不】使用官方 kata-deploy DaemonSet 来装 Kata。
+#
+# 原因（已实测定位的阻断性问题）：
+#   kata-deploy 安装末尾会在【已运行 kubelet + 多个容器】的节点上执行
+#   `systemctl restart containerd`。在 c6g.metal + AL2023 上，这会留下孤儿
+#   containerd-shim 并导致【整个裸金属节点 hang 约 12 分钟后才重新开机】
+#   （containerd 重启本身只要 200ms，慢的是节点级挂死）。这期间 EC2 reachability
+#   检查失败，托管节点组/ASG 会把它当 unhealthy 反复替换 → 节点替换死循环。
+#
+# 正确做法：把 Kata 安装【前置到节点 bootstrap 阶段】（kubelet 向 EKS 注册之前），
+#   由 Karpenter EC2NodeClass.userData 完成（见 Step 7）。bootstrap 阶段容器为空、
+#   EKS 还看不到该节点，containerd 重启瞬时完成、零抖动（实测新 metal 节点 30-60s Ready）。
+#
+# 因此 Step 3 只需创建 sandbox pod 调度用的 RuntimeClass（集群级对象，不碰节点）：
 
-# helm dependency build 需要 node-feature-discovery repo，先添加：
-helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
-helm repo update
-# 加好 nfd repo 后 dependency build 会正常成功；|| true 仅为防御未加 repo 的情况
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
+kubectl apply -f - <<'RUNTIMECLASS'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+handler: kata-qemu
+overhead:
+  podFixed:
+    cpu: 250m
+    memory: 160Mi
+scheduling:
+  # 只调度到 Step 7 由 Karpenter UserData 预装好 Kata 的 .metal 节点
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+RUNTIMECLASS
 
-helm install kata-deploy \
-  kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system
-
-# ⚠️ 重要：kata-deploy 安装末尾会执行 `systemctl restart containerd`，
-#    在 c6g.metal + AL2023 上会触发节点自发重启一次，kubelet 失联约 10-15 分钟后才自愈。
-#    这是已知行为 —— 请耐心等待，切勿手动 reboot/terminate 节点（会打断恢复，使节点 impaired）。
-#    timeout 放宽到 1200s（chart 的 startupProbe 本身预留了 20 分钟）：
-kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=1200s
-# 等待节点从 containerd 重启中恢复 Ready：
-kubectl wait node --all --for=condition=Ready --timeout=1200s
-kubectl get runtimeclass | grep kata-qemu   # 应能看到 kata-qemu
+kubectl get runtimeclass kata-qemu   # 应能看到 kata-qemu
 
 【Step 4: 安装 ingress-nginx（共享 NLB）】
 # 注意：必须指定 namespace
@@ -265,8 +274,12 @@ KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
 # KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
 echo "Node role: $KARPENTER_NODE_ROLE"
 
-# 部署 NodePool + EC2NodeClass
-kubectl apply -f - <<NODEPOOL
+# 部署 NodePool + EC2NodeClass（kata 由 EC2NodeClass.userData 在 bootstrap 阶段预装，见 Step 3 说明）
+# 实测：用此 EC2NodeClass 起的新 c6g.metal 节点 30-60s 内 Ready，全程零抖动、不触发 ASG 替换。
+#
+# 注意：用【带引号的 heredoc】(<<'NODEPOOL') 写到文件，避免本地 shell 干扰 userData 里的
+#       $VAR / 反引号；role 用占位符后 sed 替换。这是实测可直接复制运行的写法。
+cat > /tmp/kata-metal.yaml <<'NODEPOOL'
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
@@ -274,7 +287,7 @@ metadata:
 spec:
   amiSelectorTerms:
     - alias: al2023@latest
-  role: ${KARPENTER_NODE_ROLE}
+  role: __KARPENTER_NODE_ROLE__
   subnetSelectorTerms:
     - tags:
         kubernetes.io/role/elb: "1"
@@ -286,6 +299,37 @@ spec:
       ebs:
         volumeSize: 200Gi
         volumeType: gp3
+  # ── 方案 A：bootstrap 阶段（kubelet 注册前）预装 Kata，根治 c6g.metal 节点 hang ──
+  # Karpenter 把这段 shell 包成 MIME 的第一个 part，nodeadm（启动 kubelet）排在其后，
+  # 因此 kata 安装 + containerd 重启发生在 kubelet 注册前，节点对 EKS 始终"一次就绪"。
+  userData: |
+    #!/bin/bash
+    set -euxo pipefail
+    KATA_VERSION="3.31.0"; ARCH="arm64"
+    cd /tmp
+    # 注意：release 包是 .tar.zst（不是 .tar.xz），AL2023 自带 zstd
+    curl -fsSL "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst" -o kata.tar.zst
+    tar --use-compress-program=unzstd -xf kata.tar.zst -C /   # 包内路径 ./opt/kata/...
+    # containerd 2.x（AL2023）用 v2 配置路径 io.containerd.cri.v1.runtime；只注册 kata-qemu
+    mkdir -p /opt/kata/containerd/config.d
+    cat > /opt/kata/containerd/config.d/kata-deploy.toml <<'TOML'
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+    runtime_type = "io.containerd.kata-qemu.v2"
+    runtime_path = "/opt/kata/bin/containerd-shim-kata-v2"
+    privileged_without_host_devices = true
+    pod_annotations = ["io.katacontainers.*"]
+
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
+    ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+    TOML
+    if ! grep -q "kata-deploy.toml" /etc/containerd/config.toml 2>/dev/null; then
+      if grep -q "^imports" /etc/containerd/config.toml 2>/dev/null; then
+        sed -i 's#^imports = \[#imports = ["/opt/kata/containerd/config.d/kata-deploy.toml", #' /etc/containerd/config.toml
+      else
+        sed -i '1i imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]' /etc/containerd/config.toml
+      fi
+    fi
+    systemctl restart containerd && systemctl enable containerd
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
@@ -296,6 +340,10 @@ spec:
     metadata:
       labels:
         sandbox: "true"
+        # 必填：kata-qemu RuntimeClass（Step 3）带 nodeSelector katacontainers.io/kata-runtime=true。
+        # 方案 A 下 kata 由 UserData 预装、不经 kata-deploy 打 label，必须在此显式声明，
+        # 否则 Karpenter 认为 NodePool 不满足 RuntimeClass 的 nodeSelector，拒绝起节点。
+        katacontainers.io/kata-runtime: "true"
     spec:
       requirements:
         - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
@@ -311,6 +359,13 @@ spec:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 30m
 NODEPOOL
+
+sed -i.bak "s#__KARPENTER_NODE_ROLE__#${KARPENTER_NODE_ROLE}#" /tmp/kata-metal.yaml
+kubectl apply -f /tmp/kata-metal.yaml
+
+# 触发并验证：创建一个 sandbox（或测试 pod）后，Karpenter 会起一台 c6g.metal，
+# 实测从 launch 到节点 Ready 仅 30-60s，无 NotReady 抖动：
+# kubectl get nodeclaims -w
 
 kubectl get nodepools     # kata-metal READY=True
 kubectl get ec2nodeclasses # kata-metal READY=True
@@ -329,30 +384,30 @@ kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --time
 kubectl rollout status deployment/litellm -n litellm --timeout=300s
 
 # 常见问题处理：
-# LiteLLM OOMKilled → 加内存：
+# LiteLLM OOMKilled → stage2 默认已设 4Gi+1 副本（litellm.tf）。若仍 OOM 再加大：
 #   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
-# 单节点集群 LiteLLM 第二副本 Pending（anti-affinity）→ 缩为 1 副本：
 #   kubectl scale deployment/litellm -n litellm --replicas=1
 # Terraform kubernetes provider "Unexpected Identity Change" 错误 → 清理 state 重试：
 #   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
 #   terraform apply ...（重新执行 apply）
 
-kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent 1/1
-kubectl get pods -n litellm           # LiteLLM 2/2
+kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent（DaemonSet，调度到 kata-metal 节点）
+kubectl get pods -n litellm           # LiteLLM 1/1
 kubectl get nodepools                 # kata-metal READY=True
 
-# 生产 Ingress 模式（DNS 已配好）：
-bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
-
-# 生产 Ingress 模式（DNS 未配，用 --resolve 绕过）：
-NLB_IP=$(dig +short $NLB_HOST | head -1)
-bash scripts/e2e_test.sh \
-  --api-url "http://api.sbx.example.com" \
-  --resolve "api.sbx.example.com:80:${NLB_IP}"
-
-# 本地开发模式（自动 port-forward，不依赖 DNS/Ingress）：
+# ── 推荐：本地 port-forward 模式（不依赖 DNS/Ingress，实测 ALL TESTS PASSED）──
 bash scripts/e2e_test.sh
 # 期望：脚本结尾显示 ALL TESTS PASSED（按 driver 不同，部分用例会 skip）
+
+# ── 生产 Ingress 外部访问（⚠️ 实测开箱不通，见下）──
+# ingress-nginx 用的是 in-tree NLB（target=instance + preserve_client_ip），叠加
+# Karpenter kata-metal 节点（带 taint、跨 AZ、无 ingress pod）混入 NLB 目标组、cross-zone
+# 默认关闭，会导致外部 HTTP empty reply（集群内 ClusterIP 访问正常）。
+# 生产要走外部 Ingress，请改装 AWS Load Balancer Controller（target type=ip，直接指向 pod，
+# 绕过 NodePort/SNAT），或限定 NLB 只注册系统节点。仅做功能验证用上面的 port-forward 即可。
+# （DNS/--resolve 命令保留备查）：
+# NLB_IP=$(dig +short $NLB_HOST | head -1)
+# bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" --resolve "api.sbx.example.com:80:${NLB_IP}"
 
 【Step 10: 开始使用 API】
 # 直接访问控制面（需 DNS 或 port-forward）
@@ -391,26 +446,48 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false"
 
-# 先卸载 helm 安装物 + 删 ingress-nginx 创建的 NLB，否则它占用子网公网地址，
+# 先删 Karpenter NodePool（让它回收所有 kata-metal 节点），再卸载 helm 安装物 +
+# 删 ingress-nginx 创建的 NLB，否则残留节点/NLB 占用子网公网地址，
 # 会让下面 phase3 destroy 卡在 VPC/子网删除并报 DependencyViolation：
+kubectl delete nodepool kata-metal 2>/dev/null || true     # 触发 Karpenter 回收 .metal 节点
+kubectl delete ec2nodeclass kata-metal 2>/dev/null || true
+sleep 60  # 等 Karpenter 终止 .metal 实例
+helm uninstall karpenter     -n karpenter     2>/dev/null || true
 helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
-helm uninstall kata-deploy   -n kube-system    2>/dev/null || true
 for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
     --query 'LoadBalancers[?Type==`network`].LoadBalancerArn' --output text); do
   aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn "$arn"
 done
 sleep 30  # 等 NLB 的 ENI 释放
 
-# 再删 EKS 集群（含 .metal 节点组，整体约 15-20 分钟）
+# 删除 Karpenter 节点遗留的孤儿 pod ENI（VPC CNI 创建，节点终止后不自动清理，
+# 会让下面 phase3 destroy 卡在子网/安全组删除约 7+ 分钟）：
+VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
+  --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
+if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
+      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
+  done
+fi
+
+# 再删 EKS 集群（含 .metal 节点组，整体约 15-20 分钟；c6g.metal 终止本身较慢）
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 cd ../phase3 && terraform destroy -auto-approve \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
+# 若 VPC 删除卡住（>5min），多半是 EKS 自建的 eks-cluster-sg 滞留，手动删除它即可解除：
+#   SG=$(aws ec2 describe-security-groups --region us-east-1 \
+#     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" --query 'SecurityGroups[0].GroupId' --output text)
+#   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
+
 # 最后删 DynamoDB
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # 清理 terraform destroy 不会自动删、但会阻塞下次重建的残留资源：
 aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
+# S3 快照桶（按需）：aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
 ```
 
 ---
@@ -475,342 +552,4 @@ python3 sandbox-api/smoke_test.py
 
 ---
 
----
-
-## English Version
-
-### Overview
-
-A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and native Kubernetes integration.
-
-- **True microVM isolation**: Each sandbox runs in an independent Firecracker/Kata guest kernel — identical behavior to bare metal
-- **Pluggable backends**: Same API, switch between Kata-on-EKS (orchestration-first) or bare Firecracker (cost-first)
-- **Snapshot-driven cost control**: Idle sandboxes snapshot to S3, resume in ~1.2s
-- **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
-- **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
-
-### Use Cases
-
-| Use Case | Description |
-|---|---|
-| **Claude Code** | fork/exec-heavy, file-watch-intensive, nested processes — microVM guarantees bare-metal fidelity |
-| **OpenClaw / Hermes** | Conversational agents needing multi-tenant isolation and autoscaling |
-| **OpenAI Codex / Code-gen Agents** | Arbitrary code execution with VM-level security boundary |
-| **Long-horizon Agentic Tasks** | Pause/resume workflows, snapshot session state mid-task |
-| **SaaS Sandbox Service** | Expose isolated execution to end users, multi-tenant, usage-based billing |
-| **CI/CD Sandboxes** | Isolated build/test environments with full OS access |
-
-### Comparison with Alternatives
-
-| Feature | This (AWS Self-Hosted) | E2B | Fly.io Machines | AWS AgentCore |
-|---|---|---|---|---|
-| **Isolation** | Firecracker/Kata microVM | Firecracker microVM | Firecracker microVM | Container (shared kernel) |
-| **Bare-metal fidelity** | ✅ Highest | ✅ High | ✅ High | ❌ Container behavior gaps |
-| **Custom images** | ✅ Any ECR image | ✅ | ✅ | ❌ Restricted |
-| **Arbitrary ports** | ✅ Wildcard subdomain + NLB | ✅ | ✅ | ❌ |
-| **24×7 persistent** | ✅ | ✅ | ✅ | ❌ TTL enforced |
-| **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |
-| **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
-| **Data sovereignty** | ✅ Stays in your AWS account | ❌ 3rd party | ❌ 3rd party | ✅ |
-| **K8s ecosystem** | ✅ Native | ❌ | ❌ | ❌ |
-| **Est. cost (1000 concurrent)** | **~$170-$450/mo** | ~$800+/mo | ~$600+/mo | Per-call |
-
-> Cost based on c6g.metal with Savings Plan (~-50%) + snapshot idle recovery. Actual depends on active ratio.
-
-### Architecture
-
-```
-┌─ EKS cluster ────────────────────────────────────────────────────────┐
-│                                                                        │
-│  System nodes (Fargate/general)    c6g.metal node group (sandboxes)  │
-│  ┌────────────────────────────┐    ┌──────────────────────────────┐  │
-│  │ sandbox-control-plane      │    │  node-agent DaemonSet        │  │
-│  │ (Deployment, IRSA)         │───►│  Firecracker REST            │  │
-│  │  KataDriver (k8s client)   │    │  jailer / tap / snapshots    │  │
-│  │  FirecrackerDriver         │    │  S3 upload/download          │  │
-│  │  WarmPool                  │    └──────────────────────────────┘  │
-│  │  Stateless → DynamoDB      │                                       │
-│  └────────────────────────────┘                                       │
-│        ↑ ingress-nginx (NLB)                                          │
-│        api.sbx.<domain>  ←── production external access              │
-│                                                                        │
-│  DynamoDB   LiteLLM (Bedrock proxy)   Karpenter (metal autoscaling)  │
-└───────────────────────────────────────────────────────────────────────┘
-```
-
-### Quick Start (Agent Deployment Guide)
-
-> Copy the following to Claude Code, Cursor, or any code-capable Agent to deploy the platform end-to-end.
-
-```
-You are a DevOps engineer deploying an AI Agent sandbox platform on AWS.
-Follow these steps exactly, debugging any errors before proceeding.
-
-[Prerequisites]
-- AWS CLI configured (IAM permissions: EKS, EC2, IAM, DynamoDB, ECR, S3)
-- kubectl, terraform(>=1.5), helm, git installed
-- EC2 vCPU service quota for c6g.metal (64 vCPU) — request increase if needed
-
-[Step 0: Clone the repository]
-git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
-cd aws-self-hosted-sandbox
-export AWS_REGION=us-east-1
-
-[Step 1: Create DynamoDB state tables]
-cd terraform/stage1-dynamodb
-terraform init && terraform apply -auto-approve
-aws dynamodb list-tables --region us-east-1 | grep claude-sbx
-
-[Step 2: Create EKS cluster + .metal node group]
-cd ../phase3
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-terraform init && terraform apply -auto-approve \
-  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-# EKS control plane ~10-12 min; with .metal node group cold start, ~15 min total
-aws eks update-kubeconfig --name claude-sbx --region us-east-1
-kubectl wait node --all --for=condition=Ready --timeout=900s
-
-[Step 3: Install Kata Containers 3.31]
-cd /tmp
-curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
-tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
-# Add NFD repo first (required by helm dependency build)
-helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
-helm repo update
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
-helm install kata-deploy \
-  kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy \
-  --namespace kube-system
-
-# ⚠️ IMPORTANT: kata-deploy runs `systemctl restart containerd` at the end of install,
-#    which on c6g.metal + AL2023 makes the node reboot once — kubelet goes unreachable
-#    for ~10-15 min before self-healing. This is expected. Be patient and DO NOT manually
-#    reboot/terminate the node (that interrupts recovery and leaves it impaired).
-#    Widen the timeout to 1200s (the chart's startupProbe already budgets 20 min):
-kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=1200s
-# Wait for the node to recover Ready after the containerd restart:
-kubectl wait node --all --for=condition=Ready --timeout=1200s
-kubectl get runtimeclass | grep kata-qemu
-
-[Step 4: Install ingress-nginx (shared NLB)]
-# IMPORTANT: specify namespace to avoid conflicts with Terraform later
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-helm install ingress-nginx ingress-nginx/ingress-nginx \
-  --namespace ingress-nginx --create-namespace \
-  --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb \
-  --set controller.ingressClassResource.default=true
-# Wait for NLB external address (~1-3 min)
-kubectl get svc -n ingress-nginx ingress-nginx-controller --watch
-
-[Step 5: Build and push arm64 images]
-# Note: the sandbox image repo claude-sbx is auto-created by phase3 (Step 2); only create these two:
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
-aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-# Run on arm64 machine (M-series Mac, Graviton EC2, or the .metal node itself)
-# See build_and_push.sh for SSM-based remote build on .metal node
-bash scripts/build_and_push.sh
-
-[Step 6: Deploy control plane + LiteLLM + Karpenter IAM]
-# sandbox_domain is the subdomain root; control plane will be at api.<sandbox_domain>
-# Example: sandbox_domain=sbx.example.com → api.sbx.example.com
-#
-# IMPORTANT: add create_ingress_nginx=false since Step 4 already installed it
-cd terraform/stage2-control-plane && terraform init
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="my-sandbox-snapshots-${ACCT}"
-aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
-terraform apply -auto-approve \
-  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
-  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
-  -var="snapshot_s3_bucket=${S3_BUCKET}" \
-  -var="enable_fargate=false" \
-  -var="create_ingress_nginx=false" \
-  -var="sandbox_domain=sbx.example.com"
-# Terraform creates: IRSA roles, Karpenter worker node IAM role, K8s resources,
-# and EKS Access Entry for karpenter_node role (EC2_LINUX type) —
-# this is what allows Karpenter-provisioned nodes to join the cluster via TLS bootstrap
-# Karpenter controller itself is installed manually in Step 7 (OCI Helm auth issues)
-
-[Step 7: Install Karpenter manually]
-# Remove Docker credential store first (needed for OCI registry access)
-python3 -c "
-import json, pathlib
-cfg = pathlib.Path.home() / '.docker/config.json'
-if cfg.exists():
-    d = json.loads(cfg.read_text()); d.pop('credsStore', None)
-    cfg.write_text(json.dumps(d)); print('credsStore removed')
-"
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
-KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
-
-helm upgrade --install karpenter \
-  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
-  --namespace karpenter --create-namespace \
-  --set "settings.clusterName=claude-sbx" \
-  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
-  --set "controller.resources.limits.memory=1Gi"
-kubectl scale deployment karpenter -n karpenter --replicas=1
-kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
-
-# Get node role name (fixed naming pattern, or query AWS)
-KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
-# Alternative: KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
-kubectl apply -f - <<NODEPOOL
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: kata-metal
-spec:
-  amiSelectorTerms:
-    - alias: al2023@latest
-  role: ${KARPENTER_NODE_ROLE}
-  subnetSelectorTerms:
-    - tags:
-        kubernetes.io/role/elb: "1"
-  securityGroupSelectorTerms:
-    - tags:
-        kubernetes.io/cluster/claude-sbx: owned
-  blockDeviceMappings:
-    - deviceName: /dev/xvda
-      ebs: {volumeSize: 200Gi, volumeType: gp3}
----
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: kata-metal
-spec:
-  template:
-    metadata:
-      labels: {sandbox: "true"}
-    spec:
-      requirements:
-        - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
-        - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
-        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
-      taints:
-        - {key: kata-dedicated, value: "true", effect: NoSchedule}
-      nodeClassRef:
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-        name: kata-metal
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30m
-NODEPOOL
-kubectl get nodepools && kubectl get ec2nodeclasses
-
-[Step 8: Configure DNS for production API access]
-NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo "Add DNS record: api.sbx.example.com CNAME $NLB_HOST"
-# Or skip DNS and use --resolve flag for testing (see Step 9)
-
-[Step 9: Run end-to-end tests]
-# Wait for image pull to complete (ECR first pull ~1-3 min)
-kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
-kubectl rollout status deployment/litellm -n litellm --timeout=300s
-
-# Tip: If LiteLLM is OOMKilled, increase memory:
-#   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
-# Tip: Single-node cluster - LiteLLM defaults to 2 replicas with anti-affinity;
-# scale to 1 if second pod stays Pending:
-#   kubectl scale deployment/litellm -n litellm --replicas=1
-
-kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent 1/1
-kubectl get pods -n litellm           # litellm 2/2
-
-# Production Ingress mode (DNS configured):
-bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
-
-# Production Ingress mode (no DNS, use --resolve):
-NLB_IP=$(dig +short $NLB_HOST | head -1)
-bash scripts/e2e_test.sh \
-  --api-url "http://api.sbx.example.com" \
-  --resolve "api.sbx.example.com:80:${NLB_IP}"
-
-# Local dev mode (auto port-forward):
-bash scripts/e2e_test.sh
-# Expected: script ends with ALL TESTS PASSED (some tests skip depending on driver)
-
-[Step 10: Use the API]
-BASE_URL="http://api.sbx.example.com"   # or http://localhost:18000
-
-# Create sandbox (idempotent)
-curl -s $BASE_URL/sandboxes -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"cpu":2,"mem_mib":4096,"tenant_id":"user-1","idempotency_key":"req-001"}'
-
-# Wait for ready
-curl "$BASE_URL/sandboxes/{id}/wait?state=running&timeout=30"
-
-# Execute command
-curl -s $BASE_URL/sandboxes/{id}/exec -X POST -d '{"cmd":"echo hello"}'
-
-# Suspend (snapshot + free memory)
-curl -s -X POST $BASE_URL/sandboxes/{id}/suspend
-
-# Resume (~1.2s)
-curl -s -X POST $BASE_URL/sandboxes/{id}/resume
-
-# Destroy
-curl -s -X DELETE $BASE_URL/sandboxes/{id}
-
-[Cleanup]
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="my-sandbox-snapshots-${ACCT}"
-cd terraform/stage2-control-plane && terraform destroy -auto-approve \
-  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
-  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
-  -var="snapshot_s3_bucket=${S3_BUCKET}" \
-  -var="enable_fargate=false" \
-  -var="create_ingress_nginx=false"
-
-# Uninstall helm releases + delete the NLB created by ingress-nginx first — otherwise it
-# holds public addresses on the subnets and phase3 destroy stalls on VPC/subnet deletion
-# with DependencyViolation:
-helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
-helm uninstall kata-deploy   -n kube-system    2>/dev/null || true
-for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
-    --query 'LoadBalancers[?Type==`network`].LoadBalancerArn' --output text); do
-  aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn "$arn"
-done
-sleep 30  # wait for NLB ENIs to release
-
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-cd ../phase3 && terraform destroy -auto-approve \
-  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-cd ../stage1-dynamodb && terraform destroy -auto-approve
-
-# Clean up leftovers that destroy won't remove but that block a future re-create:
-aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
-aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
-```
-
-### Key Benchmark Numbers
-
-| Metric | Measured | Environment |
-|---|---|---|
-| microVM cold start | ~0.31s | c6g.metal, Firecracker v1.16 |
-| Snapshot resume | **1.2s (cross-host) / 7ms (same host)** | Full snapshot, 4GB memory |
-| Idle memory footprint | ~50 MB/VM | 512 MiB allocated |
-| Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
-| npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
-| LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| e2e test pass rate | **17/17 (ALL PASS)** | Cluster-deployed, Kata driver |
-
-### Local Smoke Test (No AWS Required)
-
-```bash
-pip install "moto[dynamodb]" boto3 kubernetes
-python3 sandbox-api/smoke_test.py
-# Expected: 21/21 PASS
-```
-
----
-
-*This project is a production-grade reference implementation. Use it as a foundation for building your own agent sandbox platform on AWS.*
+*本项目是生产级参考实现，可作为在 AWS 上自建 Agent 沙盒平台的基础。*

@@ -130,7 +130,9 @@ resource "kubernetes_deployment" "litellm" {
     labels    = { app = "litellm" }
   }
   spec {
-    replicas = 2
+    # 实测 (2026-06-14)：LiteLLM 镜像在 2Gi limit 下【必 OOMKilled】（连续重启）。
+    # 默认设为 4Gi；单节点集群两副本受 anti-affinity 影响第二副本会 Pending，故默认 1 副本。
+    replicas = 1
     selector { match_labels = { app = "litellm" } }
     template {
       metadata { labels = { app = "litellm" } }
@@ -157,7 +159,7 @@ resource "kubernetes_deployment" "litellm" {
           }
           resources {
             requests = { cpu = "250m", memory = "1Gi" }
-            limits   = { cpu = "2",    memory = "2Gi" }
+            limits   = { cpu = "2",    memory = "4Gi" }  # 2Gi 会 OOMKilled，实测需 4Gi
           }
           readiness_probe {
             http_get {

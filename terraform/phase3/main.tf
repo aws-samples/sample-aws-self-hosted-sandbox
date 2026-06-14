@@ -98,7 +98,15 @@ module "eks" {
     subnet_ids = module.vpc.public_subnets
   }
 
-  # 托管节点组:Graviton .metal,打 sandbox=true label 供 nodeSelector 用
+  # 托管节点组:集群【系统节点】—— 跑控制面 / ingress-nginx / LiteLLM / Karpenter controller。
+  #
+  # ⚠️ 架构说明（方案 A）：本节点组【不】承载 sandbox，因此【不打 sandbox=true label】。
+  #    sandbox 由 Karpenter 的 kata-metal NodePool（Step 7，UserData 预装 Kata）承载。
+  #    控制面 KataDriver 创建的 sandbox pod 用 nodeSelector sandbox=true，只会落到
+  #    Karpenter 起的、带 sandbox=true + katacontainers.io/kata-runtime=true 的 .metal 节点。
+  #
+  #    本组用 .metal 仅因 POC 早期需要它引导集群；纯系统节点其实无需裸金属，
+  #    可把 metal_instance_type 改小（如 c6g.xlarge）显著省成本——改小后系统组件照常运行。
   eks_managed_node_groups = {
     metal_arm64 = {
       ami_type       = "AL2023_ARM_64_STANDARD"
@@ -107,7 +115,6 @@ module "eks" {
       max_size       = 2
       desired_size   = 1
 
-      # .metal 根盘留足:Kata 镜像 + devmapper(若用 FC 后端)+ 沙盒镜像
       block_device_mappings = {
         xvda = {
           device_name = "/dev/xvda"
@@ -118,8 +125,9 @@ module "eks" {
         }
       }
 
+      # 不打 sandbox=true：本组是系统节点，sandbox 走 Karpenter kata-metal（见上）
       labels = {
-        sandbox = "true"
+        role = "system"
       }
     }
   }
