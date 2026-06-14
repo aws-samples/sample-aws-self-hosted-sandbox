@@ -168,104 +168,69 @@ kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=300s
 kubectl get runtimeclass | grep kata-qemu   # 应能看到 kata-qemu
 
 【Step 4: 安装 ingress-nginx（共享 NLB）】
+# 注意：必须指定 namespace
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
   --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb \
   --set controller.ingressClassResource.default=true
-# 等待 NLB 分配地址
-kubectl get svc ingress-nginx-controller --watch
+# 等待 NLB 分配外部地址（需 1-3 分钟）
+kubectl get svc -n ingress-nginx ingress-nginx-controller --watch
 
 【Step 5: 创建 ECR 仓库并构建 arm64 镜像】
-# 方式 A：在 .metal 节点上原生构建（推荐，无需 buildx）
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-bash scripts/build_and_push.sh   # 通过 SSM 在 .metal 节点上构建，自动推送
 
-# 方式 B：本地 arm64 机器（M 系列 Mac 或 Graviton EC2）
-# docker buildx build --platform linux/arm64 -t $ACCT.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest sandbox-api/
-# docker buildx build --platform linux/arm64 -t $ACCT.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest node-agent/
+# 方式 A：本地 arm64 机器（M 系列 Mac）或 arm64 EC2 直接构建
+bash scripts/build_and_push.sh
+
+# 方式 B：在 .metal 节点上原生构建（x86 机器无 buildx 时推荐）
+# 需要 Step 2 的 .metal 节点已 Ready，node-agent 已通过 SSM 可访问
+# 详见 scripts/build_and_push.sh 注释中的 SSM 构建方式
 
 【Step 6: 部署控制面 + LiteLLM + Karpenter IAM】
+# sandbox_domain 传入的是"子域名根"，控制面将暴露在 api.<sandbox_domain>
+# 例如传 sbx.example.com，则访问地址为 http://api.sbx.example.com
 cd terraform/stage2-control-plane
 terraform init
 ACCT=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="my-sandbox-snapshots-${ACCT}"   # 替换为你的 S3 桶
+S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
 
+# 注意：Step 4 已手动安装 ingress-nginx，必须加 create_ingress_nginx=false 避免冲突
 terraform apply -auto-approve \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
   -var="snapshot_s3_bucket=${S3_BUCKET}" \
   -var="enable_fargate=false" \
-  -var="sandbox_domain=sbx.example.com"   # 替换为你的域名
+  -var="create_ingress_nginx=false" \
+  -var="sandbox_domain=sbx.example.com"   # 控制面将暴露在 api.sbx.example.com
 
-【Step 7: 安装 Karpenter（手动，避免 Helm OCI 兼容问题）】
-KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
-CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
-# 移除 Docker credsStore（Helm OCI 需要）
-python3 -c "import json,pathlib; cfg=pathlib.Path.home()/'.docker/config.json'; d=json.loads(cfg.read_text()); d.pop('credsStore',None); cfg.write_text(json.dumps(d))"
-helm upgrade --install karpenter \
-  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
-  --namespace karpenter --create-namespace \
-  --set "settings.clusterName=claude-sbx" \
-  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
-  --set "controller.resources.limits.memory=1Gi"
-# 单节点集群只需 1 副本
-kubectl scale deployment karpenter -n karpenter --replicas=1
-# 部署 NodePool
-kubectl apply -f - <<'NODEPOOL'
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: kata-metal
-spec:
-  amiSelectorTerms:
-    - alias: al2023@latest
-  role: metal_arm64-eks-node-group-<suffix>   # 替换为实际节点角色名
-  subnetSelectorTerms:
-    - tags:
-        kubernetes.io/role/elb: "1"
-  securityGroupSelectorTerms:
-    - tags:
-        kubernetes.io/cluster/claude-sbx: owned
-  blockDeviceMappings:
-    - deviceName: /dev/xvda
-      ebs:
-        volumeSize: 200Gi
-        volumeType: gp3
----
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: kata-metal
-spec:
-  template:
-    metadata:
-      labels:
-        sandbox: "true"
-    spec:
-      requirements:
-        - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
-        - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
-        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
-      taints:
-        - {key: kata-dedicated, value: "true", effect: NoSchedule}
-      nodeClassRef:
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-        name: kata-metal
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30m
-NODEPOOL
+# Terraform 会自动：
+# - 创建 IRSA 角色（控制面/node-agent/LiteLLM/Karpenter）
+# - 创建 Karpenter Worker Node IAM Role（节点加入集群所需）
+# - 部署 K8s 资源（sandbox-system/litellm namespace）
+# - 创建控制面 Ingress（api.<sandbox_domain>）
+# - 通过 null_resource 部署 Karpenter NodePool（install_karpenter=true 时）
+
+【Step 7: 确认 Karpenter 就绪（Terraform 已自动安装）】
+kubectl get pods -n karpenter            # karpenter controller running
+kubectl get nodepools                    # kata-metal READY=True
+kubectl get ec2nodeclasses               # kata-metal READY=True
+# 如果 EC2NodeClass 未 Ready，查看日志：
+kubectl logs -n karpenter deployment/karpenter --tail=20
+
+# Terraform 已通过 karpenter_node_role_name output 创建了正确的节点 Role
+# 可通过以下命令确认：
+terraform output karpenter_node_role_name
 
 【Step 8: 配置 DNS（生产访问控制面 API）】
-NLB_HOST=$(kubectl get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 echo "NLB DNS: $NLB_HOST"
-# 在 Route53 或你的 DNS 提供商添加：
+# 在 Route53 或你的 DNS 提供商添加（以上面的 sandbox_domain=sbx.example.com 为例）：
 #   api.sbx.example.com  CNAME  $NLB_HOST
 # POC 可跳过 DNS，直接用 --resolve 参数测试（见 Step 9）
 
@@ -274,16 +239,16 @@ kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent 1/1
 kubectl get pods -n litellm           # LiteLLM 2/2
 kubectl get nodepools                 # kata-metal READY=True
 
-# 生产 Ingress 模式测试（DNS 已配好）：
+# 生产 Ingress 模式（DNS 已配好）：
 bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
 
-# 生产 Ingress 模式测试（DNS 未配，用 --resolve 绕过）：
+# 生产 Ingress 模式（DNS 未配，用 --resolve 绕过）：
 NLB_IP=$(dig +short $NLB_HOST | head -1)
 bash scripts/e2e_test.sh \
   --api-url "http://api.sbx.example.com" \
   --resolve "api.sbx.example.com:80:${NLB_IP}"
 
-# 本地开发模式（自动 port-forward）：
+# 本地开发模式（自动 port-forward，不依赖 DNS/Ingress）：
 bash scripts/e2e_test.sh
 # 期望：17/17 ALL PASS
 
@@ -313,8 +278,21 @@ curl -s -X POST $BASE_URL/sandboxes/{id}/resume
 curl -s -X DELETE $BASE_URL/sandboxes/{id}
 
 【清理（避免费用）】
-cd terraform/stage2-control-plane && terraform destroy -auto-approve ...
-cd ../phase3 && terraform destroy -auto-approve -var="endpoint_public_access_cidrs=[\"0.0.0.0/0\"]"
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+S3_BUCKET="my-sandbox-snapshots-${ACCT}"
+# 先删 stage2（K8s 资源/LiteLLM/Karpenter IAM）
+cd terraform/stage2-control-plane && terraform destroy -auto-approve \
+  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
+  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
+  -var="snapshot_s3_bucket=${S3_BUCKET}" \
+  -var="enable_fargate=false" \
+  -var="create_ingress_nginx=false"
+# 再删 EKS 集群（耗时约 10 分钟）
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+cd ../phase3 && terraform destroy -auto-approve \
+  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
+# 最后删 DynamoDB
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 ```
 
@@ -487,19 +465,28 @@ kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=300s
 kubectl get runtimeclass | grep kata-qemu
 
 [Step 4: Install ingress-nginx (shared NLB)]
+# IMPORTANT: specify namespace to avoid conflicts with Terraform later
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
   --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb \
   --set controller.ingressClassResource.default=true
-kubectl get svc ingress-nginx-controller --watch   # wait for EXTERNAL-IP
+# Wait for NLB external address (~1-3 min)
+kubectl get svc -n ingress-nginx ingress-nginx-controller --watch
 
 [Step 5: Build and push arm64 images]
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-bash scripts/build_and_push.sh   # builds natively on .metal node via SSM
+# Run on arm64 machine (M-series Mac, Graviton EC2, or the .metal node itself)
+# See build_and_push.sh for SSM-based remote build on .metal node
+bash scripts/build_and_push.sh
 
 [Step 6: Deploy control plane + LiteLLM + Karpenter IAM]
+# sandbox_domain is the subdomain root; control plane will be at api.<sandbox_domain>
+# Example: sandbox_domain=sbx.example.com → api.sbx.example.com
+#
+# IMPORTANT: add create_ingress_nginx=false since Step 4 already installed it
 cd terraform/stage2-control-plane && terraform init
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
@@ -510,25 +497,23 @@ terraform apply -auto-approve \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
   -var="snapshot_s3_bucket=${S3_BUCKET}" \
   -var="enable_fargate=false" \
+  -var="create_ingress_nginx=false" \
   -var="sandbox_domain=sbx.example.com"
+# Terraform automatically creates Karpenter worker node IAM role (karpenter_node_role_name output)
+# and deploys NodePool/EC2NodeClass via null_resource
 
-[Step 7: Install Karpenter 1.3.3]
-KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
-CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
-python3 -c "import json,pathlib; cfg=pathlib.Path.home()/'.docker/config.json'; d=json.loads(cfg.read_text()); d.pop('credsStore',None); cfg.write_text(json.dumps(d))"
-helm upgrade --install karpenter \
-  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
-  --namespace karpenter --create-namespace \
-  --set "settings.clusterName=claude-sbx" \
-  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
-  --set "controller.resources.limits.memory=1Gi"
-kubectl scale deployment karpenter -n karpenter --replicas=1
+[Step 7: Verify Karpenter (installed by Terraform)]
+kubectl get pods -n karpenter            # karpenter controller running
+kubectl get nodepools                    # kata-metal READY=True
+kubectl get ec2nodeclasses               # kata-metal READY=True
+# Check node role name created by Terraform:
+terraform output karpenter_node_role_name
 
 [Step 8: Configure DNS for production API access]
-NLB_HOST=$(kubectl get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 echo "Add DNS record: api.sbx.example.com CNAME $NLB_HOST"
-# Or test without DNS using --resolve
+# Or skip DNS and use --resolve flag for testing (see Step 9)
 
 [Step 9: Run end-to-end tests]
 kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent 1/1
@@ -571,8 +556,18 @@ curl -s -X POST $BASE_URL/sandboxes/{id}/resume
 curl -s -X DELETE $BASE_URL/sandboxes/{id}
 
 [Cleanup]
-cd terraform/stage2-control-plane && terraform destroy -auto-approve ...
-cd ../phase3 && terraform destroy -auto-approve -var="endpoint_public_access_cidrs=[\"0.0.0.0/0\"]"
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+S3_BUCKET="my-sandbox-snapshots-${ACCT}"
+cd terraform/stage2-control-plane && terraform destroy -auto-approve \
+  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
+  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
+  -var="snapshot_s3_bucket=${S3_BUCKET}" \
+  -var="enable_fargate=false" \
+  -var="create_ingress_nginx=false"
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+cd ../phase3 && terraform destroy -auto-approve \
+  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 ```
 

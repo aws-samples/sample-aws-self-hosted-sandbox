@@ -645,7 +645,9 @@ resource "kubernetes_ingress_v1" "control_plane" {
   spec {
     ingress_class_name = "nginx"
     rule {
-      host = "api.sbx.${var.sandbox_domain}"
+      # sandbox_domain 应传入完整子域，例如 sbx.example.com
+      # 则控制面访问地址为 api.sbx.example.com
+      host = "api.${var.sandbox_domain}"
       http {
         path {
           path      = "/"
@@ -669,7 +671,7 @@ output "control_plane_service" {
 }
 
 output "control_plane_ingress_host" {
-  value = var.expose_control_plane ? "http://api.sbx.${var.sandbox_domain} (需配 DNS → NLB)" : "disabled"
+  value = var.expose_control_plane ? "http://api.${var.sandbox_domain} (需配 DNS CNAME → NLB)" : "disabled"
 }
 
 output "sandbox_control_plane_role_arn" {

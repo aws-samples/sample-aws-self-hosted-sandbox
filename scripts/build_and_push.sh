@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# 构建并推送控制面 + node-agent 镜像到 ECR
+# 构建并推送控制面 + node-agent 镜像到 ECR（arm64 架构）
 #
 # 用法:
 #   bash scripts/build_and_push.sh [--region us-east-1] [--cluster claude-sbx]
 #
-# 假设:
-#   - AWS CLI 已配置
-#   - Docker 已运行
-#   - terraform/phase1 已 apply(ECR 仓库 claude-sbx 已存在)
+# 前提:
+#   - AWS CLI 已配置（有 ECR 推送权限）
+#   - Docker 已运行，并已配置 buildx 多平台支持：
+#       docker buildx create --use --name arm64-builder --platform linux/arm64
+#     或直接在 arm64 机器（M 系列 Mac / Graviton EC2）上运行此脚本（无需 buildx）
+#
+# 注意：在 x86 机器上跨平台构建 arm64 镜像需要 QEMU 支持且速度较慢。
+#       推荐在 .metal 节点上通过 SSM 原生构建（见 README Step 5 方式A）。
 
 set -euo pipefail
 

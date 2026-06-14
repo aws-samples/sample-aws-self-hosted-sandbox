@@ -125,8 +125,9 @@ module "eks" {
   }
 
   # 节点角色加 Bedrock 调用权限(沙盒走节点凭据链调 Bedrock;生产改 IRSA/出口代理)
+  # 保留节点安全组的集群标签，供 Karpenter 安全组选择器使用
   node_security_group_tags = {
-    "kubernetes.io/cluster/${var.cluster_name}" = null
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
 }
 
@@ -134,9 +135,18 @@ module "eks" {
 # 节点角色不再持有 Bedrock 权限 —— 沙盒内代码无法直接调 Bedrock(R8 凭据隔离落地)
 # 沙盒走: Claude Code → ANTHROPIC_BASE_URL=http://litellm.litellm:4000 → LiteLLM Pod → Bedrock
 
-# ---------- ECR(复用 Phase 1 的也行;这里独立声明便于单独 apply) ----------
+# ---------- ECR 仓库(直接创建,不依赖 phase1) ----------
+resource "aws_ecr_repository" "sbx" {
+  name                 = "claude-sbx"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+
+  tags = { Project = "claude-sbx-poc" }
+}
+
 data "aws_ecr_repository" "sbx" {
-  name = "claude-sbx"
+  name       = aws_ecr_repository.sbx.name
+  depends_on = [aws_ecr_repository.sbx]
 }
 
 # ---------- 输出 ----------

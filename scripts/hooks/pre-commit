@@ -1,23 +1,34 @@
 #!/usr/bin/env bash
 #
-# pre-commit hook —— 提交前用 Claude 做 AI code review。
+# pre-commit hook —— 提交前依次执行：
+#   1) Claude AI code review（发现严重问题时阻断提交）；
+#   2) 依据本次改动自动更新 README.md（中文版 + English Version，不阻断提交）。
 # 此文件通过 scripts/install-hooks.sh 安装到 .git/hooks/pre-commit。
 #
 set -uo pipefail
 
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# ---- 1. AI code review（可阻断）---------------------------------------------
 # 允许临时跳过：SKIP_CODE_REVIEW=1 git commit ...
 if [[ "${SKIP_CODE_REVIEW:-}" == "1" ]]; then
   echo "[pre-commit] SKIP_CODE_REVIEW=1，跳过 AI code review。"
-  exit 0
+else
+  REVIEW_SCRIPT="$REPO_ROOT/scripts/code-review.sh"
+  if [[ -x "$REVIEW_SCRIPT" ]]; then
+    "$REVIEW_SCRIPT" || exit $?   # 审查判定 BLOCK 时退出码非 0，阻断提交
+  else
+    echo "[pre-commit] 未找到可执行的 $REVIEW_SCRIPT，跳过审查。" >&2
+  fi
 fi
 
-# 定位仓库根目录并调用审查脚本
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-REVIEW_SCRIPT="$REPO_ROOT/scripts/code-review.sh"
-
-if [[ ! -x "$REVIEW_SCRIPT" ]]; then
-  echo "[pre-commit] 未找到可执行的 $REVIEW_SCRIPT，跳过审查。" >&2
-  exit 0
+# ---- 2. 自动更新 README（不阻断）-------------------------------------------
+# 允许临时跳过：SKIP_README_UPDATE=1 git commit ...
+README_SCRIPT="$REPO_ROOT/scripts/update-readme.sh"
+if [[ -x "$README_SCRIPT" ]]; then
+  "$README_SCRIPT" || true        # README 更新始终不阻断提交
+else
+  echo "[pre-commit] 未找到可执行的 $README_SCRIPT，跳过 README 更新。" >&2
 fi
 
-exec "$REVIEW_SCRIPT"
+exit 0

@@ -17,6 +17,8 @@ fi
 
 for hook in "$SRC_DIR"/*; do
   name="$(basename "$hook")"
+  # 跳过说明文档等非 hook 文件
+  [[ "$name" == "README.md" ]] && continue
   dst="$DST_DIR/$name"
   cp "$hook" "$dst"
   chmod +x "$dst"
@@ -24,5 +26,8 @@ for hook in "$SRC_DIR"/*; do
 done
 
 chmod +x "$REPO_ROOT/scripts/code-review.sh" 2>/dev/null || true
-echo "完成。提交时将自动运行 AI code review。"
-echo "临时跳过：git commit --no-verify  或  SKIP_CODE_REVIEW=1 git commit"
+chmod +x "$REPO_ROOT/scripts/update-readme.sh" 2>/dev/null || true
+echo "完成。提交时将自动运行 AI code review，并按需自动更新 README（中/英文版）。"
+echo "临时跳过 code review：SKIP_CODE_REVIEW=1 git commit"
+echo "临时跳过 README 更新：SKIP_README_UPDATE=1 git commit"
+echo "跳过全部 hook：git commit --no-verify"

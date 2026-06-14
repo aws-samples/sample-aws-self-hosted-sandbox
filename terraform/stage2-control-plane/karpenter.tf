@@ -1,15 +1,13 @@
-# Karpenter 自动扩缩 —— 替换固定 .metal 节点组
+# Karpenter 自动扩缩 —— .metal 节点按需扩缩，空闲 30 分钟整合
 #
-# 双节点池:
-#   standard-arm64  : 系统负载(LiteLLM / ingress / 控制面)
-#   kata-metal      : 沙盒专用(.metal,带 kata-dedicated taint)
+# 重要：Karpenter 需要一个专用的 EKS Worker Node IAM Role（非控制器 Role）
+# 来启动节点。本文件创建该 Role 并与 EC2NodeClass 关联。
 #
-# 收益:
-#   - .metal 按需扩缩,空闲 30 分钟整合(比固定节点组节省大量成本)
-#   - Kata 节点 UserData 自动装 devmapper + containerd kata runtime
-#   - 系统组件与沙盒隔离调度
+# 使用方式：
+#   设 install_karpenter=true 时，Terraform 通过 helm 安装 controller，
+#   并通过 null_resource local-exec 部署 NodePool/EC2NodeClass CRD。
 
-# ---------- Karpenter IRSA ----------
+# ---------- Karpenter Controller IRSA ----------
 
 resource "aws_iam_role" "karpenter_controller" {
   name = "${var.cluster_name}-karpenter"
@@ -29,11 +27,6 @@ resource "aws_iam_role" "karpenter_controller" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "karpenter_controller" {
-  role       = aws_iam_role.karpenter_controller.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-}
-
 resource "aws_iam_role_policy" "karpenter_controller_inline" {
   name = "karpenter-controller"
   role = aws_iam_role.karpenter_controller.id
@@ -45,38 +38,119 @@ resource "aws_iam_role_policy" "karpenter_controller_inline" {
         Action = [
           "ec2:CreateLaunchTemplate", "ec2:DeleteLaunchTemplate",
           "ec2:DescribeLaunchTemplates", "ec2:DescribeInstances",
-          "ec2:DescribeInstanceTypes", "ec2:DescribeSubnets",
-          "ec2:DescribeSecurityGroups", "ec2:DescribeImages",
-          "ec2:DescribeSpotPriceHistory", "ec2:CreateFleet",
+          "ec2:DescribeInstanceTypes", "ec2:DescribeInstanceTypeOfferings",
+          "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups",
+          "ec2:DescribeImages", "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeSpotPriceHistory", "ec2:DescribeLaunchTemplateVersions",
+          "ec2:DescribeKeyPairs", "ec2:CreateFleet",
           "ec2:RunInstances", "ec2:TerminateInstances",
           "ec2:CreateTags", "ec2:DeleteTags",
-          "iam:PassRole", "iam:GetInstanceProfile",
-          "iam:CreateInstanceProfile", "iam:AddRoleToInstanceProfile",
-          "iam:RemoveRoleFromInstanceProfile",
-          "eks:DescribeCluster",
-          "pricing:GetProducts",
-          "ssm:GetParameter",
         ]
+        Resource = ["*"]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "iam:PassRole",
+          "iam:GetInstanceProfile",
+          "iam:CreateInstanceProfile",
+          "iam:DeleteInstanceProfile",
+          "iam:AddRoleToInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+          "iam:TagInstanceProfile",
+        ]
+        Resource = ["*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["eks:DescribeCluster", "pricing:GetProducts", "ssm:GetParameter"]
         Resource = ["*"]
       }
     ]
   })
 }
 
-# ---------- Karpenter Helm(安装 controller) ----------
+# ---------- Karpenter Worker Node IAM Role ----------
+# 这是 Karpenter 启动 EC2 实例所用的 IAM 角色（不是控制器自身的角色）
+# 需要 EKS Worker Node 的标准策略，节点才能 join 集群
+
+resource "aws_iam_role" "karpenter_node" {
+  name = "${var.cluster_name}-karpenter-node"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node_worker" {
+  role       = aws_iam_role.karpenter_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node_cni" {
+  role       = aws_iam_role.karpenter_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node_ecr" {
+  role       = aws_iam_role.karpenter_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node_ssm" {
+  role       = aws_iam_role.karpenter_node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# S3 快照访问（node-agent 上传/下载快照）
+resource "aws_iam_role_policy" "karpenter_node_s3" {
+  name = "karpenter-node-s3-snapshot"
+  role = aws_iam_role.karpenter_node.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+      Resource = local.snapshot_bucket != "" ? [
+        "arn:aws:s3:::${local.snapshot_bucket}",
+        "arn:aws:s3:::${local.snapshot_bucket}/*",
+      ] : ["arn:aws:s3:::placeholder"]
+    }]
+  })
+}
+
+# aws:auth ConfigMap 中需要映射此 Role（让 Karpenter 节点能 join 集群）
+resource "aws_iam_role_policy" "karpenter_controller_node_role" {
+  name = "karpenter-grant-node-role"
+  role = aws_iam_role.karpenter_controller.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["iam:PassRole"]
+      Resource = [aws_iam_role.karpenter_node.arn]
+    }]
+  })
+}
+
+# ---------- Karpenter Helm（安装 controller）----------
 
 variable "install_karpenter" {
   type    = bool
-  default = true   # 已手动安装验证通过(v1.3.3);Terraform 管理 IAM 和 NodePool CRD
+  default = true
 }
 
 resource "helm_release" "karpenter" {
-  count      = var.install_karpenter ? 1 : 0
-  name       = "karpenter"
-  repository = "oci://public.ecr.aws/karpenter"
-  chart      = "karpenter"
-  version    = "1.0.0"
-  namespace  = "karpenter"
+  count            = var.install_karpenter ? 1 : 0
+  name             = "karpenter"
+  repository       = "oci://public.ecr.aws/karpenter"
+  chart            = "karpenter"
+  version          = "1.3.3"   # 与手动安装版本一致
+  namespace        = "karpenter"
   create_namespace = true
 
   set {
@@ -97,45 +171,54 @@ resource "helm_release" "karpenter" {
   }
   set {
     name  = "controller.resources.requests.memory"
-    value = "512Mi"
+    value = "256Mi"
+  }
+  set {
+    name  = "controller.resources.limits.cpu"
+    value = "1"
+  }
+  set {
+    name  = "controller.resources.limits.memory"
+    value = "1Gi"
   }
 }
 
-# ---------- NodePool: 标准 arm64 系统池 ----------
-# 用 kubernetes_manifest 声明(需 Karpenter CRD 已装)
+# ---------- NodePool / EC2NodeClass ----------
+# Karpenter v1 API: amiFamily 已废弃，改用 amiSelectorTerms with alias
+# 修复点：
+#   - amiFamily → amiSelectorTerms[].alias: al2023@latest
+#   - role → 使用 karpenter_node role（EKS worker，非 controller）
+#   - standard-arm64 使用 public subnet（elb 标签），无 NAT 时节点也能出网
+#   - securityGroupSelectorTerms 使用 owned 标签（与 phase3 SG 标签一致）
 
-locals {
-  # 公有子网 ID(节点需出网)—— 从 VPC data source 取
-  public_subnet_ids = data.aws_subnets.private.ids  # 复用已有 data source
-}
-
-# 注意:NodePool / EC2NodeClass 是 Karpenter CRD,需 Karpenter 已装。
-# 用 null_resource + local-exec 而非 kubernetes_manifest,避免 CRD 不存在时 plan 报错。
 resource "null_resource" "karpenter_nodepools" {
   count = var.install_karpenter ? 1 : 0
 
   triggers = {
     cluster_name = var.cluster_name
     metal_type   = var.metal_instance_type
+    node_role    = aws_iam_role.karpenter_node.name
   }
 
   provisioner "local-exec" {
     command = <<-EOT
       cat <<'NODEPOOL' | kubectl apply -f -
       ---
+      # EC2NodeClass for system workloads (non-.metal)
       apiVersion: karpenter.k8s.aws/v1
       kind: EC2NodeClass
       metadata:
         name: standard-arm64
       spec:
-        amiFamily: AL2023
-        role: ${aws_iam_role.karpenter_controller.name}
+        amiSelectorTerms:
+          - alias: al2023@latest
+        role: ${aws_iam_role.karpenter_node.name}
         subnetSelectorTerms:
           - tags:
-              kubernetes.io/role/internal-elb: "1"
+              kubernetes.io/role/elb: "1"
         securityGroupSelectorTerms:
           - tags:
-              kubernetes.io/cluster/${var.cluster_name}: shared
+              kubernetes.io/cluster/${var.cluster_name}: owned
         blockDeviceMappings:
           - deviceName: /dev/xvda
             ebs:
@@ -150,12 +233,8 @@ resource "null_resource" "karpenter_nodepools" {
         template:
           spec:
             requirements:
-              - key: kubernetes.io/arch
-                operator: In
-                values: ["arm64"]
-              - key: karpenter.sh/capacity-type
-                operator: In
-                values: ["on-demand"]
+              - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+              - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
             nodeClassRef:
               group: karpenter.k8s.aws
               kind: EC2NodeClass
@@ -164,30 +243,26 @@ resource "null_resource" "karpenter_nodepools" {
           consolidationPolicy: WhenEmptyOrUnderutilized
           consolidateAfter: 1m
       ---
+      # EC2NodeClass for sandbox .metal nodes
       apiVersion: karpenter.k8s.aws/v1
       kind: EC2NodeClass
       metadata:
         name: kata-metal
       spec:
-        amiFamily: AL2023
-        role: ${aws_iam_role.karpenter_controller.name}
+        amiSelectorTerms:
+          - alias: al2023@latest
+        role: ${aws_iam_role.karpenter_node.name}
         subnetSelectorTerms:
           - tags:
               kubernetes.io/role/elb: "1"
         securityGroupSelectorTerms:
           - tags:
-              kubernetes.io/cluster/${var.cluster_name}: shared
+              kubernetes.io/cluster/${var.cluster_name}: owned
         blockDeviceMappings:
           - deviceName: /dev/xvda
             ebs:
               volumeSize: 200Gi
               volumeType: gp3
-        userData: |
-          #!/bin/bash
-          # 自动装 Kata + 注册 containerd runtime(Karpenter 节点 cold start)
-          dnf install -y python3 awscli docker 2>/dev/null || true
-          systemctl start docker 2>/dev/null || true
-          # node-agent 在 DaemonSet 里会自动调度上来
       ---
       apiVersion: karpenter.sh/v1
       kind: NodePool
@@ -195,23 +270,16 @@ resource "null_resource" "karpenter_nodepools" {
         name: kata-metal
       spec:
         template:
-          spec:
-            requirements:
-              - key: node.kubernetes.io/instance-type
-                operator: In
-                values: ["${var.metal_instance_type}"]
-              - key: kubernetes.io/arch
-                operator: In
-                values: ["arm64"]
-              - key: karpenter.sh/capacity-type
-                operator: In
-                values: ["on-demand"]
-            taints:
-              - key: kata-dedicated
-                value: "true"
-                effect: NoSchedule
+          metadata:
             labels:
               sandbox: "true"
+          spec:
+            requirements:
+              - {key: node.kubernetes.io/instance-type, operator: In, values: ["${var.metal_instance_type}"]}
+              - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+              - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+            taints:
+              - {key: kata-dedicated, value: "true", effect: NoSchedule}
             nodeClassRef:
               group: karpenter.k8s.aws
               kind: EC2NodeClass
@@ -231,4 +299,9 @@ resource "null_resource" "karpenter_nodepools" {
 
 output "karpenter_role_arn" {
   value = aws_iam_role.karpenter_controller.arn
+}
+
+output "karpenter_node_role_name" {
+  value = aws_iam_role.karpenter_node.name
+  description = "EC2NodeClass spec.role 的值，Karpenter 用此 Role 启动节点"
 }
