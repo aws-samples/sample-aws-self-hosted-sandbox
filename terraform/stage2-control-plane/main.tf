@@ -617,10 +617,59 @@ resource "helm_release" "ingress_nginx" {
   }
 }
 
+# ---------- 控制面 Ingress(生产外部访问) ----------
+# 通过 ingress-nginx 暴露控制面 API，支持从集群外直接访问。
+# 访问地址: https://api.sbx.<sandbox_domain>
+# 生产应配 ACM 证书 + Route53；POC 用 HTTP 或 kubectl port-forward。
+
+variable "expose_control_plane" {
+  type    = bool
+  default = true
+  description = "是否通过 Ingress 对外暴露控制面 API"
+}
+
+resource "kubernetes_ingress_v1" "control_plane" {
+  count = var.expose_control_plane ? 1 : 0
+
+  metadata {
+    name      = "sandbox-control-plane"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+    annotations = {
+      "nginx.ingress.kubernetes.io/rewrite-target" = "/"
+      # 生产开启 TLS:
+      # "nginx.ingress.kubernetes.io/ssl-redirect" = "true"
+      # "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
+    }
+  }
+
+  spec {
+    ingress_class_name = "nginx"
+    rule {
+      host = "api.sbx.${var.sandbox_domain}"
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = kubernetes_service.control_plane.metadata[0].name
+              port { number = 80 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 # ---------- Outputs ----------
 
 output "control_plane_service" {
   value = "http://${kubernetes_service.control_plane.metadata[0].name}.${kubernetes_namespace.sandbox_system.metadata[0].name}.svc.cluster.local"
+}
+
+output "control_plane_ingress_host" {
+  value = var.expose_control_plane ? "http://api.sbx.${var.sandbox_domain} (需配 DNS → NLB)" : "disabled"
 }
 
 output "sandbox_control_plane_role_arn" {

@@ -6,20 +6,32 @@
 #   2. terraform/stage2-control-plane 已 apply
 #   3. 控制面 Pod Running: kubectl -n sandbox-system get pods
 #
-# 用法:
-#   bash scripts/e2e_test.sh [--driver firecracker|kata] [--api-url http://...]
+# 用法(三种模式):
 #
-# 若不传 --api-url,脚本自动 port-forward sandbox-control-plane:80 → localhost:18000
+#   1) 生产 Ingress 模式（推荐）—— 通过 ingress-nginx NLB 访问控制面，无需 port-forward:
+#      NLB_HOST=$(kubectl get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+#      bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" \
+#                               --resolve "api.sbx.example.com:80:$(dig +short $NLB_HOST | head -1)"
+#      # 或在 DNS 已配好的情况下:
+#      bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com"
+#
+#   2) port-forward 模式（本地开发）—— 不传 --api-url，脚本自动 port-forward:
+#      bash scripts/e2e_test.sh
+#
+#   3) 直接指定地址:
+#      bash scripts/e2e_test.sh --api-url http://localhost:18000
 
 set -euo pipefail
 
 # ---------- 参数解析 ----------
 DRIVER="kata"
 API_URL=""
+CURL_EXTRA=""
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --driver)    DRIVER="$2";   shift 2 ;;
-    --api-url)   API_URL="$2";  shift 2 ;;
+    --driver)    DRIVER="$2";    shift 2 ;;
+    --api-url)   API_URL="$2";   shift 2 ;;
+    --resolve)   CURL_EXTRA="--resolve $2"; shift 2 ;;  # 覆盖 DNS(用于 Ingress 测试)
     *)           shift ;;
   esac
 done
@@ -35,15 +47,22 @@ fail() { echo -e "${RED}  FAIL${NC} $1"; FAILED=$((FAILED+1)); }
 info() { echo -e "${YELLOW}  ----${NC} $1"; }
 FAILED=0
 
-# ---------- port-forward ----------
+# ---------- port-forward（本地开发/调试用）----------
+# 生产环境：API_URL 应指向 ingress-nginx NLB，例如：
+#   http://api.sbx.example.com（已配 DNS → NLB）
+#   或使用 --resolve 参数绕过 DNS，直接测 NLB IP
 setup_portforward() {
-  if [[ -n "$API_URL" ]]; then return; fi
-  info "Starting port-forward sandbox-control-plane → localhost:${LOCAL_PORT}"
+  if [[ -n "$API_URL" ]]; then
+    info "Using provided API URL: $API_URL"
+    return
+  fi
+  info "No --api-url provided, starting port-forward (dev mode)"
+  info "Production: use --api-url http://api.sbx.<domain> (ingress-nginx NLB)"
   kubectl -n "$NAMESPACE" port-forward svc/sandbox-control-plane "${LOCAL_PORT}:80" &>/tmp/pf.log &
   PF_PID=$!
   sleep 3
   API_URL="http://localhost:${LOCAL_PORT}"
-  echo "  API URL: $API_URL"
+  echo "  API URL: $API_URL (port-forward)"
 }
 
 teardown_portforward() {
@@ -57,11 +76,13 @@ trap teardown_portforward EXIT
 api() {
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
+    # shellcheck disable=SC2086
     curl -s -w "\n%{http_code}" -X "$method" \
       -H "Content-Type: application/json" \
-      -d "$body" "${API_URL}${path}"
+      -d "$body" ${CURL_EXTRA} "${API_URL}${path}"
   else
-    curl -s -w "\n%{http_code}" -X "$method" "${API_URL}${path}"
+    # shellcheck disable=SC2086
+    curl -s -w "\n%{http_code}" -X "$method" ${CURL_EXTRA} "${API_URL}${path}"
   fi
 }
 
