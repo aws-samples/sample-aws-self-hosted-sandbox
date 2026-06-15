@@ -113,6 +113,8 @@
    - **生产**:若要 clh(virtio-fs/热插拔),需在 kata-deploy values 显式启用 clh shim 并确认其 containerd 配置写入。**arm64 + clh 的开箱可用性确实不如 qemu**,选型时纳入。
 4. **节点网络重建会让 Pod 短暂 NotReady**:Terraform 改子网/重建节点组时,运行中的节点会经历 unreachable→恢复;生产变更网络需滚动、避开业务高峰。
 5. **Kata Pod 需设 resources**:`BestEffort`(无 requests/limits)的 Kata Pod 实测不稳定(Exit 9 / CrashLoopBackOff);设明确 `requests/limits`(2vCPU/4Gi)后稳定 0 重启。沙盒模板必须带资源声明。
+6. **kata-deploy DaemonSet 在 c6g.metal 上致节点 hang + ASG 替换循环(★第二轮实测确证,已弃用 kata-deploy)**:照 README 早期用 `helm install kata-deploy` 后,c6g.metal + AL2023(containerd 2.2.3) 节点 kubelet 失联,`uptime -s` 证实**整个裸金属节点 hang ~12 分钟后才重新开机**。SSM journalctl 定位:**containerd 重启本身仅 200ms 不慢**,是在【已运行 kubelet+多容器】的 metal 节点上重启 containerd 留下孤儿 shim → 节点级挂死;期间 EC2 reachability 失败 → 托管节点组 ASG 反复替换节点(实测连换 105→49→225 三个),**与 c6g/c7g 机型无关**。
+   - **根治 = 方案 A(已验证)**:不用 kata-deploy DaemonSet;改由 Karpenter `EC2NodeClass.userData` 在节点 **bootstrap 阶段(kubelet 注册前)预装 kata**(kata-static-*.tar.zst 解压 + containerd v2 drop-in + restart)。此时容器为空、EKS 还看不到节点,containerd 重启瞬时完成。实测新 c6g.metal 节点 **30-60s Ready、零抖动、零替换**,e2e ALL TESTS PASSED。详见 `部署验证日志-2026-06-14.md` 与 README.md Step 3/7。
 
 ## 四点六、H2 文件系统(JuiceFS)—— 已实测(详见 `文件系统方案对比.md`)
 

@@ -1,8 +1,28 @@
-# README 部署指引验证报告
+# README 部署指引验证报告（第一轮 · kata-deploy 路线 · 已被方案 A 取代）
 
 > 验证日期：2026-06-14 ｜ 账号：427169985960 ｜ Region：us-east-1
 > 验证方式：在真实 AWS 环境按 README「快速开始（Agent 部署指南）」逐步执行
 > 工具版本：terraform 1.15.2 / kubectl 1.36 / helm 4.2.0 / aws-cli / docker(colima) 29.5.3
+
+---
+
+> ## ⚠️ 状态更新（2026-06-14 第二轮）：本报告所述 Step 3 阻断问题已根治
+>
+> 本报告是**第一轮**验证（README 当时用 `kata-deploy` DaemonSet 路线）的产物，核心结论「照 README
+> 会卡在 Step 3」**已不再适用**。第二轮已定位根因并落地**方案 A**，全流程跑通（e2e ALL TESTS PASSED）：
+>
+> - **根因（已确证）**：containerd 重启本身仅 200ms 不慢；是在【已运行 kubelet+多容器】的 c6g.metal 上
+>   重启 containerd 会让**整个裸金属节点 hang ~12 分钟后才重新开机**（`uptime` 证实），期间 EC2
+>   reachability 失败 → 托管节点组 ASG 反复替换节点 → 替换循环。**与 c6g/c7g 机型无关**（本报告 P0-1
+>   第 4 点「建议改 c7g.metal」已作废——换机型不解决问题）。
+> - **方案 A（已验证）**：不再用 kata-deploy DaemonSet；改由 Karpenter `EC2NodeClass.userData` 在节点
+>   **bootstrap 阶段（kubelet 注册前）预装 kata**，containerd 重启发生在 EKS 看到节点之前，节点
+>   **30-60s 一次就绪、零抖动**。
+> - **权威流程与最新验证**：见 `README.md` Step 3/7、`部署验证日志-2026-06-14.md`、`POC-技术文档.md §3.2/§6.5`。
+> - **本报告中已被后续修复采纳的项**：P1-1（Karpenter role 写法）、P2-2/P2-3/P2-4/P2-5/P2-7、第五节
+>   （EKS Access Entry，已在 stage2 落地）。这些保留作历史记录。
+>
+> 下方原始内容**保持不变**，仅作第一轮记录归档。
 
 ---
 
@@ -27,7 +47,10 @@
 
 ## 二、阻断级问题（必须修复）
 
-### P0-1. Step 3 kata-deploy 导致节点重启循环，文档完全未提示
+### P0-1. Step 3 kata-deploy 导致节点重启循环，文档完全未提示 — ✅ 已由方案 A 根治（见文首状态更新）
+
+> 注：下方「建议修复」的第 4 点（改 c7g.metal / 预装 drop-in）方向部分正确，但最终定案是
+> **方案 A（Karpenter UserData 在 bootstrap 预装 kata）**，而非换机型。换机型不解决节点 hang。
 
 **现象**：逐字执行 README Step 3 默认命令
 ```

@@ -140,34 +140,46 @@ spec:
     consolidateAfter: 30m        # 空闲 30 分钟整合(.metal 贵,但沙盒长驻,别太激进)
 ```
 
-**(2) EC2NodeClass 的 UserData 自动装 Kata**(这是最值钱的一段)
-把现在文档 Phase 3 里"手动 `kata-deploy` + 注册 RuntimeClass"的步骤,前移到节点启动的 UserData,实现节点起来即带 Kata:
+**(2) EC2NodeClass 的 UserData 自动装 Kata**(这是最值钱的一段)— ✅ **已落地为方案 A**
+把"手动 `kata-deploy` + 注册 RuntimeClass"前移到节点启动的 UserData,实现节点起来即带 Kata。
+
+> ✅ 此条已实测落地并成为最终方案("方案 A")。背景:照 README 早期的 `kata-deploy` DaemonSet 在
+> c6g.metal 上会让节点 hang ~12 分钟 + ASG 替换循环(根因见 `部署验证日志-2026-06-14.md`);改为
+> UserData **bootstrap 阶段(kubelet 注册前)预装 kata** 后,新 c6g.metal 节点 30-60s Ready、零抖动。
+> 权威 manifest 见 `README.md` Step 7,要点已固化如下注释。
+
 ```yaml
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata: { name: kata-metal }
 spec:
-  amiFamily: Ubuntu          # 或 AL2023;Workshop 用 Ubuntu 24.04
+  amiSelectorTerms: [{ alias: al2023@latest }]   # 最终用 AL2023 arm64
+  role: claude-sbx-karpenter-node
   blockDeviceMappings:
-    - deviceName: /dev/sda1
+    - deviceName: /dev/xvda
       ebs: { volumeSize: 200Gi, volumeType: gp3 }
   userData: |
     #!/bin/bash
-    # 1) devmapper thin-pool(Kata + Firecracker 后端需要块设备 snapshotter)
-    # 2) 安装 kata-containers 二进制 + guest kernel/rootfs
-    # 3) 配 containerd:注册 kata-fc / kata-qemu / kata-clh runtime handler
-    # (具体脚本见 Workshop kata-bare-metal UserData;落地时固化成我们的 cloud-init)
+    # 实测要点(踩坑后固化):
+    # 1) 下载 kata-static-3.31.0-arm64.tar.zst(是 .zst 不是 .xz)→ tar --use-compress-program=unzstd -xf ... -C /
+    # 2) 写 containerd v2 drop-in: [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+    #    ConfigPath=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+    # 3) base config.toml 加 imports → 指向 drop-in;然后 systemctl restart containerd
+    # 4) NodePool labels 须含 katacontainers.io/kata-runtime=true,否则 Karpenter 拒绝起节点
 ```
+> qemu 系列在 arm64 开箱可用;clh 需在 drop-in 里额外注册 kata-clh handler(默认未注册)。
 
 **(3) 沙盒 Pod 加 toleration**
 `k8s/sandbox.yaml` 和 `app.py` 的 manifest 现在只有 `nodeSelector: { sandbox: "true" }`,改为同时容忍 taint:
 ```yaml
 spec:
-  runtimeClassName: kata-clh
-  nodeSelector: { sandbox: "true" }   # 仍可保留,或改用 karpenter.sh/nodepool
+  runtimeClassName: kata-qemu          # 已定案 kata-qemu(clh arm64 默认未注册)
+  nodeSelector: { sandbox: "true" }    # 仍可保留,或改用 karpenter.sh/nodepool
   tolerations:
     - { key: kata-dedicated, operator: Exists, effect: NoSchedule }
 ```
+> 实测 `app.py` / 控制面 KataDriver 创建 sandbox pod 已用 `runtimeClassName: kata-qemu` +
+> `nodeSelector: sandbox=true` + `kata-dedicated` toleration,与本条一致。
 
 ### 收益
 - ✅ .metal 按需扩缩,空闲整合省钱

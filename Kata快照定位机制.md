@@ -48,7 +48,7 @@ VMM 是哪个,取决于 Pod 的 `runtimeClassName`(= Kata 用哪个发动机):
 | RuntimeClass | VMM 进程 | 快照控制接口 | 备注 |
 |---|---|---|---|
 | `kata-qemu` | `qemu-system-*` | **QMP socket**(`savevm`/migrate) | 我们集群当前用的;clh 默认没注册时的回退 |
-| `kata-clh` | `cloud-hypervisor` | CH 自己的 HTTP API(`/api/v1/vm.snapshot`) | 需 kata-deploy 显式启用 clh shim |
+| `kata-clh` | `cloud-hypervisor` | CH 自己的 HTTP API(`/api/v1/vm.snapshot`) | 需在节点 containerd 显式注册 clh runtime(方案 A 下即在 EC2NodeClass.userData 的 drop-in 里加 kata-clh) |
 | `kata-fc` | `firecracker` | **Firecracker REST**(`/snapshot/create`) | 同 Fly 那套;块设备-only,限制多 |
 
 > 这就是难点:裸 Firecracker 只有一套 REST 快照 API(我们 `fc_snapshot_api.py` 用的);
