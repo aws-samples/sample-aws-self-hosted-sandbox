@@ -159,27 +159,7 @@ POST /sandboxes/{id}/exec
 - 已安装 kubectl, terraform (≥1.5), helm, git
 - c6g.metal vCPU 配额已申请（64 vCPU，默认配额不足需提前提单）
 
-确认就绪后，请打开 docs/deploy.md，从 Step 0 开始执行。
-
-【详细步骤见 docs/deploy.md（Step 0 ~ 清理，共约 10 步）】
-
-以下仅展示第一步，其余步骤请 Agent 直接读取 docs/deploy.md 执行：
-
-【Step 0: 克隆代码库】
-git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
-cd aws-self-hosted-sandbox
-export AWS_REGION=us-east-1
-
-# ↓ 后续步骤全部在 docs/deploy.md 中，请继续阅读并执行 Step 1 ~ Step 9 + 清理。
-
-【Step 1: 创建 DynamoDB 状态表】
-cd terraform/stage1-dynamodb
-terraform init && terraform apply -auto-approve
-# 验证：aws dynamodb list-tables --region us-east-1 | grep claude-sbx
-
-# ── Step 2 ~ Step 9 + 清理 详见 docs/deploy.md ──
-# （含：EKS集群/Kata RuntimeClass/ingress-nginx/ECR镜像构建/
-#   控制面+LiteLLM/Karpenter NodePool/验证/API使用/资源清理）
+确认就绪后，请读取并执行 docs/deploy.md 中的所有步骤。
 ```
 
 ---
