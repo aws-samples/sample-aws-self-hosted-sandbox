@@ -99,8 +99,8 @@ Claude Code 是 fork/exec 密集、进程树深、文件监听重、且执行不
 |---|---|---|
 | **计算(裸金属)** | **Graviton .metal**:POC 实测用 `c6g.metal`(64 vCPU/128 GiB,~$2.18/hr*);更新代可用 `c7g.metal`/`m7g.metal` | KVM 只在 `.metal` 暴露。Graviton(arm64)$/vCPU、$/GiB 最优,Claude Code(Node)原生跑 arm64。生产做密度可上 Graviton4 `m8g.metal-48xl`(192 vCPU/768 GiB) |
 | 编排(Phase 3) | **EKS** + `.metal` 托管节点组 + **Kata RuntimeClass** | K8s 接管调度/健康/扩缩,比自管 Nomad 轻 |
-| 节点 OS | **Amazon Linux 2023 (arm64)** 或 Bottlerocket | POC 用 AL2023 配合 `kata-deploy` 最直接 |
-| 自动扩缩 | Karpenter(生产) | POC 阶段手动管节点即可 |
+| 节点 OS | **Amazon Linux 2023 (arm64)** 或 Bottlerocket | POC 用 AL2023；Kata 经 Karpenter EC2NodeClass.userData 在 bootstrap 阶段预装（不用 kata-deploy DaemonSet，避免节点 hang，见 §3.2/§6.5） |
+| 自动扩缩 | **Karpenter**（kata-metal NodePool，UserData 预装 kata） | .metal 沙盒节点按需扩缩，空闲 30 分钟整合 |
 | 镜像仓库 | **ECR** | 存沙盒镜像/rootfs 构建产物 |
 | 网络/任意端口 | VPC + **NLB**(L4,保留任意 TCP/UDP)+ 安全组 | ALB 仅 HTTP;任意端口须用 NLB |
 | 对象存储 | **S3** | JuiceFS 数据后端 + Firecracker 快照存储 |
@@ -453,18 +453,39 @@ eksctl create cluster -f eks-cluster.yaml
 
 #### 3.2 安装 Kata Containers(Cloud Hypervisor 后端,arm64)
 
+> ⚠️ **此处早期用的 `kata-deploy` DaemonSet 方式已废弃**（见下）。最终落地方案见下方"方案 A"，
+> 也即 §6.5 与 README.md 的权威流程。下面保留 kata-deploy 方式仅作演进对照。
+
+**❌ 早期方式（kata-deploy DaemonSet，已弃用）：**
 ```bash
 # kata-deploy DaemonSet 会在节点装好 Kata 二进制并注册 containerd runtime
 kubectl apply -k "github.com/kata-containers/kata-containers/tools/packaging/kata-deploy/kata-rbac/base?ref=stable-3.x"
 kubectl apply -k "github.com/kata-containers/kata-containers/tools/packaging/kata-deploy/kata-deploy/base?ref=stable-3.x"
 kubectl -n kube-system rollout status ds/kata-deploy
-
-# 注册 RuntimeClass(Cloud Hypervisor 后端 = kata-clh)
 kubectl apply -k "github.com/kata-containers/kata-containers/tools/packaging/kata-deploy/runtimeclasses?ref=stable-3.x"
-kubectl get runtimeclass    # 应看到 kata-clh / kata-qemu 等
 ```
+> **为什么弃用（实测根因）**：kata-deploy 末尾的 `systemctl restart containerd` 在【已运行 kubelet+
+> 多容器】的 c6g.metal + AL2023 上会让整个裸金属节点 hang ~12 分钟后才重新开机（containerd 重启
+> 本身仅 200ms，慢的是节点级挂死），期间 EC2 reachability 失败 → 托管节点组 ASG 反复替换节点 →
+> **节点替换循环**。此外 kata-deploy 3.31 arm64 默认只注册 qemu 系列 handler，`kata-clh` 不可用
+> （RuntimeClass 存在但 containerd 无 handler，报 `no runtime for "kata-clh" is configured`），
+> 故后端定案 **kata-qemu**（同样真 guest 内核，保真度一致）。
 
-> ⚠️ 需复核:Kata 在 arm64 + Cloud Hypervisor 的当前支持矩阵,以及 AL2023 .metal 节点上 `kata-deploy` 是否需额外内核模块。若 `kata-clh` 在 arm64 有问题,POC 可回退到 `kata-qemu`(同样真 guest 内核,保真度一致,仅启动稍慢)。
+**✅ 方案 A（最终落地）：把 Kata 安装前置到节点 bootstrap，containerd 重启发生在 kubelet 向 EKS
+注册之前，节点对 EKS 始终"一次就绪"，零抖动。**
+```bash
+# (1) 集群级只创建 kata-qemu RuntimeClass（不碰节点）
+kubectl apply -f - <<'RC'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: kata-qemu}
+handler: kata-qemu
+overhead: {podFixed: {cpu: 250m, memory: 160Mi}}
+scheduling: {nodeSelector: {katacontainers.io/kata-runtime: "true"}}
+RC
+# (2) .metal 节点由 Karpenter EC2NodeClass.userData 在 bootstrap 阶段装 kata（详见 README.md Step 7）
+# 实测新 c6g.metal 节点 30-60s Ready、零抖动。
+```
 
 #### 3.3 部署 Claude Code 沙盒 Pod + 任意端口
 
@@ -791,16 +812,24 @@ MY_IP=$(curl -s https://checkip.amazonaws.com)
 terraform apply -auto-approve -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 
-# Step 3: Kata 3.31（通过 helm，非 kata-deploy DaemonSet）
-# kata-deploy DaemonSet 会触发 containerd 重启 → 节点 hang → EKS 替换循环
-# 正确做法：helm install + 等待 rollout
-cd /tmp && curl -sL https://github.com/kata-containers/kata-containers/archive/refs/tags/3.31.0.tar.gz -o kata.tar.gz
-tar -xzf kata.tar.gz kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/
-helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
-helm repo update
-helm dependency build kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy/ || true
-helm install kata-deploy kata-containers-3.31.0/tools/packaging/kata-deploy/helm-chart/kata-deploy --namespace kube-system
-kubectl rollout status daemonset/kata-deploy -n kube-system --timeout=300s
+# Step 3: 只创建 kata-qemu RuntimeClass（不要装 kata-deploy DaemonSet！）
+# 实测根因：kata-deploy 末尾的 systemctl restart containerd 在【已运行 kubelet+多容器】的
+# c6g.metal 上会让整个节点 hang ~12 分钟后才重新开机（containerd 重启本身仅 200ms，慢的是
+# 节点级挂死），期间 EC2 reachability 失败 → 托管节点组 ASG 反复替换节点 → 替换循环。
+# 方案 A：把 kata 安装前置到节点 bootstrap（kubelet 注册前），由 Karpenter UserData 完成（Step 7）。
+# 此处只建调度用的 RuntimeClass：
+kubectl apply -f - <<'RUNTIMECLASS'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+handler: kata-qemu
+overhead:
+  podFixed: {cpu: 250m, memory: 160Mi}
+scheduling:
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"   # 只调度到 Step 7 UserData 预装好 kata 的 .metal 节点
+RUNTIMECLASS
 
 # Step 4: ingress-nginx（必须指定 namespace）
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -833,9 +862,22 @@ helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --vers
   --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::${ACCT}:role/claude-sbx-karpenter" \
   --set "controller.resources.limits.memory=1Gi"
 kubectl scale deployment karpenter -n karpenter --replicas=1
+kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
+
+# 部署 kata-metal NodePool/EC2NodeClass（核心：userData 在 bootstrap 阶段预装 kata，
+# 实测新 c6g.metal 节点 30-60s Ready、零抖动。完整 manifest 见 README.md Step 7）。
+# 关键三点（实测踩坑）：
+#   1) artifact 是 kata-static-*.tar.zst（非 .tar.xz）；unzstd 解压；包内路径 ./opt/kata/...
+#   2) containerd 2.x 用 v2 配置路径 io.containerd.cri.v1.runtime；
+#      ConfigPath=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+#   3) NodePool labels 必须含 katacontainers.io/kata-runtime=true，否则 Karpenter
+#      认为不满足 kata-qemu RuntimeClass 的 nodeSelector 而拒绝起节点
+# （此处省略 manifest 全文，直接复用 README.md「Step 7」中的 /tmp/kata-metal.yaml）
 
 # Step 8: 端到端测试
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
+# LiteLLM 默认 2Gi 必 OOMKilled，stage2 已默认 4Gi+1 副本（litellm.tf）
+# 推荐 port-forward 模式（实测 ALL TESTS PASSED）；生产 Ingress 外部访问需 AWS LB Controller
 bash scripts/e2e_test.sh   # 期望: ALL TESTS PASSED
 ```
 
