@@ -137,355 +137,49 @@ POST /sandboxes/{id}/exec
 
 ### 快速开始（Agent 部署指南）
 
-> 将以下内容复制给 Claude Code / Cursor / 任意支持代码执行的 Agent，即可引导完整部署。
+> 将以下提示词复制给 Claude Code / Cursor / 任意支持代码执行的 Agent，即可引导完整部署。
+> 完整步骤手册见 **[docs/deploy.md](docs/deploy.md)**。
 
 ```
-你是一名 DevOps 工程师，需要在 AWS 上部署一套 AI Agent 沙盒平台。
-请严格按照以下步骤执行，遇到错误先排查再继续。
+你是一名 AWS 基础设施部署工程师，负责在 AWS 上部署一套 AI Agent 沙盒平台。
 
-【前提条件】
-- AWS CLI 已配置（有权限创建 EKS/EC2/IAM/DynamoDB/ECR/S3）
-- kubectl, terraform(>=1.5), helm, git 已安装
-- 已申请好足够的 EC2 vCPU 服务配额（c6g.metal = 64 vCPU，默认配额不够需提前申请）
+任务：完整阅读并按顺序执行 docs/deploy.md 中的所有步骤（Step 0 ~ Step 9）。
+遇到错误时先排查根因，修复后再继续，不要跳过任何步骤。
+
+⚠️ 关键注意事项（执行前必读）：
+1. 认证安全：Step 6 必须传入 api_keys 和 litellm_master_key（用 openssl rand -hex 32 生成），
+   不能留空——控制面无 key 时所有受保护接口返回 503。
+2. 不要安装 kata-deploy DaemonSet：Kata 由 Step 7 的 Karpenter EC2NodeClass.userData 预装，
+   DaemonSet 方式会导致 c6g.metal 节点 hang 12 分钟并触发节点替换死循环。
+3. arm64 镜像：Step 5 的 build_and_push.sh 须在 arm64 机器上执行（M 系列 Mac 或 .metal 节点）。
+4. 计费：c6g.metal 约 $2.3/hr，测试完成后立即执行 docs/deploy.md 中的【清理】步骤。
+
+开始前先确认：
+- AWS CLI 已配置（需要 EKS / EC2 / IAM / DynamoDB / ECR / S3 权限）
+- 已安装 kubectl, terraform (≥1.5), helm, git
+- c6g.metal vCPU 配额已申请（64 vCPU，默认配额不足需提前提单）
+
+确认就绪后，请打开 docs/deploy.md，从 Step 0 开始执行。
+
+【详细步骤见 docs/deploy.md（Step 0 ~ 清理，共约 10 步）】
+
+以下仅展示第一步，其余步骤请 Agent 直接读取 docs/deploy.md 执行：
 
 【Step 0: 克隆代码库】
 git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
 cd aws-self-hosted-sandbox
 export AWS_REGION=us-east-1
 
+# ↓ 后续步骤全部在 docs/deploy.md 中，请继续阅读并执行 Step 1 ~ Step 9 + 清理。
+
 【Step 1: 创建 DynamoDB 状态表】
 cd terraform/stage1-dynamodb
 terraform init && terraform apply -auto-approve
-# 验证：
-aws dynamodb list-tables --region us-east-1 | grep claude-sbx
+# 验证：aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 
-【Step 2: 创建 EKS 集群 + .metal 节点组】
-cd ../phase3
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-terraform init && terraform apply -auto-approve \
-  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-# EKS 控制面约 10-12 分钟，加 .metal 节点组冷启动整体约 15 分钟，等待 Ready
-aws eks update-kubeconfig --name claude-sbx --region us-east-1
-kubectl wait node --all --for=condition=Ready --timeout=900s
-
-【Step 3: 创建 kata-qemu RuntimeClass】
-kubectl apply -f - <<'RUNTIMECLASS'
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-qemu
-handler: kata-qemu
-overhead:
-  podFixed:
-    cpu: 250m
-    memory: 160Mi
-scheduling:
-  # 只调度到 Step 7 由 Karpenter UserData 预装好 Kata 的 .metal 节点
-  nodeSelector:
-    katacontainers.io/kata-runtime: "true"
-RUNTIMECLASS
-
-kubectl get runtimeclass kata-qemu   # 应能看到 kata-qemu
-
-【Step 4: 安装 ingress-nginx（共享 NLB）】
-# 注意：必须指定 namespace
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-helm install ingress-nginx ingress-nginx/ingress-nginx \
-  --namespace ingress-nginx --create-namespace \
-  --set controller.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-type"=nlb \
-  --set controller.ingressClassResource.default=true
-# 等待 NLB 分配外部地址（需 1-3 分钟）
-kubectl get svc -n ingress-nginx ingress-nginx-controller --watch
-
-【Step 5: 创建 ECR 仓库并构建 arm64 镜像】
-# 注：sandbox 镜像仓库 claude-sbx 已由 phase3 (Step 2) 自动创建，这里只需建以下两个：
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
-aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-
-# 方式 A：本地 arm64 机器（M 系列 Mac）或 arm64 EC2 直接构建
-bash scripts/build_and_push.sh
-
-# 方式 B：在 .metal 节点上原生构建（x86 机器无 buildx 时推荐）
-# 需要 Step 2 的 .metal 节点已 Ready，node-agent 已通过 SSM 可访问
-# 详见 scripts/build_and_push.sh 注释中的 SSM 构建方式
-
-【Step 6: 部署控制面 + LiteLLM + Karpenter IAM】
-# sandbox_domain 传入的是"子域名根"，控制面将暴露在 api.<sandbox_domain>
-# 例如传 sbx.example.com，则访问地址为 http://api.sbx.example.com
-cd terraform/stage2-control-plane
-terraform init
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="my-sandbox-snapshots-${ACCT}"
-aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
-
-# 注意：Step 4 已手动安装 ingress-nginx，必须加 create_ingress_nginx=false 避免冲突
-terraform apply -auto-approve \
-  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
-  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
-  -var="snapshot_s3_bucket=${S3_BUCKET}" \
-  -var="enable_fargate=false" \
-  -var="create_ingress_nginx=false" \
-  -var="sandbox_domain=sbx.example.com"   # 控制面将暴露在 api.sbx.example.com
-
-# Terraform 会自动：
-# - 创建 IRSA 角色（控制面/node-agent/LiteLLM/Karpenter）
-# - 创建 Karpenter Worker Node IAM Role（节点加入集群所需）
-# - 创建 EKS Access Entry（karpenter_node role → EC2_LINUX 类型）
-#   ← 这是让 Karpenter 启动的节点能 join 集群的关键；没有它 kubelet TLS bootstrap 会被拒绝
-# - 部署 K8s 资源（sandbox-system/litellm namespace）
-# - 创建控制面 Ingress（api.<sandbox_domain>）
-# - 通过 null_resource 部署 Karpenter NodePool（install_karpenter=true 时）
-
-【Step 7: 手动安装 Karpenter】
-# Karpenter Helm 使用 OCI registry，某些环境下需要移除 Docker credential store：
-python3 -c "
-import json, pathlib
-cfg = pathlib.Path.home() / '.docker/config.json'
-if cfg.exists():
-    d = json.loads(cfg.read_text())
-    d.pop('credsStore', None)
-    cfg.write_text(json.dumps(d))
-    print('credsStore removed')
-"
-
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-CLUSTER_ENDPOINT=$(aws eks describe-cluster --name claude-sbx --query 'cluster.endpoint' --output text)
-KARPENTER_ROLE_ARN="arn:aws:iam::${ACCT}:role/claude-sbx-karpenter"
-
-helm upgrade --install karpenter \
-  oci://public.ecr.aws/karpenter/karpenter --version 1.3.3 \
-  --namespace karpenter --create-namespace \
-  --set "settings.clusterName=claude-sbx" \
-  --set "settings.clusterEndpoint=${CLUSTER_ENDPOINT}" \
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE_ARN}" \
-  --set "controller.resources.limits.memory=1Gi"
-
-# 单节点集群：缩为 1 副本避免 anti-affinity 阻塞
-kubectl scale deployment karpenter -n karpenter --replicas=1
-kubectl rollout status deployment/karpenter -n karpenter --timeout=120s
-
-# 获取 Terraform 创建的 worker node role 名称（格式固定为 <cluster-name>-karpenter-node）
-KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"
-# 或通过 AWS CLI 查询：
-# KARPENTER_NODE_ROLE=$(aws iam list-roles --query 'Roles[?contains(RoleName,`karpenter-node`)].RoleName' --output text)
-echo "Node role: $KARPENTER_NODE_ROLE"
-
-# 部署 NodePool + EC2NodeClass（kata 由 EC2NodeClass.userData 在 bootstrap 阶段预装，见 Step 3 说明）
-# 实测：用此 EC2NodeClass 起的新 c6g.metal 节点 30-60s 内 Ready，全程零抖动、不触发 ASG 替换。
-#
-# 注意：用【带引号的 heredoc】(<<'NODEPOOL') 写到文件，避免本地 shell 干扰 userData 里的
-#       $VAR / 反引号；role 用占位符后 sed 替换。这是实测可直接复制运行的写法。
-cat > /tmp/kata-metal.yaml <<'NODEPOOL'
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: kata-metal
-spec:
-  amiSelectorTerms:
-    - alias: al2023@latest
-  role: __KARPENTER_NODE_ROLE__
-  subnetSelectorTerms:
-    - tags:
-        kubernetes.io/role/elb: "1"
-  securityGroupSelectorTerms:
-    - tags:
-        kubernetes.io/cluster/claude-sbx: owned
-  blockDeviceMappings:
-    - deviceName: /dev/xvda
-      ebs:
-        volumeSize: 200Gi
-        volumeType: gp3
-  # ── 方案 A：bootstrap 阶段（kubelet 注册前）预装 Kata，根治 c6g.metal 节点 hang ──
-  # Karpenter 把这段 shell 包成 MIME 的第一个 part，nodeadm（启动 kubelet）排在其后，
-  # 因此 kata 安装 + containerd 重启发生在 kubelet 注册前，节点对 EKS 始终"一次就绪"。
-  userData: |
-    #!/bin/bash
-    set -euxo pipefail
-    KATA_VERSION="3.31.0"; ARCH="arm64"
-    cd /tmp
-    # 注意：release 包是 .tar.zst（不是 .tar.xz），AL2023 自带 zstd
-    curl -fsSL "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-${ARCH}.tar.zst" -o kata.tar.zst
-    tar --use-compress-program=unzstd -xf kata.tar.zst -C /   # 包内路径 ./opt/kata/...
-    # containerd 2.x（AL2023）用 v2 配置路径 io.containerd.cri.v1.runtime；只注册 kata-qemu
-    mkdir -p /opt/kata/containerd/config.d
-    cat > /opt/kata/containerd/config.d/kata-deploy.toml <<'TOML'
-    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
-    runtime_type = "io.containerd.kata-qemu.v2"
-    runtime_path = "/opt/kata/bin/containerd-shim-kata-v2"
-    privileged_without_host_devices = true
-    pod_annotations = ["io.katacontainers.*"]
-
-    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
-    ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
-    TOML
-    if ! grep -q "kata-deploy.toml" /etc/containerd/config.toml 2>/dev/null; then
-      if grep -q "^imports" /etc/containerd/config.toml 2>/dev/null; then
-        sed -i 's#^imports = \[#imports = ["/opt/kata/containerd/config.d/kata-deploy.toml", #' /etc/containerd/config.toml
-      else
-        sed -i '1i imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]' /etc/containerd/config.toml
-      fi
-    fi
-    systemctl restart containerd && systemctl enable containerd
----
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: kata-metal
-spec:
-  template:
-    metadata:
-      labels:
-        sandbox: "true"
-        # 必填：kata-qemu RuntimeClass（Step 3）带 nodeSelector katacontainers.io/kata-runtime=true。
-        # 方案 A 下 kata 由 UserData 预装、不经 kata-deploy 打 label，必须在此显式声明，
-        # 否则 Karpenter 认为 NodePool 不满足 RuntimeClass 的 nodeSelector，拒绝起节点。
-        katacontainers.io/kata-runtime: "true"
-    spec:
-      requirements:
-        - {key: node.kubernetes.io/instance-type, operator: In, values: ["c6g.metal"]}
-        - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
-        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
-      taints:
-        - {key: kata-dedicated, value: "true", effect: NoSchedule}
-      nodeClassRef:
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-        name: kata-metal
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30m
-NODEPOOL
-
-sed -i.bak "s#__KARPENTER_NODE_ROLE__#${KARPENTER_NODE_ROLE}#" /tmp/kata-metal.yaml
-kubectl apply -f /tmp/kata-metal.yaml
-
-# 触发并验证：创建一个 sandbox（或测试 pod）后，Karpenter 会起一台 c6g.metal，
-# 实测从 launch 到节点 Ready 仅 30-60s，无 NotReady 抖动：
-# kubectl get nodeclaims -w
-
-kubectl get nodepools     # kata-metal READY=True
-kubectl get ec2nodeclasses # kata-metal READY=True
-
-【Step 8: 配置 DNS（生产访问控制面 API）】
-NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo "NLB DNS: $NLB_HOST"
-# 在 Route53 或你的 DNS 提供商添加（以上面的 sandbox_domain=sbx.example.com 为例）：
-#   api.sbx.example.com  CNAME  $NLB_HOST
-# POC 可跳过 DNS，直接用 --resolve 参数测试（见 Step 9）
-
-【Step 9: 验证部署】
-# Terraform apply 完成后，等待镜像拉取（ECR 首次拉取需 1-3 分钟）
-kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
-kubectl rollout status deployment/litellm -n litellm --timeout=300s
-
-# 常见问题处理：
-# LiteLLM OOMKilled → stage2 默认已设 4Gi+1 副本（litellm.tf）。若仍 OOM 再加大：
-#   kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
-#   kubectl scale deployment/litellm -n litellm --replicas=1
-# Terraform kubernetes provider "Unexpected Identity Change" 错误 → 清理 state 重试：
-#   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
-#   terraform apply ...（重新执行 apply）
-
-kubectl get pods -n sandbox-system    # 控制面 2/2 + node-agent（DaemonSet，调度到 kata-metal 节点）
-kubectl get pods -n litellm           # LiteLLM 1/1
-kubectl get nodepools                 # kata-metal READY=True
-
-# ── 推荐：本地 port-forward 模式（不依赖 DNS/Ingress，实测 ALL TESTS PASSED）──
-bash scripts/e2e_test.sh
-# 期望：脚本结尾显示 ALL TESTS PASSED（按 driver 不同，部分用例会 skip）
-
-# ── 生产 Ingress 外部访问（⚠️ 实测开箱不通，见下）──
-# ingress-nginx 用的是 in-tree NLB（target=instance + preserve_client_ip），叠加
-# Karpenter kata-metal 节点（带 taint、跨 AZ、无 ingress pod）混入 NLB 目标组、cross-zone
-# 默认关闭，会导致外部 HTTP empty reply（集群内 ClusterIP 访问正常）。
-# 生产要走外部 Ingress，请改装 AWS Load Balancer Controller（target type=ip，直接指向 pod，
-# 绕过 NodePort/SNAT），或限定 NLB 只注册系统节点。仅做功能验证用上面的 port-forward 即可。
-# （DNS/--resolve 命令保留备查）：
-# NLB_IP=$(dig +short $NLB_HOST | head -1)
-# bash scripts/e2e_test.sh --api-url "http://api.sbx.example.com" --resolve "api.sbx.example.com:80:${NLB_IP}"
-
-【Step 10: 开始使用 API】
-# 直接访问控制面（需 DNS 或 port-forward）
-BASE_URL="http://api.sbx.example.com"   # 或 http://localhost:18000
-
-# 创建沙盒
-curl -s $BASE_URL/sandboxes \
-  -X POST -H "Content-Type: application/json" \
-  -d '{"cpu":2,"mem_mib":4096,"tenant_id":"user-1","services":[{"port":8080}]}'
-
-# 等待就绪
-curl "$BASE_URL/sandboxes/{id}/wait?state=running"
-
-# 执行命令
-curl -s $BASE_URL/sandboxes/{id}/exec \
-  -X POST -d '{"cmd":"claude --version"}'
-
-# 挂起（释放内存，快照到 S3）
-curl -s -X POST $BASE_URL/sandboxes/{id}/suspend
-
-# 恢复（~1.2s）
-curl -s -X POST $BASE_URL/sandboxes/{id}/resume
-
-# 销毁
-curl -s -X DELETE $BASE_URL/sandboxes/{id}
-
-【清理（避免费用）】
-ACCT=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="my-sandbox-snapshots-${ACCT}"
-# 先删 stage2（K8s 资源/LiteLLM/Karpenter IAM）
-cd terraform/stage2-control-plane && terraform destroy -auto-approve \
-  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
-  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
-  -var="snapshot_s3_bucket=${S3_BUCKET}" \
-  -var="enable_fargate=false" \
-  -var="create_ingress_nginx=false"
-
-# 先删 Karpenter NodePool（让它回收所有 kata-metal 节点），再卸载 helm 安装物 +
-# 删 ingress-nginx 创建的 NLB，否则残留节点/NLB 占用子网公网地址，
-# 会让下面 phase3 destroy 卡在 VPC/子网删除并报 DependencyViolation：
-kubectl delete nodepool kata-metal 2>/dev/null || true     # 触发 Karpenter 回收 .metal 节点
-kubectl delete ec2nodeclass kata-metal 2>/dev/null || true
-sleep 60  # 等 Karpenter 终止 .metal 实例
-helm uninstall karpenter     -n karpenter     2>/dev/null || true
-helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
-for arn in $(aws elbv2 describe-load-balancers --region us-east-1 \
-    --query 'LoadBalancers[?Type==`network`].LoadBalancerArn' --output text); do
-  aws elbv2 delete-load-balancer --region us-east-1 --load-balancer-arn "$arn"
-done
-sleep 30  # 等 NLB 的 ENI 释放
-
-# 删除 Karpenter 节点遗留的孤儿 pod ENI（VPC CNI 创建，节点终止后不自动清理，
-# 会让下面 phase3 destroy 卡在子网/安全组删除约 7+ 分钟）：
-VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
-  --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
-if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
-  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
-      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
-      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
-  done
-fi
-
-# 再删 EKS 集群（含 .metal 节点组，整体约 15-20 分钟；c6g.metal 终止本身较慢）
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-cd ../phase3 && terraform destroy -auto-approve \
-  -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-# 若 VPC 删除卡住（>5min），多半是 EKS 自建的 eks-cluster-sg 滞留，手动删除它即可解除：
-#   SG=$(aws ec2 describe-security-groups --region us-east-1 \
-#     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" --query 'SecurityGroups[0].GroupId' --output text)
-#   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
-
-# 最后删 DynamoDB
-cd ../stage1-dynamodb && terraform destroy -auto-approve
-
-# 清理 terraform destroy 不会自动删、但会阻塞下次重建的残留资源：
-aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
-aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
-# S3 快照桶（按需）：aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
+# ── Step 2 ~ Step 9 + 清理 详见 docs/deploy.md ──
+# （含：EKS集群/Kata RuntimeClass/ingress-nginx/ECR镜像构建/
+#   控制面+LiteLLM/Karpenter NodePool/验证/API使用/资源清理）
 ```
 
 ---
