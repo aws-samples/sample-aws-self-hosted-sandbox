@@ -85,7 +85,8 @@ resource "aws_elasticache_replication_group" "juicefs" {
   subnet_group_name    = aws_elasticache_subnet_group.juicefs[0].name
   security_group_ids   = [aws_security_group.juicefs_redis[0].id]
   at_rest_encryption_enabled = true
-  transit_encryption_enabled = false   # guest 内走私有 VPC，POC 不加 TLS
+  transit_encryption_enabled = true    # 生产默认开启（防同 VPC 旁路窃听 /workspace 元数据）
+  # 注：开启 TLS 后 JuiceFS mount 命令需加 --tls 参数，且节点需信任 ElastiCache 证书
 
   tags = { Project = "claude-sbx-poc" }
 }

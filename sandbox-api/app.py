@@ -55,22 +55,58 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
 
 # ---------- 认证 ----------
-# API_KEYS: 逗号分隔的有效 key 列表;为空则禁用认证(开发/测试用)
-# 生产通过 K8s Secret 注入,不在代码里硬编码
+# API_KEYS: 逗号分隔的有效 key 列表
+# 生产必须通过 K8s Secret 注入(见 terraform/stage2-control-plane/main.tf api-keys Secret)
+# ALLOW_UNAUTHENTICATED=1 仅用于本地开发/测试,生产严禁设置
 _API_KEYS: set[str] = {
     k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()
 }
+_ALLOW_UNAUTH = os.environ.get("ALLOW_UNAUTHENTICATED", "").lower() in ("1", "true")
 # 无需认证的路径(健康检查)
 _PUBLIC_PATHS = {"/", "/capabilities"}
+
+# API_KEY → tenant_id 映射（格式: "key:tenant_id,key2:tenant_id2" 或仅 "key"）
+# 若 key 未绑定 tenant，则该 key 的调用方视为 tenant "default"
+_KEY_TENANT: dict[str, str] = {}
+for _entry in os.environ.get("API_KEYS", "").split(","):
+    _entry = _entry.strip()
+    if ":" in _entry:
+        _k, _t = _entry.split(":", 1)
+        _KEY_TENANT[_k.strip()] = _t.strip()
+        _API_KEYS.add(_k.strip())
+    elif _entry:
+        _KEY_TENANT[_entry] = "default"
+
+
+def _get_caller_tenant(handler: "Handler") -> str | None:
+    """从 Authorization header 解析调用方 tenant_id。未认证或无绑定时返回 None。"""
+    auth = handler.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    return _KEY_TENANT.get(token)  # None 表示无效 token
+
+
+# 启动时警告（不阻断，让 _check_auth 在请求时失败）
+if not _API_KEYS and not _ALLOW_UNAUTH:
+    import sys
+    print("[WARNING] API_KEYS not set and ALLOW_UNAUTHENTICATED!=1 — "
+          "all protected endpoints will return 503 until API_KEYS is configured", file=sys.stderr)
 
 
 def _check_auth(handler: "Handler") -> bool:
     """返回 True 表示通过;False 表示已发送 401 响应。"""
-    if not _API_KEYS:
-        return True  # 未配置 API_KEYS → 开发模式,跳过认证
     path = urlparse(handler.path).path
     if path in _PUBLIC_PATHS:
         return True
+    if _ALLOW_UNAUTH:
+        # 仅限本地开发/测试 —— 生产严禁
+        return True
+    if not _API_KEYS:
+        # API_KEYS 未配置且未显式允许无鉴权 → 拒绝，强制安全失败
+        handler._send(503, {
+            "error": "control plane not configured",
+            "hint": "Set API_KEYS env var (K8s Secret) before exposing this service",
+        })
+        return False
     auth = handler.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if token in _API_KEYS:
@@ -132,10 +168,28 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         return 500, {"error": str(e)}
 
 
-def destroy_sandbox(sid: str) -> tuple[int, dict]:
+def _check_tenant_access(record: dict, caller_tenant: str | None) -> tuple[int, dict] | None:
+    """
+    校验调用方是否有权操作该沙盒。
+    返回 None 表示允许；返回 (code, body) 表示拒绝。
+    caller_tenant=None 表示无法从 token 解析租户（鉴权未启用时退化为 None → 允许）。
+    """
+    if caller_tenant is None:
+        return None  # 无鉴权模式（ALLOW_UNAUTHENTICATED=1）
+    sandbox_tenant = record.get("tenant_id", "default")
+    if caller_tenant == "default":
+        return None  # default key 有管理员权限
+    if sandbox_tenant != caller_tenant:
+        return 403, {"error": "forbidden", "hint": "sandbox belongs to a different tenant"}
+    return None
+
+
+def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
         return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
 
     lease_id = None
     try:
@@ -155,10 +209,12 @@ def destroy_sandbox(sid: str) -> tuple[int, dict]:
             db.release_lease(sid, lease_id)
 
 
-def suspend_sandbox(sid: str) -> tuple[int, dict]:
+def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
         return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
 
     if not _driver.capabilities().suspend_resume:
         return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
@@ -185,10 +241,12 @@ def suspend_sandbox(sid: str) -> tuple[int, dict]:
             db.release_lease(sid, lease_id)
 
 
-def resume_sandbox(sid: str) -> tuple[int, dict]:
+def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
         return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
 
     if not _driver.capabilities().suspend_resume:
         return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
@@ -219,10 +277,12 @@ def resume_sandbox(sid: str) -> tuple[int, dict]:
             db.release_lease(sid, lease_id)
 
 
-def exec_sandbox(sid: str, cmd: str) -> tuple[int, dict]:
+def exec_sandbox(sid: str, cmd: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
         return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
     rc, stdout, stderr = _driver.exec(sid, record, cmd)
     return (200 if rc == 0 else 500), {
         "id": sid, "cmd": cmd, "rc": rc,
@@ -369,17 +429,19 @@ class Handler(BaseHTTPRequestHandler):
             sid    = p[1]
             action = p[2]
 
+            ct = _get_caller_tenant(self)
+
             if action == "suspend":
-                code, result = suspend_sandbox(sid)
+                code, result = suspend_sandbox(sid, ct)
                 return self._send(code, result)
 
             if action == "resume":
-                code, result = resume_sandbox(sid)
+                code, result = resume_sandbox(sid, ct)
                 return self._send(code, result)
 
             if action == "exec":
                 cmd = self._body().get("cmd", "echo no-cmd")
-                code, result = exec_sandbox(sid, cmd)
+                code, result = exec_sandbox(sid, cmd, ct)
                 return self._send(code, result)
 
         self._send(404, {"error": "not found"})
@@ -387,7 +449,8 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_delete(self):
         p = self._parts()
         if len(p) == 2 and p[0] == "sandboxes":
-            code, result = destroy_sandbox(p[1])
+            ct = _get_caller_tenant(self)
+            code, result = destroy_sandbox(p[1], ct)
             return self._send(code, result)
         self._send(404, {"error": "not found"})
 

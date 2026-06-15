@@ -50,6 +50,7 @@ os.environ.update({
     "SNAPSHOT_S3_BUCKET":        "test-bucket",
     "WARM_POOL_SIZE":            "2",
     "WARM_POOL_REFILL_S":        "9999",  # 禁止自动 refill 干扰测试
+    "ALLOW_UNAUTHENTICATED":     "1",     # 测试环境跳过认证
 })
 
 
@@ -578,10 +579,11 @@ class TestAPIAuth(unittest.TestCase):
 
     @mock_aws
     def test_no_auth_when_keys_empty(self):
-        """API_KEYS 未配置时不需要认证。"""
+        """ALLOW_UNAUTHENTICATED=1 时跳过认证（开发模式）。"""
         _create_tables()
         import sandbox_api.app as app_module
-        app_module._API_KEYS = set()  # 清空 key → 开发模式
+        app_module._API_KEYS = set()
+        app_module._ALLOW_UNAUTH = True  # 明确开发模式
 
         from sandbox_api.drivers.kata import KataDriver
         from http.server import ThreadingHTTPServer
@@ -605,6 +607,7 @@ class TestAPIAuth(unittest.TestCase):
         _create_tables()
         import sandbox_api.app as app_module
         app_module._API_KEYS = {"test-key-abc"}
+        app_module._ALLOW_UNAUTH = False   # 关闭开发模式以测试真实鉴权
 
         from sandbox_api.drivers.kata import KataDriver
         from http.server import ThreadingHTTPServer
@@ -635,7 +638,8 @@ class TestAPIAuth(unittest.TestCase):
             self.assertEqual(code, 200)
         finally:
             srv.shutdown()
-            app_module._API_KEYS = set()  # 恢复
+            app_module._API_KEYS = set()
+            app_module._ALLOW_UNAUTH = True  # 恢复开发模式
 
     def _call(self, port, method, path, body=None, api_key=None):
         import urllib.request, urllib.error, json

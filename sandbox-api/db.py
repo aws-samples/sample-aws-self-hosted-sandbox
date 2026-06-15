@@ -100,8 +100,10 @@ def update_state(
     if extra:
         for i, (k, v) in enumerate(extra.items()):
             placeholder = f":extra{i}"
-            update_expr += f", {k} = {placeholder}"
-            attr_values[placeholder] = _sanitize(v)
+            name_alias  = f"#extra{i}"
+            update_expr += f", {name_alias} = {placeholder}"
+            attr_names[name_alias]    = k        # 通过别名传字段名，防表达式注入
+            attr_values[placeholder]  = _sanitize(v)
 
     _sb().update_item(
         Key={"id": sandbox_id},

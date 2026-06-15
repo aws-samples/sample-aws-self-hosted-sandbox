@@ -396,6 +396,28 @@ resource "aws_eks_fargate_profile" "sandbox_system" {
 
 # ---------- Kubernetes: ConfigMap(控制面配置) ----------
 
+# ---------- API Keys Secret（控制面鉴权）----------
+# api_keys 为空字符串时控制面启动后拒绝所有受保护请求（安全失败）
+# 生产必须传入真实的随机密钥，例如:
+#   -var='api_keys=sk-abc123,sk-def456'
+variable "api_keys" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "逗号分隔的 Bearer token 列表，注入控制面 API_KEYS env（生产必填）"
+}
+
+resource "kubernetes_secret" "control_plane_api_keys" {
+  metadata {
+    name      = "control-plane-api-keys"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+  data = {
+    API_KEYS = var.api_keys
+  }
+  type = "Opaque"
+}
+
 resource "kubernetes_config_map" "control_plane" {
   metadata {
     name      = "sandbox-control-plane"
@@ -447,6 +469,10 @@ resource "kubernetes_deployment" "control_plane" {
           port { container_port = 8000 }
           env_from {
             config_map_ref { name = kubernetes_config_map.control_plane.metadata[0].name }
+          }
+          # API_KEYS 从 Secret 注入（不进 ConfigMap 避免明文暴露）
+          env_from {
+            secret_ref { name = kubernetes_secret.control_plane_api_keys.metadata[0].name }
           }
           resources {
             requests = { cpu = "250m", memory = "512Mi" }
@@ -628,8 +654,8 @@ resource "helm_release" "ingress_nginx" {
 
 variable "expose_control_plane" {
   type    = bool
-  default = true
-  description = "是否通过 Ingress 对外暴露控制面 API"
+  default = false
+  description = "是否通过 Ingress 对外暴露控制面 API（生产需同时配置 TLS + API_KEYS Secret）"
 }
 
 resource "kubernetes_ingress_v1" "control_plane" {
@@ -640,9 +666,10 @@ resource "kubernetes_ingress_v1" "control_plane" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
     annotations = {
       "nginx.ingress.kubernetes.io/rewrite-target" = "/"
-      # 生产开启 TLS:
-      # "nginx.ingress.kubernetes.io/ssl-redirect" = "true"
-      # "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
+      # ⚠️  生产必须开启 TLS，否则 API_KEYS 在传输中明文暴露：
+      #   "nginx.ingress.kubernetes.io/ssl-redirect"    = "true"
+      #   "nginx.ingress.kubernetes.io/force-ssl-redirect" = "true"
+      #   "cert-manager.io/cluster-issuer"              = "letsencrypt-prod"
     }
   }
 
@@ -675,7 +702,7 @@ output "control_plane_service" {
 }
 
 output "control_plane_ingress_host" {
-  value = var.expose_control_plane ? "http://api.${var.sandbox_domain} (需配 DNS CNAME → NLB)" : "disabled"
+  value = var.expose_control_plane ? "https://api.${var.sandbox_domain} (需配 DNS CNAME → NLB + TLS + API_KEYS Secret)" : "disabled (use kubectl port-forward)"
 }
 
 output "sandbox_control_plane_role_arn" {

@@ -112,9 +112,9 @@ resource "kubernetes_secret" "litellm_key" {
 
 variable "litellm_master_key" {
   type        = string
-  default     = "sk-litellm-poc-change-me"
-  description = "LiteLLM master key(生产从 Secrets Manager 取)"
+  description = "LiteLLM master key（生产必传随机密钥，例如: openssl rand -hex 32）"
   sensitive   = true
+  # 无默认值——强制调用方显式传入，防止弱密钥上线
 }
 
 # ---------- LiteLLM Deployment ----------

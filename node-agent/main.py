@@ -36,6 +36,12 @@ from urllib.parse import urlparse
 
 # ---------- 配置 ----------
 LISTEN_PORT  = int(os.environ.get("NODE_AGENT_PORT", "8002"))
+# 监听地址：默认只绑 127.0.0.1（本机回环），防止集群内其他 Pod 直接访问宿主级执行面
+# hostNetwork=true 模式下 127.0.0.1 对控制面 Pod 不可达；
+# 生产：通过 ALLOWED_CALLER_CIDR 限制可访问 IP，或走 NetworkPolicy 白名单控制面 Pod CIDR
+LISTEN_HOST  = os.environ.get("NODE_AGENT_LISTEN_HOST", "0.0.0.0")  # 生产改为节点内网 IP
+# 允许调用的来源 CIDR（逗号分隔，空=不限制）——生产应设为控制面 Pod CIDR
+ALLOWED_CALLER_CIDR = os.environ.get("ALLOWED_CALLER_CIDR", "")
 SBX_BASE     = os.environ.get("SBX_BASE", "/var/lib/sbx")       # 统一路径约定
 ROOTFS       = os.environ.get("FC_ROOTFS",  "/opt/sbx/rootfs.ext4")  # 基础 rootfs 模板
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
@@ -546,6 +552,22 @@ def _free_mem_mib() -> int:
 
 # ---------- HTTP handler ----------
 
+def _check_caller_allowed(client_ip: str) -> bool:
+    """校验来源 IP 是否在 ALLOWED_CALLER_CIDR 白名单内。白名单为空则允许所有（仅适合内网隔离环境）。"""
+    if not ALLOWED_CALLER_CIDR:
+        return True
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(client_ip)
+        for cidr in ALLOWED_CALLER_CIDR.split(","):
+            cidr = cidr.strip()
+            if cidr and addr in ipaddress.ip_network(cidr, strict=False):
+                return True
+    except ValueError:
+        pass
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False, default=str).encode()
@@ -564,8 +586,18 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+    def _check_access(self) -> bool:
+        client_ip = self.client_address[0]
+        if not _check_caller_allowed(client_ip):
+            self._send(403, {"error": "forbidden", "hint": f"caller {client_ip} not in ALLOWED_CALLER_CIDR"})
+            return False
+        return True
+
     def do_GET(self):
         path = urlparse(self.path).path
+        # /health 对所有来源开放（存活探针）
+        if path != "/health" and not self._check_access():
+            return
         try:
             if path == "/health":
                 return self._send(200, op_health())
@@ -579,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
+        if not self._check_access():
+            return
         path = urlparse(self.path).path
         body = self._body()
         try:
@@ -600,5 +634,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"node-agent [{NODE_ID}] 在 :{LISTEN_PORT}")
-    ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+    print(f"node-agent [{NODE_ID}] 在 {LISTEN_HOST}:{LISTEN_PORT} "
+          f"(allowed callers: {ALLOWED_CALLER_CIDR or 'all — set ALLOWED_CALLER_CIDR in production'})")
+    ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
