@@ -47,22 +47,23 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 ### Architecture
 
 ```
-┌─ EKS cluster ────────────────────────────────────────────────────────┐
-│                                                                        │
-│  System nodes (Fargate/general)    c6g.metal node group (sandboxes)  │
-│  ┌────────────────────────────┐    ┌──────────────────────────────┐  │
-│  │ sandbox-control-plane      │    │  node-agent DaemonSet        │  │
-│  │ (Deployment, IRSA)         │───►│  Firecracker REST            │  │
-│  │  KataDriver (k8s client)   │    │  jailer / tap / snapshots    │  │
-│  │  FirecrackerDriver         │    │  S3 upload/download          │  │
-│  │  WarmPool                  │    └──────────────────────────────┘  │
-│  │  Stateless → DynamoDB      │                                       │
-│  └────────────────────────────┘                                       │
-│        ↑ ingress-nginx (NLB)                                          │
-│        api.sbx.<domain>  ←── production external access              │
-│                                                                        │
-│  DynamoDB   LiteLLM (Bedrock proxy)   Karpenter (metal autoscaling)  │
-└───────────────────────────────────────────────────────────────────────┘
+┌─ EKS cluster ───────────────────────────────────────────────────────────┐
+│                                                                           │
+│  Managed node group (system)      Karpenter c6g.metal nodes (sandboxes) │
+│  ┌────────────────────────────┐   ┌──────────────────────────────────┐  │
+│  │ sandbox-control-plane      │   │  Kata microVM (kata-qemu)        │  │
+│  │ (Deployment, IRSA)         │──►│  kata pre-installed via UserData │  │
+│  │  KataDriver (k8s client)   │   │  node-agent DaemonSet            │  │
+│  │  FirecrackerDriver         │   │  jailer / tap / snapshot / S3    │  │
+│  │  WarmPool                  │   └──────────────────────────────────┘  │
+│  │  Stateless → DynamoDB      │                                          │
+│  └────────────────────────────┘                                          │
+│        ↑ ingress-nginx (NLB)                                             │
+│        api.sbx.<domain>  ←── production (POC: use port-forward)         │
+│                                                                           │
+│  DynamoDB   LiteLLM (Bedrock proxy)   Karpenter (.metal autoscaling      │
+│                                        + kata pre-installed at bootstrap) │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Quick Start (Agent Deployment Guide)
@@ -93,7 +94,7 @@ cd ../phase3
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 terraform init && terraform apply -auto-approve \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-# EKS control plane ~10-12 min; with .metal node group cold start, ~15 min total
+# EKS control plane ~10-12 min; total with .metal node group cold start ~15 min
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
@@ -300,8 +301,13 @@ echo "Add DNS record: api.sbx.example.com CNAME $NLB_HOST"
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
 kubectl rollout status deployment/litellm -n litellm --timeout=300s
 
-# Note: stage2 now defaults LiteLLM to 4Gi + 1 replica (2Gi OOMKills; see litellm.tf).
-#   If it still OOMs: kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
+# Tip: LiteLLM defaults to 4Gi memory + 1 replica (configured in litellm.tf to prevent OOMKill).
+# If it still OOMKills: kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi
+# Tip: single-node cluster — if the 2nd LiteLLM replica stays Pending (anti-affinity):
+#   kubectl scale deployment/litellm -n litellm --replicas=1
+# Tip: if terraform reports "Unexpected Identity Change" on a deployment resource:
+#   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
+#   then re-run terraform apply
 
 kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent (DaemonSet on kata-metal nodes)
 kubectl get pods -n litellm           # litellm 1/1
@@ -394,6 +400,43 @@ aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region 
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
 # S3 snapshot bucket (optional): aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
 ```
+
+### Operations Prompt
+
+```
+You are the ops engineer for this AWS sandbox platform. Platform overview:
+- EKS cluster claude-sbx, c6g.metal nodes, Kata 3.31 pre-installed via Karpenter UserData + kata-qemu runtime
+- Control plane: sandbox-system namespace, Deployment 2 replicas
+  External access: http://api.sbx.<domain> (ingress-nginx NLB; POC use port-forward)
+- State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx)
+- Credential isolation: LiteLLM (litellm namespace) holds Bedrock IRSA; sandboxes have no credentials
+- Snapshots: S3 bucket, Plan A = 3-tuple (vm.mem + vm.snapshot + rootfs.ext4)
+             Plan B (JuiceFS) = 2-tuple (vm.snapshot + vm.snapshot.base, ~2 GB)
+- Karpenter: kata-metal NodePool, auto-consolidate after 30 min idle
+
+Common ops tasks:
+1. List sandboxes:    curl http://api.sbx.<domain>/sandboxes?tenant_id=<id>
+   Local:            kubectl port-forward -n sandbox-system svc/sandbox-control-plane 18000:80 &
+2. Restart control plane: kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
+3. View Karpenter nodes:  kubectl get nodeclaims; kubectl get nodes
+4. View LiteLLM logs:     kubectl logs -n litellm deployment/litellm --tail=50
+5. DynamoDB item count:   aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
+6. Update images:         bash scripts/build_and_push.sh
+                          kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
+7. Scale node capacity:   edit NodePool limits; Karpenter provisions new nodes automatically
+8. Cost optimization — bulk-suspend idle sandboxes:
+   for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
+     curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
+   done
+
+Monitoring:
+- node-agent memory: kubectl exec -n sandbox-system daemonset/node-agent -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/health').read().decode())"
+- DynamoDB write latency: AWS Console → DynamoDB → Metrics → SuccessfulRequestLatency
+- Karpenter node utilization: kubectl top nodes
+- LiteLLM request volume: kubectl logs -n litellm deployment/litellm | grep "INFO:"
+```
+
+---
 
 ### Key Benchmark Numbers
 
