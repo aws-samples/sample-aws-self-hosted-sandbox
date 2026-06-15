@@ -113,7 +113,7 @@ POST /sandboxes/{id}/exec
 │  │  无状态 → DynamoDB        │                                       │
 │  └──────────────────────────┘                                       │
 │         ↑ ingress-nginx (NLB)                                       │
-│         api.sbx.<domain>  ←── 生产外部访问（需 AWS LB Controller）  │
+│         api.sbx.<domain>  ←── 生产外部访问（POC 推荐 port-forward）  │
 │                                                                      │
 │  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩+预装kata)  │
 └──────────────────────────────────────────────────────────────────────┘

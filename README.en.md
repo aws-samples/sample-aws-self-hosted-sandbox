@@ -400,12 +400,16 @@ aws ecr delete-repository --repository-name claude-sbx --force --region us-east-
 | Metric | Measured | Environment |
 |---|---|---|
 | microVM cold start | ~0.31s | c6g.metal, Firecracker v1.16 |
-| Snapshot resume | **1.2s (cross-host) / 7ms (same host)** | Full snapshot, 4GB memory |
+| Snapshot resume (Plan A) | **1.2s (cross-host) / 7ms (same host)** | Full snapshot, 4GB memory |
+| **Snapshot resume (Plan B — JuiceFS)** | **1.16s** | mem-only snapshot (~2GB, no rootfs) |
+| Plan A snapshot size | ~8 GB | mem + state + rootfs |
+| **Plan B snapshot size** | **~2 GB** | mem + state only (rootfs in S3) |
 | Idle memory footprint | ~50 MB/VM | 512 MiB allocated |
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| e2e test pass rate | **17/17 (ALL PASS)** | Cluster-deployed, Kata driver |
+| e2e test pass rate | **ALL PASS** | Kata 15/15, FC + JuiceFS Plan B verified |
+| Smoke tests | **21/21 PASS** | Local, no AWS needed |
 
 ### Local Smoke Test (No AWS Required)
 
