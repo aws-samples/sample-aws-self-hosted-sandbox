@@ -89,10 +89,12 @@ def setup_tap(idx):
     subprocess.run(["ip", "link", "set", tap, "up"], stderr=subprocess.DEVNULL)
     hostif = subprocess.run("ip route|awk '/default/{print $5;exit}'", shell=True,
                             capture_output=True, text=True).stdout.strip()
+    # nosec B602 / nosemgrep: subprocess-shell-true -- shell=True 仅为 "-C 检查 || -A 添加" 幂等惯用法;
+    # idx 为内部分配的 int、hostif 来自本机路由表自动探测,均非用户输入,无注入面。
     subprocess.run(f"iptables -t nat -C POSTROUTING -o {hostif} -j MASQUERADE 2>/dev/null || "
-                   f"iptables -t nat -A POSTROUTING -o {hostif} -j MASQUERADE", shell=True)
+                   f"iptables -t nat -A POSTROUTING -o {hostif} -j MASQUERADE", shell=True)  # nosec B602
     subprocess.run(f"iptables -C FORWARD -i {tap} -o {hostif} -j ACCEPT 2>/dev/null || "
-                   f"iptables -A FORWARD -i {tap} -o {hostif} -j ACCEPT", shell=True)
+                   f"iptables -A FORWARD -i {tap} -o {hostif} -j ACCEPT", shell=True)  # nosec B602
     return tap, host_ip, guest_ip
 
 

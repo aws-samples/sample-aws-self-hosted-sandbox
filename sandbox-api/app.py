@@ -298,7 +298,7 @@ def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, d
             return 404, {"error": "not found"}
         if record["state"] == target_state or record["state"] == "failed":
             return 200, record
-        time.sleep(1)
+        time.sleep(1)  # nosemgrep: arbitrary-sleep -- 轮询 DynamoDB 状态变更的间隔
     record = db.get(sid) or {}
     return 408, {"error": "timeout", "current_state": record.get("state")}
 

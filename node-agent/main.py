@@ -79,15 +79,17 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
                    stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "link", "set", tap, "up"])
     # NAT(幂等)
+    # nosec B602 / nosemgrep: subprocess-shell-true -- shell=True 仅为 "-C 检查 || -A 添加" 幂等惯用法;
+    # tap_idx 为控制面分配的 int、host_if 来自本机路由表自动探测,均非用户输入,无注入面。
     subprocess.run(
         f"iptables -t nat -C POSTROUTING -o {host_if} -j MASQUERADE 2>/dev/null || "
         f"iptables -t nat -A POSTROUTING -o {host_if} -j MASQUERADE",
-        shell=True,
+        shell=True,  # nosec B602
     )
     subprocess.run(
         f"iptables -C FORWARD -i {tap} -o {host_if} -j ACCEPT 2>/dev/null || "
         f"iptables -A FORWARD -i {tap} -o {host_if} -j ACCEPT",
-        shell=True,
+        shell=True,  # nosec B602
     )
     return tap, host_ip, guest_ip
 
@@ -142,6 +144,7 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
         cmd = [FC_BIN, "--api-sock", sock]
 
     with open(log, "w") as lf:
+        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- cmd 为固定 list(jailer/FC 二进制路径来自环境配置,非请求体);env 仅作为 boot_args 注入 guest,不参与 host 命令拼接
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
 
     if not _wait_sock(sock, timeout=30.0):
@@ -222,7 +225,7 @@ def _wait_sock(path: str, timeout: float = 10.0) -> bool:
                 return True
             except OSError:
                 pass
-        time.sleep(0.05)
+        time.sleep(0.05)  # nosemgrep: arbitrary-sleep -- 轮询 socket 就绪的退避间隔
     return False
 
 
@@ -375,7 +378,7 @@ def op_suspend(body: dict) -> dict:
 
     # kill VMM,释放 RAM
     subprocess.run(["kill", str(vm["pid"])], stderr=subprocess.DEVNULL)
-    time.sleep(0.2)
+    time.sleep(0.2)  # nosemgrep: arbitrary-sleep -- 等 VMM 退出释放 vm.mem 文件句柄后再读大小
 
     mem_size = os.path.getsize(f"{snap_dir}/vm.mem")
 
@@ -435,6 +438,7 @@ def op_resume(body: dict) -> dict:
         pass
 
     with open(f"{d}/vm-resume.log", "w") as lf:
+        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- 固定 list:FC_BIN 来自环境配置,sock 为本地派生路径,无用户输入
         proc = subprocess.Popen([FC_BIN, "--api-sock", sock], stdout=lf, stderr=lf)
 
     if not _wait_sock(sock):

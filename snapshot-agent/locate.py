@@ -12,11 +12,13 @@ locate.py —— Kata 快照 node-agent 的"定位"环节最小 demo。
   python3 locate.py <pod-name> [-n namespace]
 依赖:本机能 kubectl 连集群;节点能用 SSM(脚本自动用 aws ssm 在节点上执行定位)。
 """
-import argparse, json, subprocess, sys, time
+import argparse, json, shlex, subprocess, sys, time
 
 
 def sh(cmd):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # shell=False + shlex.split:保留引号语义,但 pod 名/namespace 等用户输入
+    # 不再经 shell 解释(防命令注入)。cmd 必须是不含管道/重定向的单条命令。
+    return subprocess.run(shlex.split(cmd), shell=False, capture_output=True, text=True)
 
 
 def kubectl_json(args):
@@ -92,6 +94,7 @@ def ssm_run(instance_id, script, arg):
     }
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
+        f.flush()        # 确保落盘后 f.name 指向的文件内容完整(aws cli 随后读它）
         pf = f.name
     try:
         r = subprocess.run(
@@ -103,7 +106,7 @@ def ssm_run(instance_id, script, arg):
             sys.exit(f"SSM 下发失败: {r.stderr.strip()}")
         cid = r.stdout.strip()
         for _ in range(20):
-            time.sleep(3)
+            time.sleep(3)  # nosemgrep: arbitrary-sleep -- SSM 命令异步执行,轮询间隔
             g = subprocess.run(
                 ["aws", "ssm", "get-command-invocation", "--region", "us-east-1",
                  "--command-id", cid, "--instance-id", instance_id,

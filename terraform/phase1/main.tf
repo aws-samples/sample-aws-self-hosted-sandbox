@@ -200,6 +200,12 @@ resource "aws_instance" "host" {
     volume_type = "gp3"
   }
 
+  # 强制 IMDSv2(http_tokens=required):阻断 SSRF 经 IMDSv1 窃取实例凭据
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
   # 开机装好 docker/git 依赖。.metal 的 cloud-init 偶发不可靠(实测有一次没装上 docker),
   # 故加重试 + 落完成标记;setup-host.sh 里也会再次防御性安装 docker(双保险)。
   user_data = <<-EOF

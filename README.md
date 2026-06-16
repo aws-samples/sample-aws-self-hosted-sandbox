@@ -92,6 +92,7 @@ POST /sandboxes/{id}/exec
 - VM 级隔离：每沙盒独立 guest 内核，无共享宿主内核泄漏
 - 凭据零进沙盒：Bedrock 凭据只在 LiteLLM IRSA
 - Bearer token 认证，多 key 支持多租户
+- 强制 IMDSv2（`http_tokens=required`）：阻断 SSRF 经 IMDSv1 窃取宿主机实例凭据
 - Karpenter 空闲整合：.metal 节点闲置 30 分钟自动回收
 
 ---

@@ -421,7 +421,7 @@ class TestAPIEndToEnd(unittest.TestCase):
         srv  = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        time.sleep(0.1)
+        time.sleep(0.1)  # nosemgrep: arbitrary-sleep -- 测试:等后台 HTTP server 线程绑定端口
         return srv, port
 
     @mock_aws
@@ -593,7 +593,7 @@ class TestAPIAuth(unittest.TestCase):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        time.sleep(0.1)
+        time.sleep(0.1)  # nosemgrep: arbitrary-sleep -- 测试:等后台 HTTP server 线程绑定端口
         try:
             # 不带 key 也能访问
             code, body = self._call(port, "GET", "/")
@@ -617,7 +617,7 @@ class TestAPIAuth(unittest.TestCase):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        time.sleep(0.1)
+        time.sleep(0.1)  # nosemgrep: arbitrary-sleep -- 测试:等后台 HTTP server 线程绑定端口
         try:
             # 无 key → 401
             code, _ = self._call(port, "GET", "/sandboxes")
