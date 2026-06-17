@@ -307,12 +307,18 @@ resource "kubernetes_cluster_role" "control_plane" {
   rule {
     api_groups = [""]
     resources  = ["pods","services","configmaps","secrets"]
-    verbs      = ["get","list","watch","create","update","patch","delete"]
+    verbs      = ["get","list","watch","create","update","patch","delete","deletecollection"]
+  }
+  rule {
+    # pods/exec 是独立子资源,exec 走 websocket 需要 get+create
+    api_groups = [""]
+    resources  = ["pods/exec"]
+    verbs      = ["get","create"]
   }
   rule {
     api_groups = ["networking.k8s.io"]
     resources  = ["ingresses"]
-    verbs      = ["get","list","watch","create","update","patch","delete"]
+    verbs      = ["get","list","watch","create","update","patch","delete","deletecollection"]
   }
   rule {
     api_groups = ["agents.x-k8s.io"]
