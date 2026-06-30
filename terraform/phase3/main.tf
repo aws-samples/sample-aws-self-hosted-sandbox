@@ -1,9 +1,12 @@
-# Phase 3 基础设施 —— EKS 集群 + Graviton .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
+# Phase 3 基础设施 —— EKS 集群 + .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c6g.metal 节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + 一个 .metal 节点组(打 sandbox=true label)。
 #       Kata 安装、RuntimeClass、ingress-nginx、ACM、测试 Pod 是集群内操作(kubectl/helm),不归此处。
 #
-# ⚠️ 计费:EKS 控制平面 $0.10/hr + c6g.metal 节点 $2.32/hr。用完务必 destroy。
+# 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或 amd64(Intel x86 c5n.metal)。
+#       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
+#
+# ⚠️ 计费:EKS 控制平面 $0.10/hr + .metal 节点(c6g.metal≈$2.32/hr,c5n.metal≈$3.89/hr)。用完务必 destroy。
 #
 # 用法:
 #   terraform init
@@ -37,9 +40,40 @@ variable "cluster_name" {
   default = "claude-sbx"
 }
 
+variable "node_arch" {
+  type        = string
+  default     = "arm64"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI 类型、默认 .metal 机型、Firecracker/内核下载架构。"
+  validation {
+    condition     = contains(["arm64", "amd64"], var.node_arch)
+    error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
+  }
+}
+
 variable "metal_instance_type" {
-  type    = string
-  default = "c6g.metal" # Graviton 裸金属,KVM 可用,Kata 才能跑
+  type        = string
+  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
+  description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜的 Intel x86 裸金属)。"
+}
+
+locals {
+  # 架构派生:AMI 类型、默认 .metal 机型、Firecracker/内核下载用的架构标识(uname -m 风格)
+  arch_cfg = {
+    arm64 = {
+      ami_type      = "AL2023_ARM_64_STANDARD"
+      default_metal = "c6g.metal"  # Graviton 裸金属
+      fc_arch       = "aarch64"    # Firecracker 发行包 / CI vmlinux 的架构后缀
+      rootfs_key    = "rootfs/rootfs-juicefs.tar.gz"
+    }
+    amd64 = {
+      ami_type      = "AL2023_x86_64_STANDARD"
+      default_metal = "c5n.metal"  # 最便宜的主流 Intel x86 裸金属(72 vCPU/192GiB)
+      fc_arch       = "x86_64"
+      rootfs_key    = "rootfs/rootfs-juicefs-x86_64.tar.gz" # 需另行构建 x86 rootfs(见 setup-host.sh)
+    }
+  }
+  node_arch_cfg = local.arch_cfg[var.node_arch]
+  metal_type    = var.metal_instance_type != "" ? var.metal_instance_type : local.node_arch_cfg.default_metal
 }
 
 variable "endpoint_public_access_cidrs" {
@@ -108,9 +142,9 @@ module "eks" {
   #    本组用 .metal 仅因 POC 早期需要它引导集群；纯系统节点其实无需裸金属，
   #    可把 metal_instance_type 改小（如 c6g.xlarge）显著省成本——改小后系统组件照常运行。
   eks_managed_node_groups = {
-    metal_arm64 = {
-      ami_type       = "AL2023_ARM_64_STANDARD"
-      instance_types = [var.metal_instance_type]
+    "metal_${var.node_arch}" = {
+      ami_type       = local.node_arch_cfg.ami_type
+      instance_types = [local.metal_type]
       min_size       = 1
       max_size       = 2
       desired_size   = 1
@@ -138,8 +172,8 @@ module "eks" {
 
         mkdir -p /opt/sbx /var/lib/sbx
 
-        # Firecracker (바이너리만, 빠름)
-        ARCH=aarch64
+        # Firecracker (바이너리만, 빠름) —— 架构由 Terraform node_arch 注入
+        ARCH=${local.node_arch_cfg.fc_arch}
         VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
         curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
@@ -149,13 +183,13 @@ module "eks" {
         chmod +x /usr/local/bin/firecracker && \
         echo "[pre-bootstrap] Firecracker OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
 
-        # 커널 (16MB, 빠름)
-        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223" \
+        # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
+        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
           -o /opt/sbx/vmlinux 2>/dev/null && echo "[pre-bootstrap] Kernel OK" || true
 
         # rootfs: S3 에서 tar.gz 다운로드 → ext4 생성
-        # (미리 빌드한 JuiceFS 포함 arm64 rootfs)
-        aws s3 cp s3://427169985960-23-09-05-01-18-49-bucket/rootfs/rootfs-juicefs.tar.gz \
+        # (미리 빌드한 JuiceFS 포함 rootfs;架构对应 key 由 node_arch 决定)
+        aws s3 cp s3://427169985960-23-09-05-01-18-49-bucket/${local.node_arch_cfg.rootfs_key} \
           /tmp/rootfs.tar.gz --region us-east-1 2>/dev/null && \
         dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=6144 status=none 2>/dev/null && \
         mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \

@@ -1,7 +1,10 @@
 #!/bin/bash
-# setup-host.sh —— 在 Graviton .metal 主机上准备 Firecracker microVM + Claude Code
+# setup-host.sh —— 在 .metal 主机上准备 Firecracker microVM + Claude Code(arm64 / x86_64)
 # 幂等:可重复运行。对应 POC 文档第 3 节。
 # 在主机上以 root 或 sudo 运行:  sudo bash setup-host.sh
+#
+# 架构:默认探测宿主架构;Intel x86 节点可显式 ARCH=x86_64 bash setup-host.sh。
+#       Firecracker 发行包与 CI vmlinux 的架构后缀正好与 uname -m 一致(aarch64 / x86_64)。
 #
 # 实测踩坑修正(2026-06-12):
 #  1. .metal 的 cloud-init 偶尔没装上 docker → 本脚本主动安装并启动 docker(不再假设已就绪)。
@@ -11,7 +14,13 @@
 #  3. rootfs 里预装 juicefs 客户端,方便 guest 内挂 JuiceFS。
 set -euxo pipefail
 
-ARCH=aarch64
+# 架构:默认探测宿主架构;可用 ARCH 环境变量覆盖(aarch64 / x86_64)
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  aarch64|arm64) ARCH=aarch64 ;;
+  x86_64|amd64)  ARCH=x86_64 ;;
+  *) echo "ERROR: 不支持的架构 ARCH=$ARCH(仅支持 aarch64 / x86_64)" >&2; exit 1 ;;
+esac
 WORKDIR=/opt/sbx
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$WORKDIR"
@@ -29,7 +38,7 @@ systemctl enable --now docker
 for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break; sleep 2; done
 docker version >/dev/null
 
-# ---------- 1. 安装 Firecracker(aarch64) ----------
+# ---------- 1. 安装 Firecracker($ARCH) ----------
 if ! command -v firecracker >/dev/null 2>&1; then
   VER=$(curl -s https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest | grep tag_name | cut -d'"' -f4)
   curl -L "https://github.com/firecracker-microvm/firecracker/releases/download/${VER}/firecracker-${VER}-${ARCH}.tgz" -o fc.tgz
@@ -61,7 +70,7 @@ if [ "${SKIP_FUSE_KERNEL:-0}" != "1" ]; then
 else
   # 回退:无 FUSE 的 CI 内核(仅本地 ext4 workspace 场景够用,不能挂 JuiceFS)
   if [ ! -f "$WORKDIR/vmlinux" ]; then
-    KURL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223"
+    KURL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${ARCH}/vmlinux-5.10.223"
     curl -fL "$KURL" -o "$WORKDIR/vmlinux"
   fi
   KERNEL="$WORKDIR/vmlinux"
@@ -69,7 +78,7 @@ else
 fi
 ls -lh "$KERNEL"
 
-# ---------- 3. 构建带 Claude Code + JuiceFS 的 arm64 rootfs ----------
+# ---------- 3. 构建带 Claude Code + JuiceFS 的 rootfs(随宿主架构 $ARCH) ----------
 
 # 生成 sbxinit（guest PID 1：网络 + 可选 JuiceFS 挂载）
 cat > "$WORKDIR/sbxinit" <<'SBXINIT'

@@ -18,8 +18,16 @@ variable "enable_juicefs" {
 }
 
 variable "juicefs_redis_node_type" {
-  type    = string
-  default = "cache.t4g.micro"   # arm64 Graviton，POC 用最小规格
+  type        = string
+  default     = ""   # 留空时按 node_arch 选默认(arm64→cache.t4g.micro / amd64→cache.t3.micro)
+  description = "JuiceFS 元数据 Redis(ElastiCache)节点类型。留空则随 node_arch:arm64=cache.t4g.micro(Graviton),amd64=cache.t3.micro(Intel)。"
+}
+
+locals {
+  # ElastiCache 节点族:arm64=t4g(Graviton),amd64=t3(Intel)。POC 用最小规格 micro。
+  juicefs_redis_node_type = var.juicefs_redis_node_type != "" ? var.juicefs_redis_node_type : (
+    var.node_arch == "amd64" ? "cache.t3.micro" : "cache.t4g.micro"
+  )
 }
 
 # ---------- JuiceFS workspace S3 桶 ----------
@@ -78,7 +86,7 @@ resource "aws_elasticache_replication_group" "juicefs" {
 
   replication_group_id = "${var.cluster_name}-jfs"
   description          = "JuiceFS metadata engine for sandbox workspaces"
-  node_type            = var.juicefs_redis_node_type
+  node_type            = local.juicefs_redis_node_type
   num_cache_clusters   = 1   # POC 单节点；生产改为 2（multi-AZ）
   engine_version       = "7.1"
   port                 = 6379
