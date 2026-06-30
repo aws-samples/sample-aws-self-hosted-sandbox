@@ -35,9 +35,33 @@ variable "az" {
   default = "us-east-1a"
 }
 
+variable "node_arch" {
+  type        = string
+  default     = "arm64"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI 与默认 .metal 机型。"
+  validation {
+    condition     = contains(["arm64", "amd64"], var.node_arch)
+    error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
+  }
+}
+
 variable "metal_instance_type" {
-  type    = string
-  default = "c6g.metal" # Graviton 64 vCPU / 128 GiB。需更多内存改 m7g.metal(256 GiB)
+  type        = string
+  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
+  description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜 Intel x86 裸金属)。"
+}
+
+locals {
+  # 架构 → (默认机型, AL2023 SSM 路径里的架构后缀)
+  default_metal_by_arch = {
+    arm64 = "c6g.metal"
+    amd64 = "c5n.metal"
+  }
+  ssm_arch_suffix = {
+    arm64 = "arm64"
+    amd64 = "x86_64"
+  }
+  metal_type = var.metal_instance_type != "" ? var.metal_instance_type : local.default_metal_by_arch[var.node_arch]
 }
 
 variable "my_ip_cidr" {
@@ -72,9 +96,9 @@ data "aws_subnets" "default" {
   }
 }
 
-# ---------- 最新 AL2023 arm64 AMI ----------
-data "aws_ssm_parameter" "al2023_arm64" {
-  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+# ---------- 最新 AL2023 AMI(架构随 node_arch) ----------
+data "aws_ssm_parameter" "al2023" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-${local.ssm_arch_suffix[var.node_arch]}"
 }
 
 # ---------- 安全组:仅放行你的 IP 的 SSH ----------
@@ -188,8 +212,8 @@ resource "aws_ecr_repository" "sbx" {
 
 # ---------- .metal 主机 ----------
 resource "aws_instance" "host" {
-  ami                    = data.aws_ssm_parameter.al2023_arm64.value
-  instance_type          = var.metal_instance_type
+  ami                    = data.aws_ssm_parameter.al2023.value
+  instance_type          = local.metal_type
   key_name               = aws_key_pair.sbx.key_name
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.sbx.id]

@@ -86,10 +86,29 @@ variable "control_plane_replicas" {
   default = 2
 }
 
+variable "node_arch" {
+  type        = string
+  default     = "arm64"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。需与 phase3 的 node_arch 一致。"
+  validation {
+    condition     = contains(["arm64", "amd64"], var.node_arch)
+    error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
+  }
+}
+
 variable "metal_instance_type" {
-  type    = string
-  default = "c6g.metal"
-  description = "Graviton .metal 实例类型(沙盒节点池)"
+  type        = string
+  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
+  description = ".metal 实例类型(沙盒节点池)。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal。"
+}
+
+locals {
+  # 架构 → 默认 .metal 机型(amd64 取最便宜的 Intel x86 裸金属 c5n.metal)
+  default_metal_by_arch = {
+    arm64 = "c6g.metal"
+    amd64 = "c5n.metal"
+  }
+  metal_type = var.metal_instance_type != "" ? var.metal_instance_type : local.default_metal_by_arch[var.node_arch]
 }
 
 # ---------- Providers ----------
