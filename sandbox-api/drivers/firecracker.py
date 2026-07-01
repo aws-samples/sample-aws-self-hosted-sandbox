@@ -82,11 +82,12 @@ class FirecrackerDriver:
         snap_local  = f"{SBX_BASE}/{sandbox_id}/snap"
         snap_s3     = f"s3://{S3_BUCKET}/sbx/{sandbox_id}/" if S3_BUCKET else ""
 
+        # suspend 在慢速 EBS gp3 上 Full 快照可能 ~100s，给足 300s 避免 API 超时
         resp = self._agent(node, "POST", "/vm/suspend", {
             "id":                   sandbox_id,
             "snapshot_local_path":  snap_local,
             "s3_prefix":            snap_s3,   # node-agent 异步上传
-        })
+        }, timeout=300)
         return {
             "snapshot_s3":           snap_s3,
             "snapshot_size_bytes":   resp.get("mem_file_bytes", 0),
@@ -177,7 +178,8 @@ class FirecrackerDriver:
     # node-agent HTTP 调用
     # ------------------------------------------------------------------
 
-    def _agent(self, node: str, method: str, path: str, body: Any = None) -> dict:
+    def _agent(self, node: str, method: str, path: str, body: Any = None,
+               timeout: int = 120) -> dict:
         # node 可以是 "ip" 或 "ip:port";后者已含 port,不再追加
         host = node if ":" in node else f"{node}:{NODE_AGENT_PORT}"
         url  = f"http://{host}{path}"
@@ -185,7 +187,7 @@ class FirecrackerDriver:
         headers = {"Content-Type": "application/json"}
         req  = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             body_txt = e.read().decode(errors="replace")

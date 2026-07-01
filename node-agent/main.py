@@ -25,6 +25,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -298,7 +299,11 @@ def op_destroy(body: dict) -> dict:
         vm = _VMS.pop(sid, None)
     if vm:
         if vm.get("pid"):
-            subprocess.run(["kill", str(vm["pid"])], stderr=subprocess.DEVNULL)
+            # os.kill 而非 subprocess(slim 镜像无 /bin/kill)
+            try:
+                os.kill(int(vm["pid"]), signal.SIGTERM)
+            except (ProcessLookupError, ValueError, TypeError):
+                pass
         _teardown_tap(vm.get("tap", ""))
         shutil.rmtree(f"{SBX_BASE}/{sid}", ignore_errors=True)
     return {"deleted": True}
@@ -334,50 +339,29 @@ def op_suspend(body: dict) -> dict:
     # 暂停
     _fc(sock, "PATCH", "/vm", {"state": "Paused"})
 
-    # 快照策略:
-    #   首次(无 base Full) → Full 快照(写全量内存,慢但必要)
-    #   后续(有 base Full) → Diff 快照(只写脏页,快且小)
-    # Firecracker Diff 快照要求:resume 时需同时提供 base mem + diff mem
-    base_snap  = f"{snap_dir}/vm.snapshot.base"
-    base_mem   = f"{snap_dir}/vm.mem.base"
-    diff_snap  = f"{snap_dir}/vm.snapshot"
-    diff_mem   = f"{snap_dir}/vm.mem"
-    has_base   = os.path.exists(base_mem)
+    # 快照策略：纯 Full。
+    # （曾试过 Diff 只 dump 脏页，但 Firecracker 在 snapshot load/resume 后会重置
+    #  脏页位图 → "suspend→resume→再 suspend" 场景下 diff 退化成接近 full，
+    #  叠加 overlay 开销后反而更慢。对本用例 Full 更简单可预测。真正的提速是
+    #  换带本地 NVMe 的机型，把落盘从 EBS gp3 的 ~81MB/s 提到 GB/s 级。）
+    full_snap = f"{snap_dir}/vm.snapshot"      # 设备/vCPU 状态文件（小，几十KB）
+    full_mem  = f"{snap_dir}/vm.mem"           # 完整内存镜像
 
-    # snapshot/create 타임아웃: 메모리 크기에 따라 다름 (2GB Full = ~16s, 여유있게 120s)
-    SNAP_TIMEOUT = 120
+    SNAP_TIMEOUT = 300  # gp3 上 2GB Full 可能 ~90s
 
     t0 = time.monotonic()
-    if not has_base:
-        # 首次:Full 快照,同时保留一份作 base
-        _fc(sock, "PUT", "/snapshot/create", {
-            "snapshot_type": "Full",
-            "snapshot_path": diff_snap,
-            "mem_file_path": diff_mem,
-        }, timeout=SNAP_TIMEOUT)
-        # 复制为 base 供后续 Diff 使用
-        import shutil as _sh
-        _sh.copy2(diff_snap, base_snap)
-        _sh.copy2(diff_mem,  base_mem)
-    else:
-        # 后续:Diff 快照(只写自上次 Full 以来的脏页)
-        try:
-            _fc(sock, "PUT", "/snapshot/create", {
-                "snapshot_type": "Diff",
-                "snapshot_path": diff_snap,
-                "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
-        except Exception:
-            # Diff 失败(如内核不支持)→ 降级 Full
-            _fc(sock, "PUT", "/snapshot/create", {
-                "snapshot_type": "Full",
-                "snapshot_path": diff_snap,
-                "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
+    _fc(sock, "PUT", "/snapshot/create", {
+        "snapshot_type": "Full",
+        "snapshot_path": full_snap,
+        "mem_file_path": full_mem,
+    }, timeout=SNAP_TIMEOUT)
     dt = time.monotonic() - t0
 
-    # kill VMM,释放 RAM
-    subprocess.run(["kill", str(vm["pid"])], stderr=subprocess.DEVNULL)
+    # kill VMM,释放 RAM。用 os.kill 而非 subprocess(slim 镜像无 /bin/kill)
+    try:
+        os.kill(int(vm["pid"]), signal.SIGTERM)
+    except (ProcessLookupError, ValueError, TypeError):
+        pass
     time.sleep(0.2)  # nosemgrep: arbitrary-sleep -- 等 VMM 退出释放 vm.mem 文件句柄后再读大小
 
     mem_size = os.path.getsize(f"{snap_dir}/vm.mem")
@@ -445,6 +429,16 @@ def op_resume(body: dict) -> dict:
         proc.kill()
         raise RuntimeError("firecracker resume socket 未就绪")
 
+    # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
+    # 会自动重建 vsock 并绑定该 UDS；若旧 v.sock 文件残留会导致
+    # "Address in use (os error 98)" → 必须先删旧 socket 文件。
+    try:
+        os.remove(f"{d}/v.sock")
+    except FileNotFoundError:
+        pass
+
+    # vm.mem 始终是最新的完整内存（Diff 的脏页已在 suspend 侧叠加进去），
+    # 因此 resume 直接 load vm.mem，无需在恢复路径上做合并 → resume 保持亚秒级。
     t0 = time.monotonic()
     _fc(sock, "PUT", "/snapshot/load", {
         "snapshot_path": f"{snap_dir}/vm.snapshot",
@@ -480,8 +474,8 @@ def op_resume(body: dict) -> dict:
 def op_exec(body: dict) -> dict:
     """
     在 running 沙盒内执行命令。优先级:
-      1. TAP 网络 SSH(guest IP 可达时最简单)
-      2. vsock UDS(SSH 不可用时兜底)
+      1. vsock UDS(不依赖 guest 网络，优先)
+      2. TAP 网络 SSH(兜底，需 rootfs 内 sshd)
     """
     sid = body["id"]
     cmd = body.get("cmd", "echo no-cmd")
@@ -492,7 +486,25 @@ def op_exec(body: dict) -> dict:
     if not vm or vm["state"] != "running":
         raise RuntimeError(f"sandbox {sid} not running")
 
-    # --- 方式 1: TAP SSH ---
+    # --- 方式 1: vsock（优先）---
+    # 不依赖 guest 网络配置（tap IP / sshd），只要 guest 内 vsock-exec-agent 在监听。
+    # Firecracker vsock: host 端 UDS = {d}/v.sock，需先发 "CONNECT <port>\n" 握手，
+    # FC 回 "OK <assigned_port>\n" 后进入透传，再收发与 guest agent 约定的 JSON 协议。
+    # create 乐观返回 running，VM 可能仍在 boot / agent 未起 → 短重试等就绪。
+    d     = vm.get("dir", f"{SBX_BASE}/{sid}")
+    vsock = f"{d}/v.sock"
+    if os.path.exists(vsock):
+        last_err = None
+        for attempt in range(10):  # 最多重试 ~10s，覆盖 guest boot + agent 启动
+            try:
+                return _vsock_exec(vsock, cmd, timeout)
+            except Exception as e:
+                last_err = e
+                time.sleep(1)  # nosemgrep: arbitrary-sleep -- 等 guest vsock agent 就绪的退避
+        # vsock 始终不通则回退 SSH（记录最后错误供排查）
+        _ = last_err
+
+    # --- 方式 2: TAP SSH（兜底，需 rootfs 内 sshd + 正确 guest IP）---
     guest_ip = vm.get("ip", "")
     if guest_ip:
         r = subprocess.run(
@@ -507,25 +519,44 @@ def op_exec(body: dict) -> dict:
         if r.returncode != 255:  # 255=SSH 连接失败,其他为命令退出码
             return {"rc": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
 
-    # --- 方式 2: vsock via socat ---
-    # Firecracker vsock: host 端 UDS = {d}/v.sock, guest 端 CID=3, port=2222
-    d     = vm.get("dir", f"{SBX_BASE}/{sid}")
-    vsock = f"{d}/v.sock"
-    if os.path.exists(vsock):
-        try:
-            # 通过 socat 把命令发给 guest vsock listener(guest 需运行 socat vsock 服务)
-            r = subprocess.run(
-                ["socat", "-", f"UNIX-CONNECT:{vsock}"],
-                input=f"{cmd}\n", capture_output=True, text=True, timeout=timeout,
-            )
-            return {"rc": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
-        except FileNotFoundError:
-            pass  # socat 未安装
-
     raise RuntimeError(
-        f"sandbox {sid}: exec failed (SSH unreachable, vsock not available). "
-        "Ensure SSH is configured in rootfs or vsock is enabled."
+        f"sandbox {sid}: exec failed (vsock agent unreachable, SSH unreachable). "
+        "Ensure guest vsock-exec-agent is running or SSH is configured in rootfs."
     )
+
+
+def _vsock_exec(vsock_uds: str, cmd: str, timeout: int, port: int = 2222) -> dict:
+    """通过 Firecracker vsock UDS 把命令发给 guest 的 vsock-exec-agent。"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(vsock_uds)
+        # Firecracker vsock 握手：CONNECT <guest_port>\n → "OK <host_port>\n"
+        s.sendall(f"CONNECT {port}\n".encode())
+        ack = b""
+        while b"\n" not in ack:
+            chunk = s.recv(64)
+            if not chunk:
+                raise RuntimeError("vsock handshake: no ACK from firecracker")
+            ack += chunk
+        if not ack.startswith(b"OK"):
+            raise RuntimeError(f"vsock handshake failed: {ack!r}")
+        # 发请求（一行 JSON）
+        s.sendall((json.dumps({"cmd": cmd}) + "\n").encode())
+        # 收响应（一行 JSON）
+        resp = b""
+        while b"\n" not in resp:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            resp += chunk
+        line = resp.split(b"\n", 1)[0]
+        data = json.loads(line.decode(errors="replace"))
+        return {"rc": data.get("rc", -1),
+                "stdout": data.get("stdout", ""),
+                "stderr": data.get("stderr", "")}
+    finally:
+        s.close()
 
 
 def op_get(sid: str) -> dict:
