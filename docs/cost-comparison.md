@@ -159,7 +159,56 @@ Fly 方案中 AI gateway 和 bucket 在 Fly 内网 → 流量**免费**。迁到
 
 ---
 
-## 9. 价格来源与可信度
+## 9. 托管服务对比：AI Gateway（→LiteLLM）与 Tigris（→S3）
+
+客户在 Fly.io 上额外用了两个服务：**AI Gateway**（调 LLM）和 **Tigris**（对象存储）。本节对标我们方案的 **LiteLLM+Bedrock** 与 **S3**。
+
+### 9.1 AI Gateway → 自建 LiteLLM + Bedrock
+
+> ⚠️ **前提说明**：经核实（`fly.io/docs` 导航、`fly.io/ai`、pricing 页三处交叉验证，2026-06-30），**Fly.io 官方并无一个名为 "AI Gateway" 的托管 LLM 网关产品**，且 Fly GPU 已于 2025-08 下线。客户所说的 "AI Gateway" 应是**其自行在 Fly 上部署的 LLM 网关**（LiteLLM/OpenRouter 风格的 BYOK 代理）或泛指"调 LLM 那一层"。以下按此解读对标；若客户实指某第三方托管网关（如 OpenRouter/Cloudflare AI Gateway/Portkey），需单独补该产品定价。
+
+**关键结论：对比要拆两层，且大头不在网关本身。**
+
+| 层次 | Fly 侧（自托管网关） | AWS 侧（自建 LiteLLM+Bedrock） | 差异 |
+|---|---|---|---|
+| **① 网关服务费/算力** | 一台 Machine：shared-cpu-1x/256MB ≈ **$2/月**，或 performance-1x/2GB ≈ **$32/月** | LiteLLM Pod（requests 250m/1Gi）≈ **$11/月**，满载封顶（limits 2C/4Gi）≈ **$73/月** | 两边都是**几美元到几十美元/月**，相对 token 费是零头 |
+| **② 底层 LLM token 费** | 透传给背后 provider（BYOK，网关不加价） | 透传给 **AWS Bedrock**（按各模型 per-1M token 计价） | **真正的大头**；两方案都要付，与网关无关 |
+
+**要点：**
+- **网关这一层两边都近乎免费**（自建代理就是一个小 Pod / 一台小 Machine 的钱），不构成有意义的成本差异。
+- **决定成本的是 token 费**，它是透传成本：我们走 **Bedrock 的 per-token 价**，Fly 侧走其背后 provider 的价。**这不该算作"网关服务"的成本差**，而是模型选型/用量问题，需按实际模型和月 token 量单独测算。
+- 若要精确对比 token 费，需要客户提供：**用哪些模型、月均输入/输出 token 量**——给我这些可以拉 Bedrock 各模型单价算一版。
+
+### 9.2 Tigris → AWS S3
+
+数据来源：Tigris 官方定价页（`tigrisdata.com/pricing/`）+ AWS 官方 Price List API（S3 + DataTransfer），可信度高。
+
+| 费用项 | Tigris | AWS S3 (us-east-1) | 差异 |
+|---|---|---|---|
+| 存储 Standard | **$0.02**/GB/月（全球多区复制内含） | 首 50TB **$0.023** / next 450TB $0.022 /GB/月 | Tigris 省 ~13%，且无跨区复制附加费 |
+| Class A 请求（PUT/POST/LIST） | $0.005 / 千次 | $0.005 / 千次 | 相同 |
+| Class B 请求（GET/HEAD） | $0.0005 / 千次 | $0.0004 / 千次 | S3 略便宜 20% |
+| **公网出口 egress** | **$0（全免，官方明示）** | 阶梯 $0.09→$0.05/GB（首 100GB/月免费） | **核心分水岭** |
+| 同云内网访问 | Fly app↔Tigris 免费 | EC2↔S3 走 **Gateway Endpoint 免费** | 都 ≈ $0 |
+| 免费额度 | 5GB + 1万 A + 10万 B / 月 | 100GB/月出口 + 新客 6 月 $200 | 千沙盒规模下均可忽略 |
+
+**场景化月成本**（1000 沙盒，假设 5000万 Class A + 5亿 Class B 请求）：
+
+| 存储量 | 出口前提 | Tigris | AWS S3 |
+|---|---|---|---|
+| 1TB | 同内网（egress≈0） | ~$520 | ~$474 |
+| 10TB | 同内网 | ~$705 | ~$686 |
+| 50TB | 同内网 | ~$1,524 | ~$1,628 |
+| 10TB | **+20TB 公网出口** | **~$705** | **~$2,478** |
+
+**结论：**
+1. **egress 是唯一分水岭。** 若存储与计算同云内网（我们 repo 就是 EC2↔S3 走 Gateway Endpoint），两者 egress 都 ≈$0，**基本打平**（存储越大 Tigris 略占优，请求侧 S3 略便宜）。
+2. **只要有可观公网出口**（rootfs/快照跨环境拉取、对外分发），Tigris 免费 egress **碾压性便宜**，可省数千美元/月。这是 Tigris 的核心卖点，也和"rootfs/snapshot 常被跨环境拉取"的场景相关。
+3. **对我们方案的启示**：坚持 **S3 + Gateway Endpoint + 同区域访问**，把出口压在内网，S3 成本即可与 Tigris 打平；一旦沙盒需大量对公网拉存储，需评估 CloudFront 或接受 egress 费。
+
+---
+
+## 10. 价格来源与可信度
 
 - **AWS**：官方 Price List API，EC2 offer 版本 **20260626063016**（2026-06-26 快照），us-east-1，SKU `B9CQBH4FXSKWQPFQ`（Linux / Shared / No License）。逐分精确，可信度高。
   - c6g.metal：OD **$2.176/h**；1 年 All-Upfront 有效 **$1.27945/h**；3 年 All-Upfront 有效 **$0.81819/h**（upfront $21,502，recurring $0）。
@@ -172,7 +221,7 @@ Fly 方案中 AI gateway 和 bucket 在 Fly 内网 → 流量**免费**。迁到
   - 预留（reservation）：**单一 1 年期，统一 −40%**，预付全年 + 按月发 credit（不滚存）；shared/performance 均适用；credit **仅作用于 CPU+RAM，不含带宽/存储**。**Fly 无 3 年档**。
   - 非计算项：出口 $0.02/$0.04/$0.12/GB（按区）、内网免费、专用 IPv4 $2/月、Volumes $0.15/GB/月、快照 $0.08/GB/月（前 10GB 免费）、TLS 单域 $0.10/通配 $1（前 10 免费）、无组织月费、support 可选。Docker registry 存储官方文档未列费（推定不单收，可信度中）。
 
-## 10. 关键假设（可调，影响结论）
+## 11. 关键假设（可调，影响结论）
 
 1. 1000 个沙盒**全部同时 active 满载**、730 h/月。
 2. AWS 系统开销预留 15%（可用 = 标称 × 0.85）。
