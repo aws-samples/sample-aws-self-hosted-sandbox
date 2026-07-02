@@ -47,6 +47,13 @@ variable "endpoint_public_access_cidrs" {
   description = "允许访问 EKS 公网 API endpoint 的来源 CIDR(必填,无默认值以避免误开全网)。收窄到自己的 IP,apply 时传入:terraform apply -var='endpoint_public_access_cidrs=[\"'$(curl -s https://checkip.amazonaws.com)'/32\"]'"
 }
 
+# B2(FirecrackerDriver): 节点 userData 从此 S3 URI 拉取最小可启动 rootfs.tar.gz
+variable "rootfs_s3_uri" {
+  type        = string
+  description = "S3 URI of the minimal bootable arm64 rootfs tarball (B2 FC mode)"
+  default     = ""
+}
+
 # ---------- VPC(EKS 专用,3 AZ;裸金属在多 AZ 提高可得性) ----------
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -96,6 +103,10 @@ module "eks" {
   # POC:节点放公有子网,拿公网 IP 直接出网(无 NAT)
   eks_managed_node_group_defaults = {
     subnet_ids = module.vpc.public_subnets
+    # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → 给节点角色 S3 只读
+    iam_role_additional_policies = {
+      s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+    }
   }
 
   # 托管节点组:集群【系统节点】—— 跑控制面 / ingress-nginx / LiteLLM / Karpenter controller。
@@ -111,9 +122,9 @@ module "eks" {
     metal_arm64 = {
       ami_type       = "AL2023_ARM_64_STANDARD"
       instance_types = [var.metal_instance_type]
-      min_size       = 1
+      min_size       = 2
       max_size       = 2
-      desired_size   = 1
+      desired_size   = 2
 
       block_device_mappings = {
         xvda = {
@@ -154,10 +165,10 @@ module "eks" {
           -o /opt/sbx/vmlinux 2>/dev/null && echo "[pre-bootstrap] Kernel OK" || true
 
         # rootfs: S3 에서 tar.gz 다운로드 → ext4 생성
-        # (미리 빌드한 JuiceFS 포함 arm64 rootfs)
-        aws s3 cp s3://427169985960-23-09-05-01-18-49-bucket/rootfs/rootfs-juicefs.tar.gz \
-          /tmp/rootfs.tar.gz --region us-east-1 2>/dev/null && \
-        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=6144 status=none 2>/dev/null && \
+        # (B2: 최소 부팅 가능 arm64 rootfs, 사용자 버킷에서 다운로드)
+        aws s3 cp ${var.rootfs_s3_uri} \
+          /tmp/rootfs.tar.gz --region ${var.region} 2>/dev/null && \
+        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=2048 status=none 2>/dev/null && \
         mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \
         mkdir -p /tmp/rootfs_mount && \
         mount /opt/sbx/rootfs.ext4 /tmp/rootfs_mount 2>/dev/null && \
@@ -176,9 +187,12 @@ module "eks" {
         echo "[pre-bootstrap] DONE $(date)"
       EOT
 
-      # 不打 sandbox=true：本组是系统节点，sandbox 走 Karpenter kata-metal（见上）
+      # B2(FirecrackerDriver 模式): 本组承载 sandbox(裸 Firecracker microVM),
+      # 打 sandbox=true 让 node-agent DaemonSet 调度上来。
+      # (kata 模式下本组是纯系统节点不打此 label;B2 改为兼作沙盒节点)
       labels = {
-        role = "system"
+        role    = "system"
+        sandbox = "true"
       }
     }
   }

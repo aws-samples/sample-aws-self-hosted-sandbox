@@ -61,6 +61,20 @@ variable "node_agent_image" {
   description = "ECR URL for node-agent image"
 }
 
+# B2(FirecrackerDriver): driver 选择,默认 kata;FC 模式传 firecracker
+variable "sandbox_driver" {
+  type        = string
+  description = "Sandbox backend driver: kata | firecracker"
+  default     = "kata"
+}
+
+# B2: FC 模式下控制面访问 node-agent 的节点内网 IP(逗号分隔)
+variable "fc_nodes" {
+  type        = string
+  description = "Comma-separated private IPs of metal nodes running node-agent (firecracker mode)"
+  default     = ""
+}
+
 variable "litellm_url" {
   type    = string
   default = "http://litellm.litellm.svc.cluster.local:4000"
@@ -430,7 +444,7 @@ resource "kubernetes_config_map" "control_plane" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
   data = {
-    SANDBOX_DRIVER          = "kata"          # 默认走 Kata;FC 节点加入后改为 firecracker
+    SANDBOX_DRIVER          = var.sandbox_driver   # B2: 可传 firecracker
     DYNAMODB_TABLE          = local.dynamodb_table
     DYNAMODB_EVENTS_TABLE   = local.dynamodb_events
     DYNAMODB_TAPIDX_TABLE   = local.dynamodb_tap_idx
@@ -446,6 +460,9 @@ resource "kubernetes_config_map" "control_plane" {
     LISTEN_PORT             = "8000"
     LISTEN_HOST             = "0.0.0.0"
     NODE_AGENT_PORT         = "8002"
+    # B2(FirecrackerDriver): 控制面靠 FC_NODES(逗号分隔的节点内网 IP)找 node-agent
+    FC_NODES                = var.fc_nodes
+    FC_KERNEL_PATH          = "/opt/sbx/vmlinux"
   }
 }
 
@@ -598,6 +615,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/usr/local/bin"
             read_only  = true
           }
+          # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
+          volume_mount {
+            name       = "fc-assets"
+            mount_path = "/opt/sbx"
+          }
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
             limits   = { cpu = "2",    memory = "4Gi"   }
@@ -617,6 +639,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
         volume {
           name = "fc-bins"
           host_path { path = "/usr/local/bin" }
+        }
+        volume {
+          name = "fc-assets"
+          host_path {
+            path = "/opt/sbx"
+            type = "DirectoryOrCreate"
+          }
         }
         toleration {
           key      = "kata-dedicated"
