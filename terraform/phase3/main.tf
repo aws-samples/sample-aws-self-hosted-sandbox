@@ -171,10 +171,12 @@ module "eks" {
         }
       }
 
-      # pre_bootstrap_user_data: kubelet 시작 전 실행
-      # Firecracker + Redis + JuiceFS + rootfs 를 사전 설치
-      # → containerd 재시작 없음 → EKS 헬스체크 미트리거 → 노드 교체 사이클 없음
-      pre_bootstrap_user_data = <<-EOT
+      # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本 MIME 分段,
+      # 在 nodeadm 引导前执行(pre_bootstrap_user_data 是 AL2 时代机制,AL2023 会静默忽略)。
+      # Firecracker + Redis + JuiceFS + rootfs 预装,不重启 containerd → 不触发节点替换循环。
+      cloudinit_pre_nodeadm = [{
+        content_type = "text/x-shellscript; charset=\"us-ascii\""
+        content      = <<-EOT
         #!/bin/bash
         # pre_bootstrap: kubelet 시작 전 실행
         # ⚠️ 긴 작업 금지 (docker/dnf 설치 금지 → kubelet heartbeat 중단 → 노드 교체 사이클)
@@ -222,6 +224,7 @@ module "eks" {
 
         echo "[pre-bootstrap] DONE $(date)"
       EOT
+      }]
 
       # B2(FirecrackerDriver 模式): 本组承载 sandbox(裸 Firecracker microVM),
       # 打 sandbox=true 让 node-agent DaemonSet 调度上来。
