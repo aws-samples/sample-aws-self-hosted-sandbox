@@ -61,6 +61,20 @@ variable "node_agent_image" {
   description = "ECR URL for node-agent image"
 }
 
+# B2(FirecrackerDriver): driver 选择,默认 kata;FC 模式传 firecracker
+variable "sandbox_driver" {
+  type        = string
+  description = "Sandbox backend driver: kata | firecracker"
+  default     = "kata"
+}
+
+# B2: FC 模式下控制面访问 node-agent 的节点内网 IP(逗号分隔)
+variable "fc_nodes" {
+  type        = string
+  description = "Comma-separated private IPs of metal nodes running node-agent (firecracker mode)"
+  default     = ""
+}
+
 variable "litellm_url" {
   type    = string
   default = "http://litellm.litellm.svc.cluster.local:4000"
@@ -86,10 +100,29 @@ variable "control_plane_replicas" {
   default = 2
 }
 
+variable "node_arch" {
+  type        = string
+  default     = "arm64"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。需与 phase3 的 node_arch 一致。"
+  validation {
+    condition     = contains(["arm64", "amd64"], var.node_arch)
+    error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
+  }
+}
+
 variable "metal_instance_type" {
-  type    = string
-  default = "c6g.metal"
-  description = "Graviton .metal 实例类型(沙盒节点池)"
+  type        = string
+  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
+  description = ".metal 实例类型(沙盒节点池)。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal。"
+}
+
+locals {
+  # 架构 → 默认 .metal 机型(amd64 取最便宜的 Intel x86 裸金属 c5n.metal)
+  default_metal_by_arch = {
+    arm64 = "c6g.metal"
+    amd64 = "c5n.metal"
+  }
+  metal_type = var.metal_instance_type != "" ? var.metal_instance_type : local.default_metal_by_arch[var.node_arch]
 }
 
 # ---------- Providers ----------
@@ -430,7 +463,7 @@ resource "kubernetes_config_map" "control_plane" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
   data = {
-    SANDBOX_DRIVER          = "kata"          # 默认走 Kata;FC 节点加入后改为 firecracker
+    SANDBOX_DRIVER          = var.sandbox_driver   # B2: 可传 firecracker
     DYNAMODB_TABLE          = local.dynamodb_table
     DYNAMODB_EVENTS_TABLE   = local.dynamodb_events
     DYNAMODB_TAPIDX_TABLE   = local.dynamodb_tap_idx
@@ -446,6 +479,9 @@ resource "kubernetes_config_map" "control_plane" {
     LISTEN_PORT             = "8000"
     LISTEN_HOST             = "0.0.0.0"
     NODE_AGENT_PORT         = "8002"
+    # B2(FirecrackerDriver): 控制面靠 FC_NODES(逗号分隔的节点内网 IP)找 node-agent
+    FC_NODES                = var.fc_nodes
+    FC_KERNEL_PATH          = "/opt/sbx/vmlinux"
   }
 }
 
@@ -598,6 +634,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/usr/local/bin"
             read_only  = true
           }
+          # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
+          volume_mount {
+            name       = "fc-assets"
+            mount_path = "/opt/sbx"
+          }
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
             limits   = { cpu = "2",    memory = "4Gi"   }
@@ -617,6 +658,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
         volume {
           name = "fc-bins"
           host_path { path = "/usr/local/bin" }
+        }
+        volume {
+          name = "fc-assets"
+          host_path {
+            path = "/opt/sbx"
+            type = "DirectoryOrCreate"
+          }
         }
         toleration {
           key      = "kata-dedicated"

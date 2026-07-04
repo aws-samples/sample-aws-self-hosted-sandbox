@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -110,7 +111,8 @@ def _host_iface() -> str:
 # ---------- Firecracker 启动(jailer 包裹) ----------
 
 def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
-               mem_mib: int, kernel: str, env: dict) -> tuple[int, str]:
+               mem_mib: int, kernel: str, env: dict,
+               guest_ip: str = "", host_ip: str = "") -> tuple[int, str]:
     """
     用 jailer 启动 Firecracker,返回 (pid, api_sock)。
     jailer 把 FC 进程放进独立 cgroup + chroot + seccomp,防止逃逸。
@@ -153,6 +155,9 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
         raise RuntimeError("firecracker API socket 未就绪")
 
     # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
+    # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
+    # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
+    net_args = f"SBX_IP={guest_ip} SBX_GW={host_ip} " if guest_ip and host_ip else ""
     if JUICEFS_ENABLED and JUICEFS_REDIS_ADDR and JUICEFS_BUCKET:
         jfs_env = (
             f"JFS_REDIS={JUICEFS_REDIS_ADDR} "
@@ -160,9 +165,9 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
             f"JFS_NAME={JUICEFS_FS_NAME} "
             f"AWS_REGION={AWS_REGION} "
         )
-        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {jfs_env}"
+        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}{jfs_env}"
     else:
-        boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit"
+        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}"
 
     _fc(sock, "PUT", "/boot-source", {
         "kernel_image_path": kernel,
@@ -174,12 +179,8 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
     })
     _fc(sock, "PUT", "/machine-config", {"vcpu_count": cpu, "mem_size_mib": mem_mib})
     _fc(sock, "PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap})
-    # vsock: host UDS = {d}/v.sock, guest CID=3, port=2222 供 exec 使用
-    vsock_path = f"{d}/v.sock"
-    try:
-        _fc(sock, "PUT", "/vsock", {"vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_path})
-    except Exception:
-        pass  # vsock 配置失败不阻断 VM 启动
+    # 注: 里程碑 B 用 TAP SSH 做 exec,不配 vsock。
+    # vsock 设备会被写入快照,resume 时重绑 host UDS 报 "Address in use",且其 config 在本环境静默失败。
     _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
 
     return proc.pid, sock
@@ -210,6 +211,8 @@ def _fc(sock: str, method: str, path: str, body=None, timeout: int = 15) -> dict
                      headers={"Content-Type": "application/json"})
         r = conn.getresponse()
         raw = r.read()
+        if r.status >= 400:
+            raise RuntimeError(f"firecracker {method} {path} → {r.status}: {raw.decode(errors='replace')}")
         return json.loads(raw) if raw else {}
     finally:
         conn.close()
@@ -278,7 +281,8 @@ def op_create(body: dict) -> dict:
 
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
 
-    pid, sock = _start_fc(sid, dest_rootfs, tap, cpu, mem_mib, kernel, env)
+    pid, sock = _start_fc(sid, dest_rootfs, tap, cpu, mem_mib, kernel, env,
+                          guest_ip=guest_ip, host_ip=host_ip)
 
     with _LOCK:
         _VMS[sid] = {
@@ -418,6 +422,13 @@ def op_resume(body: dict) -> dict:
     sock = f"{d}/api-resume.sock"
     try:
         os.remove(sock)
+    except FileNotFoundError:
+        pass
+
+    # resume 前清理旧 vsock socket(快照含 vsock 设备,残留的 v.sock 会导致
+    # "Address in use" → snapshot load 失败)。这是 Firecracker 快照恢复已知坑。
+    try:
+        os.remove(f"{d}/v.sock")
     except FileNotFoundError:
         pass
 

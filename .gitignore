@@ -36,3 +36,9 @@ crash.*.log
 
 # Local Claude/session notes; not part of public source
 CONTINUE-SESSION.md
+.sbxkeys/
+node-agent/sbx_exec_key
+
+# Local B2 demo/validation scripts (kept on disk, not committed)
+scripts/demo_e2e_fc.py
+scripts/demo_e2e_fc_p2.py

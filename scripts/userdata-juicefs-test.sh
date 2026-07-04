@@ -16,7 +16,13 @@ sleep 2
 redis6-cli ping && echo "[userdata] Redis OK"
 
 # ---------- 2. Firecracker ----------
-ARCH=aarch64
+# 架构:默认探测宿主架构;可用 ARCH 环境变量覆盖(aarch64 / x86_64)
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  aarch64|arm64) ARCH=aarch64 ;;
+  x86_64|amd64)  ARCH=x86_64 ;;
+  *) echo "[userdata] 不支持的架构 ARCH=$ARCH"; exit 1 ;;
+esac
 VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/${VER}/firecracker-${VER}-${ARCH}.tgz" \
@@ -30,7 +36,7 @@ firecracker --version && echo "[userdata] Firecracker OK"
 mkdir -p /opt/sbx /var/lib/sbx
 # 用 CI kernel 先跑通流程；如需 JuiceFS 则需 FUSE kernel（见 build-fuse-kernel.sh）
 # POC 测试：用 CI kernel + JuiceFS 客户端在 host 侧挂，验证方案 B 快照逻辑
-curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223" \
+curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${ARCH}/vmlinux-5.10.223" \
   -o /opt/sbx/vmlinux
 ls -lh /opt/sbx/vmlinux && echo "[userdata] Kernel OK"
 

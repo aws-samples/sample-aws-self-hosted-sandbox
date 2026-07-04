@@ -218,7 +218,8 @@ resource "null_resource" "karpenter_nodepools" {
 
   triggers = {
     cluster_name = var.cluster_name
-    metal_type   = var.metal_instance_type
+    metal_type   = local.metal_type
+    node_arch    = var.node_arch
     node_role    = aws_iam_role.karpenter_node.name
   }
 
@@ -230,7 +231,7 @@ resource "null_resource" "karpenter_nodepools" {
       apiVersion: karpenter.k8s.aws/v1
       kind: EC2NodeClass
       metadata:
-        name: standard-arm64
+        name: standard-${var.node_arch}
       spec:
         amiSelectorTerms:
           - alias: al2023@latest
@@ -250,17 +251,17 @@ resource "null_resource" "karpenter_nodepools" {
       apiVersion: karpenter.sh/v1
       kind: NodePool
       metadata:
-        name: standard-arm64
+        name: standard-${var.node_arch}
       spec:
         template:
           spec:
             requirements:
-              - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+              - {key: kubernetes.io/arch, operator: In, values: ["${var.node_arch}"]}
               - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
             nodeClassRef:
               group: karpenter.k8s.aws
               kind: EC2NodeClass
-              name: standard-arm64
+              name: standard-${var.node_arch}
         disruption:
           consolidationPolicy: WhenEmptyOrUnderutilized
           consolidateAfter: 1m
@@ -297,8 +298,8 @@ resource "null_resource" "karpenter_nodepools" {
               sandbox: "true"
           spec:
             requirements:
-              - {key: node.kubernetes.io/instance-type, operator: In, values: ["${var.metal_instance_type}"]}
-              - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
+              - {key: node.kubernetes.io/instance-type, operator: In, values: ["${local.metal_type}"]}
+              - {key: kubernetes.io/arch, operator: In, values: ["${var.node_arch}"]}
               - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
             taints:
               - {key: kata-dedicated, value: "true", effect: NoSchedule}

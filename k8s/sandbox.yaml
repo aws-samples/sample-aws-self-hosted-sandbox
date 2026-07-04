@@ -7,9 +7,12 @@ metadata:
   name: claude-sbx-1
   labels: { app: claude-sbx, sandboxId: "1" }
 spec:
-  runtimeClassName: kata-qemu       # ← 实测通过(H3/e2e 均用此)
+  runtimeClassName: kata-qemu       # ← 实测通过(H3/e2e 均用此);kata-qemu 本身 arm64/x86_64 通用
   # 注:kata-clh(Cloud Hypervisor)在 kata-deploy 3.31 arm64 上默认未注册 containerd handler
   # (R2 实锤,见 POC-实测结果.md §四点五),改 kata-clh 需在 kata-deploy values 显式启用 clh shim
+  # 架构:沙盒镜像(claude-sbx:poc)须与节点架构匹配。单架构集群无需显式指定 arch;
+  #   若集群同时存在 arm64 与 amd64 节点,需用多架构 manifest list 镜像,或在此加
+  #   nodeSelector kubernetes.io/arch: amd64(或 arm64)把 Pod 钉到对应架构节点。
   nodeSelector: { sandbox: "true" }
   containers:
   - name: agent

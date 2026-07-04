@@ -1,9 +1,12 @@
-# Phase 3 基础设施 —— EKS 集群 + Graviton .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
+# Phase 3 基础设施 —— EKS 集群 + .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个 c6g.metal 节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + 一个 .metal 节点组(打 sandbox=true label)。
 #       Kata 安装、RuntimeClass、ingress-nginx、ACM、测试 Pod 是集群内操作(kubectl/helm),不归此处。
 #
-# ⚠️ 计费:EKS 控制平面 $0.10/hr + c6g.metal 节点 $2.32/hr。用完务必 destroy。
+# 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或 amd64(Intel x86 c5n.metal)。
+#       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
+#
+# ⚠️ 计费:EKS 控制平面 $0.10/hr + .metal 节点(c6g.metal≈$2.32/hr,c5n.metal≈$3.89/hr)。用完务必 destroy。
 #
 # 用法:
 #   terraform init
@@ -37,14 +40,52 @@ variable "cluster_name" {
   default = "claude-sbx"
 }
 
+variable "node_arch" {
+  type        = string
+  default     = "arm64"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI 类型、默认 .metal 机型、Firecracker/内核下载架构。"
+  validation {
+    condition     = contains(["arm64", "amd64"], var.node_arch)
+    error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
+  }
+}
+
 variable "metal_instance_type" {
-  type    = string
-  default = "c6g.metal" # Graviton 裸金属,KVM 可用,Kata 才能跑
+  type        = string
+  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
+  description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜的 Intel x86 裸金属)。"
+}
+
+locals {
+  # 架构派生:AMI 类型、默认 .metal 机型、Firecracker/内核下载用的架构标识(uname -m 风格)
+  arch_cfg = {
+    arm64 = {
+      ami_type      = "AL2023_ARM_64_STANDARD"
+      default_metal = "c6g.metal"  # Graviton 裸金属
+      fc_arch       = "aarch64"    # Firecracker 发行包 / CI vmlinux 的架构后缀
+      rootfs_key    = "rootfs/rootfs-juicefs.tar.gz"
+    }
+    amd64 = {
+      ami_type      = "AL2023_x86_64_STANDARD"
+      default_metal = "c5n.metal"  # 最便宜的主流 Intel x86 裸金属(72 vCPU/192GiB)
+      fc_arch       = "x86_64"
+      rootfs_key    = "rootfs/rootfs-juicefs-x86_64.tar.gz" # 需另行构建 x86 rootfs(见 setup-host.sh)
+    }
+  }
+  node_arch_cfg = local.arch_cfg[var.node_arch]
+  metal_type    = var.metal_instance_type != "" ? var.metal_instance_type : local.node_arch_cfg.default_metal
 }
 
 variable "endpoint_public_access_cidrs" {
   type        = list(string)
   description = "允许访问 EKS 公网 API endpoint 的来源 CIDR(必填,无默认值以避免误开全网)。收窄到自己的 IP,apply 时传入:terraform apply -var='endpoint_public_access_cidrs=[\"'$(curl -s https://checkip.amazonaws.com)'/32\"]'"
+}
+
+# B2(FirecrackerDriver): 节点 userData 从此 S3 URI 拉取最小可启动 rootfs.tar.gz
+variable "rootfs_s3_uri" {
+  type        = string
+  description = "S3 URI of the minimal bootable arm64 rootfs tarball (B2 FC mode)"
+  default     = ""
 }
 
 # ---------- VPC(EKS 专用,3 AZ;裸金属在多 AZ 提高可得性) ----------
@@ -96,6 +137,10 @@ module "eks" {
   # POC:节点放公有子网,拿公网 IP 直接出网(无 NAT)
   eks_managed_node_group_defaults = {
     subnet_ids = module.vpc.public_subnets
+    # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → 给节点角色 S3 只读
+    iam_role_additional_policies = {
+      s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+    }
   }
 
   # 托管节点组:集群【系统节点】—— 跑控制面 / ingress-nginx / LiteLLM / Karpenter controller。
@@ -108,12 +153,13 @@ module "eks" {
   #    本组用 .metal 仅因 POC 早期需要它引导集群；纯系统节点其实无需裸金属，
   #    可把 metal_instance_type 改小（如 c6g.xlarge）显著省成本——改小后系统组件照常运行。
   eks_managed_node_groups = {
-    metal_arm64 = {
-      ami_type       = "AL2023_ARM_64_STANDARD"
-      instance_types = [var.metal_instance_type]
-      min_size       = 1
+    "metal_${var.node_arch}" = {
+      ami_type       = local.node_arch_cfg.ami_type
+      instance_types = [local.metal_type]
+      # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化
+      min_size       = 2
       max_size       = 2
-      desired_size   = 1
+      desired_size   = 2
 
       block_device_mappings = {
         xvda = {
@@ -125,10 +171,12 @@ module "eks" {
         }
       }
 
-      # pre_bootstrap_user_data: kubelet 시작 전 실행
-      # Firecracker + Redis + JuiceFS + rootfs 를 사전 설치
-      # → containerd 재시작 없음 → EKS 헬스체크 미트리거 → 노드 교체 사이클 없음
-      pre_bootstrap_user_data = <<-EOT
+      # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本 MIME 分段,
+      # 在 nodeadm 引导前执行(pre_bootstrap_user_data 是 AL2 时代机制,AL2023 会静默忽略)。
+      # Firecracker + Redis + JuiceFS + rootfs 预装,不重启 containerd → 不触发节点替换循环。
+      cloudinit_pre_nodeadm = [{
+        content_type = "text/x-shellscript; charset=\"us-ascii\""
+        content      = <<-EOT
         #!/bin/bash
         # pre_bootstrap: kubelet 시작 전 실행
         # ⚠️ 긴 작업 금지 (docker/dnf 설치 금지 → kubelet heartbeat 중단 → 노드 교체 사이클)
@@ -138,8 +186,8 @@ module "eks" {
 
         mkdir -p /opt/sbx /var/lib/sbx
 
-        # Firecracker (바이너리만, 빠름)
-        ARCH=aarch64
+        # Firecracker (바이너리만, 빠름) —— 架构由 Terraform node_arch 注入
+        ARCH=${local.node_arch_cfg.fc_arch}
         VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
         curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
@@ -149,15 +197,16 @@ module "eks" {
         chmod +x /usr/local/bin/firecracker && \
         echo "[pre-bootstrap] Firecracker OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
 
-        # 커널 (16MB, 빠름)
-        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223" \
+        # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
+        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
           -o /opt/sbx/vmlinux 2>/dev/null && echo "[pre-bootstrap] Kernel OK" || true
 
         # rootfs: S3 에서 tar.gz 다운로드 → ext4 생성
-        # (미리 빌드한 JuiceFS 포함 arm64 rootfs)
-        aws s3 cp s3://427169985960-23-09-05-01-18-49-bucket/rootfs/rootfs-juicefs.tar.gz \
-          /tmp/rootfs.tar.gz --region us-east-1 2>/dev/null && \
-        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=6144 status=none 2>/dev/null && \
+        # (Firecracker 快照方案: 最小可启动 rootfs, 由 build-min-rootfs.sh 构建上传到用户桶,
+        #  路径经 var.rootfs_s3_uri 传入; node_arch 决定构建时的 --platform)
+        aws s3 cp ${var.rootfs_s3_uri} \
+          /tmp/rootfs.tar.gz --region ${var.region} 2>/dev/null && \
+        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=2048 status=none 2>/dev/null && \
         mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \
         mkdir -p /tmp/rootfs_mount && \
         mount /opt/sbx/rootfs.ext4 /tmp/rootfs_mount 2>/dev/null && \
@@ -175,10 +224,14 @@ module "eks" {
 
         echo "[pre-bootstrap] DONE $(date)"
       EOT
+      }]
 
-      # 不打 sandbox=true：本组是系统节点，sandbox 走 Karpenter kata-metal（见上）
+      # B2(FirecrackerDriver 模式): 本组承载 sandbox(裸 Firecracker microVM),
+      # 打 sandbox=true 让 node-agent DaemonSet 调度上来。
+      # (kata 模式下本组是纯系统节点不打此 label;B2 改为兼作沙盒节点)
       labels = {
-        role = "system"
+        role    = "system"
+        sandbox = "true"
       }
     }
   }
