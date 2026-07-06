@@ -224,6 +224,8 @@ python3 sandbox-api/smoke_test.py
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
 | e2e 测试通过率 | **17/17（ALL PASS）** | 集群部署，Kata driver |
+| FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |
+| FC suspend→resume | 快照 512MB→S3 / resume 0.27s | 内存态跨快照精确保留 |
 
 ---
 

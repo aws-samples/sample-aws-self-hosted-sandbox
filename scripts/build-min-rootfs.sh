@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 构建最小可启动 arm64 rootfs
 #   里程碑 A: 内存快照 + 跨机恢复(心跳验证)
-#   里程碑 B: SSH exec —— init 读内核 cmdline 的 SBX_IP 配网 + 起 sshd + 授权公钥
+#   里程碑 B: exec —— vsock 主通道(guest 起 vsock-exec-agent) + SSH 兜底
+#            (SSH: init 读内核 cmdline 的 SBX_IP 配网 + 起 sshd + 授权公钥)
 # 产出 rootfs.tar.gz 上传 S3,供节点拉取。
 #
 # 用法: bash scripts/build-min-rootfs.sh <s3-bucket>
@@ -52,6 +53,11 @@ sed -i 's/^#\?StrictModes.*/StrictModes no/' /etc/ssh/sshd_config 2>/dev/null ||
 [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A 2>/dev/null
 /usr/sbin/sshd 2>/dev/null && echo "[sbxinit] sshd started" > /dev/console || echo "[sbxinit] sshd FAILED" > /dev/console
 
+# vsock exec agent(exec 主通道): 监听 AF_VSOCK:2222,不依赖 guest 网络。
+# 后台常驻;stdout/stderr 转串口便于排查。
+python3 /sbin/vsock-exec-agent.py > /dev/console 2>&1 &
+echo "[sbxinit] vsock-exec-agent started (pid \$!)" > /dev/console
+
 echo "[sbxinit] microVM booted" > /dev/console
 
 # 心跳: 递增计数写串口 + tmpfs。内存级 resume 后从断点续增。
@@ -65,7 +71,7 @@ done
 INIT
 chmod +x "$WORK/sbxinit"
 
-# ---------- 2. docker 造 rootfs: python + iproute2 + openssh-server ----------
+# ---------- 2. docker 造 rootfs: python(vsock agent) + iproute2 + openssh-server(SSH 兜底) ----------
 cat > "$WORK/Dockerfile" <<'DOCKER'
 FROM public.ecr.aws/docker/library/python:3.12-slim
 RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
@@ -83,6 +89,10 @@ docker rm "$CID" >/dev/null
 
 cp "$WORK/sbxinit" "$WORK/rootfs/sbin/sbxinit"
 chmod +x "$WORK/rootfs/sbin/sbxinit"
+
+# vsock exec agent(guest 端 exec 主通道),由 sbxinit 后台启动
+cp "${ROOT}/scripts/vsock-exec-agent.py" "$WORK/rootfs/sbin/vsock-exec-agent.py"
+chmod +x "$WORK/rootfs/sbin/vsock-exec-agent.py"
 
 # ---------- 3. 打包 + 上传 ----------
 TARBALL="$WORK/rootfs.tar.gz"

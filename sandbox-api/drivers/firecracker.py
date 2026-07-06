@@ -95,6 +95,8 @@ class FirecrackerDriver:
         node        = record["node"]
         snap_local  = f"{SBX_BASE}/{sandbox_id}/snap"
 
+        # suspend 在慢速 EBS gp3 上 Full 快照可能 ~100s，给足 300s 避免 API 超时
+        # 方案C 不传 S3(快照落持久状态 EBS,卷幸存);不带 s3_prefix。
         resp = self._agent(node, "POST", "/vm/suspend", {
             "id":                   sandbox_id,
             "snapshot_local_path":  snap_local,

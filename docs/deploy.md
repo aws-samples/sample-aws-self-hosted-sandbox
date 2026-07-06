@@ -5,22 +5,42 @@
 
 ---
 
+## 两个 driver：默认 Firecracker，可选 Kata
+
+本平台是**同一套控制面 API + 可插拔后端 driver**，由控制面环境变量 `SANDBOX_DRIVER` 选择：
+
+| driver | `SANDBOX_DRIVER` | 特点 | 适用 |
+|---|---|---|---|
+| **Firecracker（默认，本手册主线）** | `firecracker` | 裸 FC microVM + node-agent DaemonSet，**支持 suspend/resume 亚秒恢复 + 跨机快照**，成本优先 | AI Agent 沙盒、需挂起省钱 |
+| Kata（可选） | `kata`（代码默认值） | Kata-on-EKS + K8s API，编排能力靠 K8s 白送，**不支持快照**（suspend 返回 501） | 标准 K8s 生态、无需快照 |
+
+> ⚠️ 注意：**`SANDBOX_DRIVER` 的代码默认值仍是 `kata`**（`sandbox-api/app.py`），terraform var `sandbox_driver` 默认也是 `kata`。
+> 本手册主线是 Firecracker，**每次 apply stage2 必须显式传 `-var="sandbox_driver=firecracker"`**，否则会起成 Kata。
+> Kata 部署路径见文末【附录：Kata driver 部署】。
+
+---
+
 ## 前提条件
 
 - AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3）
-- 已安装：kubectl, terraform (≥1.5), helm, git
+- 已安装：kubectl, terraform (≥1.5), helm, git, docker（构建 arm64 镜像/rootfs 用）
 - EC2 vCPU 服务配额：c6g.metal = 64 vCPU，默认配额通常不够，需提前申请
 - 生产部署必须设置 `API_KEYS`（见 Step 6 注意事项）
 
 ---
 
-## ⚠️ 注意事项
+## ⚠️ 注意事项（含实测踩坑，务必先读）
 
-1. **认证**：控制面默认关闭对外 Ingress（`expose_control_plane=false`），本地通过 port-forward 访问。生产开启 Ingress 时必须同时配置 `api_keys` variable 和 TLS，否则控制面启动后会拒绝所有受保护请求（503）。
-2. **不要用 kata-deploy DaemonSet**：本方案通过 Karpenter EC2NodeClass.userData 在节点 bootstrap 阶段预装 Kata（见 Step 7）。kata-deploy DaemonSet 会在节点已运行时重启 containerd，导致 c6g.metal 节点 hang 约 12 分钟，触发 ASG 节点替换死循环。
-3. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
-4. **arm64 镜像**：控制面和 node-agent 镜像必须在 arm64 机器上构建（M 系列 Mac、Graviton EC2 或 .metal 节点）。
-5. **费用提醒**：c6g.metal 按小时计费（约 $2.3/hr），EKS 控制面 $0.1/hr，用完务必执行清理步骤。
+1. **认证 = 硬门槛**：FC/Kata 都一样——控制面若 `API_KEYS` 未设、又没设 `ALLOW_UNAUTHENTICATED=1`，则**所有写操作（create/exec/suspend…）直接返回 503 `control plane not configured`**。生产必须传 `-var="api_keys=..."`；本地测试可给控制面 deployment 加 env `ALLOW_UNAUTHENTICATED=1`（见 Step 9 排障）。
+2. **DynamoDB 表必须先建**（Step 1）。漏了这步，控制面 create 会报 `ResourceNotFoundException`（boto3 找不到表），且报错发生在业务逻辑里、不易一眼看出。
+3. **FC 模式必须传 `fc_nodes`**：控制面靠 `FC_NODES`（逗号分隔的 .metal 节点内网 IP）找 node-agent。**只填就绪且稳定的节点 IP**——`_pick_node` 对列表里每个节点串行探 `/health`，遇到不可达节点会阻塞最长 120s（表现为 create 请求"卡住无响应"）。若某台 metal 节点 NotReady/抖动，务必把它从 `fc_nodes` 剔除。
+4. **rootfs 必须是含 vsock agent 的 min-rootfs**：FC 的 exec 走 vsock 通道，需要 `scripts/build-min-rootfs.sh` 产出的 rootfs（内含 `/sbin/vsock-exec-agent.py`，sbxinit 后台启动）。**别用 phase3 `rootfs_s3_uri` 的默认 juicefs 版**——apply phase3 时必须显式传 `-var="rootfs_s3_uri=s3://<bucket>/rootfs/min-rootfs.tar.gz"`（见 Step 1.5 + Step 2）。
+5. **不要用 kata-deploy DaemonSet**（仅 Kata 相关）：Kata 由 Karpenter EC2NodeClass.userData 在节点 bootstrap 阶段预装。kata-deploy DaemonSet 会在节点已运行时重启 containerd，导致 c6g.metal 节点 hang 约 12 分钟，触发 ASG 节点替换死循环。
+6. **.metal 节点冷启动可能抖动**：实测 c6g.metal 节点起来后可能出现短暂 NotReady 抖动（kubelet heartbeat 波动）。缓解：等节点稳定 Ready 再部署控制面；把控制面 pod 用 cordon/nodeSelector 固定到稳定节点；`fc_nodes` 只填稳定节点（见坑 3）。
+7. **arm64 镜像 + rootfs**：控制面/node-agent 镜像**和** min-rootfs 都必须在 arm64 机器上构建（M 系列 Mac、Graviton EC2 或 .metal 节点）。Mac 上若用 colima：`colima start --arch aarch64`。
+8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
+9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
+10. **费用提醒**：c6g.metal 按小时计费（约 $2.3/hr/台，FC 默认起 2 台 = ~$4.6/hr），EKS 控制面 $0.1/hr，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，多半是 node-agent pod 在 NotReady 节点上无法优雅终止 → `kubectl delete pods -n sandbox-system --all --force --grace-period=0` 解除。
 
 ---
 
@@ -34,32 +54,73 @@ export AWS_REGION=us-east-1
 
 ---
 
-## Step 1: 创建 DynamoDB 状态表
+## Step 1: 创建 DynamoDB 状态表（必做，勿跳）
 
 ```bash
 cd terraform/stage1-dynamodb
 terraform init && terraform apply -auto-approve
-# 验证
+# 验证：应看到 claude-sbx-sandboxes / -sandbox-events / -tap-idx
 aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 ```
 
+> ⚠️ 漏掉这步 → 控制面 create 报 `ResourceNotFoundException`（见注意事项 2）。
+
 ---
 
-## Step 2: 创建 EKS 集群 + .metal 节点组
+## Step 1.5: 构建并上传含 vsock agent 的 min-rootfs（FC 专用，勿跳）
+
+FC 的 exec 走 vsock 通道，rootfs 内必须有 `/sbin/vsock-exec-agent.py`（由 sbxinit 后台启动）。
+用 `build-min-rootfs.sh` 构建（**arm64 机器**上跑）：
 
 ```bash
-cd ../phase3
-MY_IP=$(curl -s https://checkip.amazonaws.com)
+cd ../..   # 回到仓库根
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="my-sandbox-snapshots-${ACCT}"
+aws s3 mb "s3://${BUCKET}" --region us-east-1 2>/dev/null || true
+
+# SSH 兜底通道用的密钥（vsock 主通道不依赖它，但脚本要求存在；已被 .gitignore 忽略）
+mkdir -p .sbxkeys
+[ -f .sbxkeys/sbx_exec ] || ssh-keygen -t ed25519 -N "" -f .sbxkeys/sbx_exec -C sbx-exec
+cp .sbxkeys/sbx_exec node-agent/sbx_exec_key   # node-agent 镜像构建需要（Dockerfile COPY）
+
+# 构建 + 上传 → s3://<bucket>/rootfs/min-rootfs.tar.gz
+bash scripts/build-min-rootfs.sh "${BUCKET}"
+
+# 验证 vsock agent 确实进了 rootfs（可选）
+aws s3 cp "s3://${BUCKET}/rootfs/min-rootfs.tar.gz" /tmp/r.tgz --region us-east-1
+tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
+```
+
+> Mac 上 docker 未起：`colima start --cpu 4 --memory 8 --arch aarch64`。
+
+---
+
+## Step 2: 创建 EKS 集群 + .metal 节点组（传 rootfs_s3_uri）
+
+```bash
+cd terraform/phase3
+MY_IP=$(curl -s https://checkip.amazonaws.com)   # 若出口 IP 不固定（NAT 池），用覆盖网段如 x.y.z.0/24
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="my-sandbox-snapshots-${ACCT}"
+
 terraform init && terraform apply -auto-approve \
+  -var="node_arch=arm64" \
+  -var="rootfs_s3_uri=s3://${BUCKET}/rootfs/min-rootfs.tar.gz" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # EKS 控制面约 10-12 分钟，加 .metal 节点组冷启动整体约 15 分钟
+# 默认起 2 台 c6g.metal（跨机快照演示需 2 台；只测 exec 可改 min/max/desired=1）
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 ```
 
+> ⚠️ `rootfs_s3_uri` 不传 → 用默认 juicefs 版 rootfs（无 vsock agent）→ exec 掉到 SSH 兜底并因 sbxinit 硬编码 IP 失败（见注意事项 4）。
+> ⚠️ .metal 节点可能冷启动抖动（NotReady）；记下**稳定 Ready** 的节点内网 IP，Step 6 的 `fc_nodes` 只填稳定节点（见注意事项 3/6）。
+>
+> **FC 模式无需 Step 3/4/7**（那是 Kata 的 RuntimeClass / ingress-nginx / Karpenter+kata NodePool）。FC 直接跳到 Step 5。
+
 ---
 
-## Step 3: 创建 kata-qemu RuntimeClass
+## Step 3: 创建 kata-qemu RuntimeClass 〔🅚 Kata-only，FC 跳过〕
 
 ```bash
 kubectl apply -f - <<'RUNTIMECLASS'
@@ -83,7 +144,7 @@ kubectl get runtimeclass kata-qemu
 
 ---
 
-## Step 4: 安装 ingress-nginx（共享 NLB）
+## Step 4: 安装 ingress-nginx（共享 NLB）〔🅚 Kata-only；FC 用 port-forward 可跳过〕
 
 ```bash
 # 必须指定 namespace，否则与 Step 6 的 Terraform 冲突
@@ -107,6 +168,7 @@ aws ecr create-repository --repository-name sandbox-control-plane --region us-ea
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
 
 # 方式 A：本地 arm64 机器（M 系列 Mac 或 Graviton EC2）
+# 前置：Step 1.5 已生成 node-agent/sbx_exec_key（Dockerfile COPY 需要），否则镜像构建失败
 bash scripts/build_and_push.sh
 
 # 方式 B：在 .metal 节点上原生构建（x86 机器无 buildx 时推荐，见脚本注释）
@@ -114,7 +176,7 @@ bash scripts/build_and_push.sh
 
 ---
 
-## Step 6: 部署控制面 + LiteLLM + Karpenter IAM
+## Step 6: 部署控制面 + node-agent（Firecracker 模式）
 
 ```bash
 cd terraform/stage2-control-plane
@@ -124,13 +186,18 @@ ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
 
-# 生成随机 API key（生产必填，不能留空）
+# 生成随机 API key（生产必填，不能留空，否则写操作全 503）
 API_KEY=$(openssl rand -hex 32)
 LITELLM_KEY=$(openssl rand -hex 32)
 echo "API_KEY: $API_KEY  （保存好，后续 curl 鉴权用）"
 
-# Step 4 已安装 ingress-nginx，加 create_ingress_nginx=false 避免冲突
+# FC 模式关键：拿【稳定 Ready】的 .metal 节点内网 IP 拼 fc_nodes（只填稳定节点！见注意事项 3）
+FC_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
+echo "FC_NODES=$FC_NODES  （若含 NotReady 节点，手动改成只留稳定的）"
+
 terraform apply -auto-approve \
+  -var="sandbox_driver=firecracker" \
+  -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
@@ -142,21 +209,25 @@ terraform apply -auto-approve \
   -var="litellm_master_key=${LITELLM_KEY}"
 
 # Terraform 自动完成：
-# - IRSA 角色（控制面/node-agent/LiteLLM/Karpenter）
-# - Karpenter Worker Node IAM Role + EKS Access Entry（节点 TLS bootstrap 必需）
-# - K8s 资源（sandbox-system / litellm namespace）
-# - api-keys Secret（API_KEY 注入控制面）
+# - IRSA 角色（控制面 / node-agent / LiteLLM）
+# - K8s 资源（sandbox-system namespace + 控制面 Deployment + node-agent DaemonSet）
+# - api-keys Secret + ConfigMap（SANDBOX_DRIVER=firecracker / FC_NODES 经 env_from 注入控制面）
 ```
 
+> ⚠️ **FC_NODES 只填稳定节点**：控制面 `_pick_node` 串行探每个节点 `/health`，遇不可达节点阻塞最长 120s（表现为 create "卡住无响应"）。若节点抖动，先 `kubectl get nodes` 确认，只把稳定的 IP 传给 `fc_nodes`。改完可热更新：`kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
+> ⚠️ **必须传 `sandbox_driver=firecracker`**，否则起成 Kata（默认值）。
+>
 > **常见问题：** Terraform `Unexpected Identity Change` 错误 → 清理 state 重试：
 > ```bash
-> terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
+> terraform state rm kubernetes_deployment.control_plane
 > terraform apply ...
 > ```
 
+> **FC 模式无需 Step 7**（Karpenter + kata NodePool）。跳到 Step 9 验证。
+
 ---
 
-## Step 7: 手动安装 Karpenter + 部署 NodePool
+## Step 7: 手动安装 Karpenter + 部署 NodePool 〔🅚 Kata-only，FC 跳过〕
 
 ```bash
 # 某些环境需先移除 Docker credential store（Helm OCI 需要）
@@ -282,24 +353,46 @@ echo "NLB: $NLB_HOST"
 
 ---
 
-## Step 9: 验证部署
+## Step 9: 验证部署（Firecracker）
 
 ```bash
-# 等待镜像拉取（ECR 首次约 1-3 分钟）
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
-kubectl rollout status deployment/litellm -n litellm --timeout=300s
+kubectl get pods -n sandbox-system -o wide   # 控制面 2/2 + node-agent DaemonSet（每台 sandbox=true 节点一个）
 
-kubectl get pods -n sandbox-system   # 控制面 2/2 + node-agent DaemonSet
-kubectl get pods -n litellm           # LiteLLM 1/1
-kubectl get nodepools                 # kata-metal READY=True
+# port-forward 访问控制面
+kubectl port-forward -n sandbox-system svc/sandbox-control-plane 18000:80 &
+BASE=http://localhost:18000
+API_KEY="<Step 6 生成的 API_KEY>"
 
-# 运行端到端测试（port-forward 模式，实测 ALL TESTS PASSED）
-bash scripts/e2e_test.sh
+# 健康 / 能力（driver 应为 firecracker，suspend_resume=true）
+curl -s $BASE/ ; echo
+curl -s $BASE/capabilities ; echo   # {"driver":"firecracker","suspend_resume":true,...}
+
+# 端到端测试（FC 模式）
+bash scripts/e2e_test.sh --driver firecracker --api-url $BASE
+
+# 手动验证 vsock exec 在 microVM 内执行（复现实测报告 §八）
+SID=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"cpu":1,"mem_mib":512,"tenant_id":"t","idempotency_key":"k1"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -s -X POST $BASE/sandboxes/$SID/exec -H "Authorization: Bearer $API_KEY" \
+  -d '{"cmd":"echo sandbox-ok && uname -r && nproc"}' ; echo
+# 期望 rc=0, stdout="sandbox-ok\n5.10.223\n1"
+#   5.10.223 = guest kernel（≠ 宿主 6.1.x）→ 确在 microVM 内；nproc=1 = guest 配额
+# 走的是 vsock 通道的证据：node-agent 上 /var/lib/sbx/<id>/v.sock 存在（PUT /vsock 生效）
 ```
 
-> **LiteLLM 常见问题：**
-> - OOMKilled → `kubectl set resources deployment/litellm -n litellm --limits=cpu=2,memory=4Gi`
-> - 单节点 Pending（anti-affinity）→ `kubectl scale deployment/litellm -n litellm --replicas=1`
+> **排障：**
+> - **create/exec 全 503 `control plane not configured`** → 没配 API_KEYS。测试环境快速放行：`kubectl set env deployment/sandbox-control-plane -n sandbox-system ALLOW_UNAUTHENTICATED=1`（生产严禁）。
+> - **create 卡住无响应（~90-120s）** → `FC_NODES` 里有不可达/抖动节点，`_pick_node` 探 `/health` 阻塞。改成只留稳定节点：`kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
+> - **create 报 `ResourceNotFoundException`** → 漏了 Step 1（DynamoDB 表）。
+> - **控制面 Pending / 节点 NotReady 抖动** → cordon 抖动节点，把控制面固定到稳定节点：`kubectl cordon <抖动节点>; kubectl delete pod -n sandbox-system -l app=sandbox-control-plane`。
+> - **节点上 FC 资产核查**（SSM 用 `AWS-RunShellScript`，或经 node-agent 容器）：
+>   ```bash
+>   NA=$(kubectl get pod -n sandbox-system -l app=node-agent -o name | head -1)
+>   kubectl exec -n sandbox-system $NA -- ls -l /usr/local/bin/firecracker /opt/sbx/vmlinux /opt/sbx/rootfs.ext4 /dev/kvm
+>   ```
+> - **LiteLLM**（若部署）：OOMKilled → 调大 limits；单节点 Pending → `--replicas=1`。
 
 ---
 
@@ -343,12 +436,17 @@ curl -s -X DELETE -H "Authorization: Bearer ${API_KEY}" \
 
 ## 清理（避免费用）
 
+> ⏱ 顺序：stage2 → phase3（删 EKS+metal，真正停止 metal 计费的一步，约 15-20 分钟）→ stage1。
+> phase3 destroy 里 node group 删除本身就要 3-6 分钟，metal 实例到那时才终止，属正常。
+
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 
-# 1. 删 stage2（K8s 资源/LiteLLM/Karpenter IAM）
+# 1. 删 stage2（FC 模式；var 要与 apply 时一致，含 sandbox_driver / fc_nodes）
 cd terraform/stage2-control-plane && terraform destroy -auto-approve \
+  -var="sandbox_driver=firecracker" \
+  -var="fc_nodes=placeholder" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
@@ -358,7 +456,11 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="api_keys=placeholder" \
   -var="litellm_master_key=placeholder"
 
-# 2. 回收 Karpenter 节点 + 删 NLB（否则 VPC destroy 会因依赖卡住）
+# ⚠️ 若卡在删 sandbox-system namespace（node-agent pod 在 NotReady 节点上无法优雅终止）：
+#   kubectl delete pods -n sandbox-system --all --force --grace-period=0
+# 强删后 destroy 会在 1-2 分钟内继续完成。
+
+# 2.〔🅚 Kata-only〕回收 Karpenter 节点 + 删 NLB（FC 模式没装这些，可跳过）
 kubectl delete nodepool kata-metal 2>/dev/null || true
 kubectl delete ec2nodeclass kata-metal 2>/dev/null || true
 sleep 60
@@ -381,9 +483,13 @@ if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
   done
 fi
 
-# 4. 删 EKS 集群（约 15-20 分钟）
+# 4. 删 EKS 集群 + metal 节点（约 15-20 分钟；var 要与 apply 时一致）
+#    node group 删除本身 3-6 分钟，metal 实例在此期间终止（计费到实例 terminated 为止）
 MY_IP=$(curl -s https://checkip.amazonaws.com)
+ACCT=$(aws sts get-caller-identity --query Account --output text)
 cd ../phase3 && terraform destroy -auto-approve \
+  -var="node_arch=arm64" \
+  -var="rootfs_s3_uri=s3://my-sandbox-snapshots-${ACCT}/rootfs/min-rootfs.tar.gz" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # VPC 删除卡住 >5min → 删 eks-cluster-sg：
 #   SG=$(aws ec2 describe-security-groups --region us-east-1 \
@@ -399,3 +505,18 @@ aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region 
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
 # aws s3 rb s3://${S3_BUCKET} --force --region us-east-1 2>/dev/null || true
 ```
+
+---
+
+## 附录：Kata driver 部署（可选后端）
+
+Kata 不支持快照（suspend 返回 501），但编排能力由 K8s 白送。与 FC 主线的差异：
+
+1. **跳过** Step 1.5（min-rootfs，Kata 不用 FC rootfs）。
+2. **Step 2**：无需 `rootfs_s3_uri`；节点组在 kata 模式下是纯系统节点（不打 `sandbox=true`），实际 sandbox 节点由 Step 7 的 Karpenter 拉起。
+3. **执行 Step 3/4/7**（🅚 标记的步骤）：kata-qemu RuntimeClass、ingress-nginx、Karpenter + kata-metal NodePool（userData 预装 Kata，**切勿用 kata-deploy DaemonSet**，见注意事项 5）。
+4. **Step 6**：apply stage2 时**不传** `sandbox_driver`（用默认 `kata`），也不需要 `fc_nodes`。
+5. **Step 9**：`bash scripts/e2e_test.sh`（默认 `--driver kata`）；`/capabilities` 的 `suspend_resume=false`，suspend 应返回 501。
+6. exec：Kata 走 `kubectl exec`（kubelet 代理），无需 vsock/SSH。
+
+> 两个 driver 共用同一控制面代码与 API，切换只需改 `SANDBOX_DRIVER` 环境变量重新 apply stage2。
