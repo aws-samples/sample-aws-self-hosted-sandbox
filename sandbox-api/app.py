@@ -159,6 +159,8 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
             driver_fields = _driver.create(sid, spec)
             db.force_update(sid, {**driver_fields, "state": "running"})
         db.write_event(sid, "created", "creating")
+        # 方案C:create 成功后异步打一次 Full base 快照(供后续 Diff 疏散),不阻塞 create 返回。
+        _maybe_snapshot_base_async(sid)
         return 201, db.get(sid)
     except Exception as e:
         try:
@@ -166,6 +168,37 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         except Exception:
             pass
         return 500, {"error": str(e)}
+
+
+# 方案C:是否在 create 后自动打 base(Diff 前提)。默认开启;可用 AUTO_SNAPSHOT_BASE=0 关闭。
+_AUTO_BASE = os.environ.get("AUTO_SNAPSHOT_BASE", "1").lower() in ("1", "true")
+# base 是 Full 快照(写 2GB),多个并发会打满状态 EBS 带宽 → 每个都变慢、guest 冻结更久。
+# 用信号量限制【同时进行的 base 数】,避免 50 个 base 同时打把 EBS 撑爆(实测会拖到 ~200s/个)。
+import threading as _threading
+_BASE_CONCURRENCY = int(os.environ.get("BASE_SNAPSHOT_CONCURRENCY", "2"))
+_BASE_SEM = _threading.Semaphore(_BASE_CONCURRENCY)
+
+
+def _maybe_snapshot_base_async(sid: str) -> None:
+    """后台线程给 sandbox 打 Full base 快照(方案C Diff 前提)。off 关键路径,失败不影响 create。
+    用信号量限制并发,避免多个 base Full 同时打满状态 EBS 带宽。"""
+    snap_base = getattr(_driver, "snapshot_base", None)
+    if not _AUTO_BASE or snap_base is None:
+        return
+
+    def _do():
+        try:
+            import time as _t
+            _t.sleep(float(os.environ.get("BASE_SNAPSHOT_DELAY_S", "20")))  # 等 guest boot 稳定
+            with _BASE_SEM:  # 限流:同时最多 _BASE_CONCURRENCY 个 base 在打
+                rec = db.get(sid)
+                if rec and rec.get("state") == "running":
+                    info = snap_base(sid, rec)
+                    db.write_event(sid, "base_snapshot", "running", info)
+        except Exception:
+            pass  # base 失败 → 疏散时降级 Full,不阻断
+
+    _threading.Thread(target=_do, daemon=True).start()
 
 
 def _check_tenant_access(record: dict, caller_tenant: str | None) -> tuple[int, dict] | None:

@@ -176,7 +176,10 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
         "drive_id": "rootfs", "path_on_host": rootfs,
         "is_root_device": True, "is_read_only": False,
     })
-    _fc(sock, "PUT", "/machine-config", {"vcpu_count": cpu, "mem_size_mib": mem_mib})
+    # track_dirty_pages=True: 开启脏页跟踪,是 Diff 增量快照的前提。
+    # 不开则 PUT /snapshot/create {Diff} 会失败 → 方案C 疏散退化成全量 Full(慢一个量级)。
+    _fc(sock, "PUT", "/machine-config",
+        {"vcpu_count": cpu, "mem_size_mib": mem_mib, "track_dirty_pages": True})
     _fc(sock, "PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap})
     # 注: 里程碑 B 用 TAP SSH 做 exec,不配 vsock。
     # vsock 设备会被写入快照,resume 时重绑 host UDS 报 "Address in use",且其 config 在本环境静默失败。
@@ -311,6 +314,45 @@ def op_destroy(body: dict) -> dict:
     return {"deleted": True}
 
 
+def op_snapshot_base(body: dict) -> dict:
+    """
+    方案C 预热:在 sandbox 运行期打一次 Full base 快照(不 kill VMM,打完继续跑)。
+    目的:spot 疏散时才能走 Diff(只写脏页),而 Diff 的前提是已有 base。
+    创建后由控制面异步调用一次;off 关键路径(~16s 无所谓)。
+    """
+    sid      = body["id"]
+    snap_dir = body["snapshot_local_path"]
+    with _LOCK:
+        vm = _VMS.get(sid)
+    if not vm:
+        raise KeyError(sid)
+    os.makedirs(snap_dir, exist_ok=True)
+    sock = vm["sock"]
+    base_snap = f"{snap_dir}/vm.snapshot.base"
+    base_mem  = f"{snap_dir}/vm.mem.base"
+
+    if os.path.exists(base_mem):
+        return {"base_exists": True, "skipped": True}
+
+    t0 = time.monotonic()
+    _fc(sock, "PATCH", "/vm", {"state": "Paused"})
+    try:
+        # Full 快照直接写 base 文件(不覆盖后续 Diff 用的 vm.snapshot/vm.mem)
+        # timeout=600: base Full 写 2GB;多个 base 并发时共享 EBS 带宽,单个可能耗时数分钟,
+        # 必须给足超时,否则 _fc 超时抛异常会跳过下面 finally 的 Resumed → VM 卡在 Paused。
+        _fc(sock, "PUT", "/snapshot/create", {
+            "snapshot_type": "Full",
+            "snapshot_path": base_snap,
+            "mem_file_path": base_mem,
+        }, timeout=600)
+    finally:
+        # 打完 base 立即恢复运行(base 是运行期快照,不释放 RAM)
+        _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
+    dt = time.monotonic() - t0
+    return {"base_created": True, "base_snapshot_time_s": round(dt, 3),
+            "base_mem_bytes": os.path.getsize(base_mem)}
+
+
 def op_suspend(body: dict) -> dict:
     sid       = body["id"]
     snap_dir  = body["snapshot_local_path"]
@@ -341,33 +383,34 @@ def op_suspend(body: dict) -> dict:
     # 暂停
     _fc(sock, "PATCH", "/vm", {"state": "Paused"})
 
-    # 快照策略:
-    #   首次(无 base Full) → Full 快照(写全量内存,慢但必要)
-    #   后续(有 base Full) → Diff 快照(只写脏页,快且小)
-    # Firecracker Diff 快照要求:resume 时需同时提供 base mem + diff mem
+    # 快照策略(方案C + Diff):
+    #   已有 base(op_snapshot_base 预热打过) → Diff 快照(只写脏页,~百MB,秒级)
+    #   无 base(未预热/预热失败) → Full 快照(写全量内存)并留一份作 base,后续可 Diff
+    # 快照落 snap_dir(位于持久状态 EBS),spot 终止后卷幸存,无需传 S3。
     base_snap  = f"{snap_dir}/vm.snapshot.base"
     base_mem   = f"{snap_dir}/vm.mem.base"
     diff_snap  = f"{snap_dir}/vm.snapshot"
     diff_mem   = f"{snap_dir}/vm.mem"
     has_base   = os.path.exists(base_mem)
 
-    # snapshot/create 타임아웃: 메모리 크기에 따라 다름 (2GB Full = ~16s, 여유있게 120s)
-    SNAP_TIMEOUT = 120
+    # snapshot/create 超时:内存越大越久;多个并发共享 EBS 带宽会显著拉长。留足 600s。
+    SNAP_TIMEOUT = 600
 
     t0 = time.monotonic()
+    snap_type = "diff"
     if not has_base:
-        # 首次:Full 快照,同时保留一份作 base
+        # 无 base:Full 快照,同时保留一份作 base(供本 sandbox 后续 Diff)
+        snap_type = "full"
         _fc(sock, "PUT", "/snapshot/create", {
             "snapshot_type": "Full",
             "snapshot_path": diff_snap,
             "mem_file_path": diff_mem,
         }, timeout=SNAP_TIMEOUT)
-        # 复制为 base 供后续 Diff 使用
         import shutil as _sh
         _sh.copy2(diff_snap, base_snap)
         _sh.copy2(diff_mem,  base_mem)
     else:
-        # 后续:Diff 快照(只写自上次 Full 以来的脏页)
+        # 有 base:Diff 快照(只写自 base 以来的脏页)
         try:
             _fc(sock, "PUT", "/snapshot/create", {
                 "snapshot_type": "Diff",
@@ -375,7 +418,8 @@ def op_suspend(body: dict) -> dict:
                 "mem_file_path": diff_mem,
             }, timeout=SNAP_TIMEOUT)
         except Exception:
-            # Diff 失败(如内核不支持)→ 降级 Full
+            # Diff 失败(如未开 track_dirty_pages)→ 降级 Full
+            snap_type = "full-fallback"
             _fc(sock, "PUT", "/snapshot/create", {
                 "snapshot_type": "Full",
                 "snapshot_path": diff_snap,
@@ -390,31 +434,64 @@ def op_suspend(body: dict) -> dict:
         pass
     time.sleep(0.2)  # nosemgrep: arbitrary-sleep -- 等 VMM 退出释放 vm.mem 文件句柄后再读大小
 
-    mem_size = os.path.getsize(f"{snap_dir}/vm.mem")
+    # diff.mem 是稀疏文件:apparent 是全量大小,真实占盘用 st_blocks*512
+    st = os.stat(f"{snap_dir}/vm.mem")
+    mem_apparent = st.st_size
+    mem_actual   = st.st_blocks * 512
 
     with _LOCK:
         vm["state"] = "suspended"
         vm["pid"]   = None
 
-    # 上传 S3：
-    #   方案 A（默认）：三件套 = vm.mem + vm.snapshot + rootfs.ext4
-    #   方案 B（JuiceFS）：两件套 = vm.mem + vm.snapshot（workspace 已在 S3，无需复制磁盘）
-    if JUICEFS_ENABLED:
-        # 方案 B：只上传内存快照，不含 rootfs（快照更小，跨机更轻量）
-        _s3_upload(snap_dir, s3_prefix)
-    else:
-        # 方案 A：rootfs 一起上传（保证跨机 resume 的完整一致性）
-        rootfs_src = f"{SBX_BASE}/{sid}/rootfs.ext4"
-        rootfs_dst = f"{snap_dir}/rootfs.ext4"
-        if os.path.exists(rootfs_src) and rootfs_src != rootfs_dst:
-            subprocess.run(["cp", "--reflink=auto", rootfs_src, rootfs_dst],
-                           stderr=subprocess.DEVNULL)
+    # 方案C:快照已在持久状态 EBS 上(snap_dir),spot 终止后卷幸存 → **不传 S3**。
+    # 跨机恢复靠 EBS detach/attach(控制面/运维编排),node-agent 不主动上传。
+    # (若显式传了 s3_prefix 且非方案C场景,保留旧的 S3 上传作兜底路径。)
+    if s3_prefix and body.get("upload_s3", False):
         _s3_upload(snap_dir, s3_prefix)
 
     return {
+        "snapshot_type": snap_type,
         "snapshot_create_time_s": round(dt, 3),
-        "mem_file_bytes": mem_size,
+        "mem_file_bytes": mem_apparent,
+        "mem_actual_bytes": mem_actual,
     }
+
+
+def _merge_diff_into_base(base_mem: str, diff_mem: str, merged: str) -> None:
+    """
+    把 Diff 快照的脏页叠加到 base.mem,产出完整内存镜像供 snapshot/load。
+    diff_mem 是稀疏文件:只有"写过的区段"是真实数据,其余是空洞(hole)。
+    用 SEEK_DATA/SEEK_HOLE 精确找出 diff 的数据区段,逐段覆盖到 base 副本上。
+    (不能用"非零块"判断——脏页可能合法为全零,漏写会导致内存不一致。)
+    """
+    # 1) 先把 base 复制成 merged(reflink 秒级,不占额外空间)
+    subprocess.run(["cp", "--reflink=auto", base_mem, merged], check=True)
+    # 2) 用 SEEK_DATA/SEEK_HOLE 遍历 diff 的数据区段,覆盖到 merged
+    size = os.path.getsize(diff_mem)
+    with open(diff_mem, "rb") as fd, open(merged, "r+b") as fm:
+        off = 0
+        while off < size:
+            try:
+                data_start = os.lseek(fd.fileno(), off, os.SEEK_DATA)
+            except OSError:
+                break  # 后面全是空洞,没有更多数据
+            try:
+                data_end = os.lseek(fd.fileno(), data_start, os.SEEK_HOLE)
+            except OSError:
+                data_end = size
+            fd.seek(data_start)
+            fm.seek(data_start)
+            remaining = data_end - data_start
+            CHUNK = 8 * 1024 * 1024
+            while remaining > 0:
+                buf = fd.read(min(CHUNK, remaining))
+                if not buf:
+                    break
+                fm.write(buf)
+                remaining -= len(buf)
+            off = data_end
+        fm.flush()
+        os.fsync(fm.fileno())
 
 
 def op_resume(body: dict) -> dict:
@@ -424,22 +501,38 @@ def op_resume(body: dict) -> dict:
     tap_idx    = int(body["tap_idx"])
     s3_prefix  = body.get("s3_prefix", "")
 
-    # 若本地无快照文件，从 S3 拉回
+    # 若本地无快照文件，从 S3 拉回(方案C 主路径不走 S3,卷已 attach;此为兜底)
     if not os.path.exists(f"{snap_dir}/vm.snapshot") and s3_prefix:
         _s3_download(s3_prefix, snap_dir)
 
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
 
-    if JUICEFS_ENABLED:
-        # 方案 B：rootfs 不在快照里，从基础镜像 CoW 复制（/workspace 数据在 S3，resume 后自动重连）
-        if not os.path.exists(rootfs):
-            subprocess.run(["cp", "--reflink=auto", ROOTFS, rootfs], check=True)
-    else:
-        # 方案 A：rootfs 在快照三件套里，从 S3 拉回
+    # rootfs 准备:方案C 下 rootfs 就在状态 EBS 的 {sid}/rootfs.ext4(随卷迁移,含装的软件)。
+    # 回退:本地已有→直接用;快照目录里有→复制;都没有→基础镜像 CoW。
+    if not os.path.exists(rootfs):
         snap_rootfs = f"{snap_dir}/rootfs.ext4"
-        if not os.path.exists(rootfs) and os.path.exists(snap_rootfs):
+        if os.path.exists(snap_rootfs):
             shutil.copy2(snap_rootfs, rootfs)
+        else:
+            subprocess.run(["cp", "--reflink=auto", ROOTFS, rootfs], check=True)
+
+    # 内存镜像准备:若本次是 Diff 快照(存在 base.mem),需先把 diff 脏页合并到 base。
+    #   Diff 快照的 vm.mem 只含脏页,不能独立 load(实测:仅 diff.mem load 失败/内存不全)。
+    base_mem = f"{snap_dir}/vm.mem.base"
+    diff_mem = f"{snap_dir}/vm.mem"
+    mem_backend_path = diff_mem
+    merge_time = 0.0
+    if os.path.exists(base_mem):
+        # 判断 vm.mem 是否为 Diff(稀疏,占盘远小于 apparent)。base==diff 时说明上次是 Full,无需合并。
+        st = os.stat(diff_mem)
+        is_sparse_diff = (st.st_blocks * 512) < (st.st_size * 0.9)
+        if is_sparse_diff:
+            merged = f"{snap_dir}/vm.mem.merged"
+            tm = time.monotonic()
+            _merge_diff_into_base(base_mem, diff_mem, merged)
+            merge_time = time.monotonic() - tm
+            mem_backend_path = merged
 
     sock = f"{d}/api-resume.sock"
     try:
@@ -465,10 +558,29 @@ def op_resume(body: dict) -> dict:
     t0 = time.monotonic()
     _fc(sock, "PUT", "/snapshot/load", {
         "snapshot_path": f"{snap_dir}/vm.snapshot",
-        "mem_backend":   {"backend_path": f"{snap_dir}/vm.mem", "backend_type": "File"},
+        "mem_backend":   {"backend_path": mem_backend_path, "backend_type": "File"},
+        # track_dirty_pages 不随快照保存 → load 时必须显式再设 True,
+        # 否则本次 resume 后的实例无法再打 Diff(多代接力断链)。FC 官方文档明确要求。
+        "track_dirty_pages": True,
         "resume_vm":     True,
     })
     dt = time.monotonic() - t0
+
+    # ---- P0: merged 转正为新 base(多代接力 + 存储减半)----
+    # FC 语义(官方文档):load 时重置脏页位图 → resume 后的 Diff 基准 = 本次 load 的完整内存镜像。
+    # 因此 merged 必须成为下一轮 Diff 的 base。同时旧 base/diff 作废,删除以省空间。
+    # ⚠️ merged 正被 FC mmap 当运行内存,不能删/不能动它的 inode → 用 os.replace 原子改名(inode 不变)。
+    if mem_backend_path.endswith("vm.mem.merged"):
+        try:
+            # 删旧 diff(已并入 merged)
+            if os.path.exists(diff_mem):
+                os.remove(diff_mem)
+            # merged 原子改名为 base:os.replace 保留 inode + 已建立的 mmap 不受影响,
+            # 只是把老 base_mem 的目录项替换掉。老 base 的数据块在 rename 覆盖后被释放。
+            os.replace(mem_backend_path, base_mem)  # merged → base(新基准)
+            mem_backend_path = base_mem
+        except OSError:
+            pass  # 转正失败不影响本次已 resume 成功的 VM;下轮 suspend 会降级 Full 兜底
 
     # 重建 tap
     tap, _, guest_ip = _setup_tap(tap_idx)
@@ -491,6 +603,7 @@ def op_resume(body: dict) -> dict:
     # 这里不主动 remount，依赖 JuiceFS 自动重连机制。
 
     return {"restore_time_s": round(dt, 4), "ip": guest_ip,
+            "merge_time_s": round(merge_time, 4),
             "juicefs_mode": JUICEFS_ENABLED}
 
 
@@ -641,6 +754,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, op_create(body))
             if path == "/vm/destroy":
                 return self._send(200, op_destroy(body))
+            if path == "/vm/snapshot_base":
+                return self._send(200, op_snapshot_base(body))
             if path == "/vm/suspend":
                 return self._send(200, op_suspend(body))
             if path == "/vm/resume":

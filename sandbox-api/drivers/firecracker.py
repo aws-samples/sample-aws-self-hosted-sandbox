@@ -77,19 +77,32 @@ class FirecrackerDriver:
     # suspend  (Fly suspend 同款:暂停 → Full/diff 快照 → kill → 释放 RAM)
     # ------------------------------------------------------------------
 
+    def snapshot_base(self, sandbox_id: str, record: dict) -> dict:
+        """
+        方案C 预热:sandbox 运行期打一次 Full base 快照(不释放 RAM),供后续 Diff。
+        create 成功后由控制面异步调用;off spot 关键路径。
+        """
+        node = record["node"]
+        snap_local = f"{SBX_BASE}/{sandbox_id}/snap"
+        return self._agent(node, "POST", "/vm/snapshot_base", {
+            "id": sandbox_id,
+            "snapshot_local_path": snap_local,
+        }, timeout=180)
+
     def suspend(self, sandbox_id: str, record: dict) -> dict:
+        # 方案C:快照落节点持久状态 EBS(snap_local),spot 终止后卷幸存,不传 S3。
+        # 有 base 时走 Diff(只写脏页,秒级);无 base 降级 Full。
         node        = record["node"]
         snap_local  = f"{SBX_BASE}/{sandbox_id}/snap"
-        snap_s3     = f"s3://{S3_BUCKET}/sbx/{sandbox_id}/" if S3_BUCKET else ""
 
         resp = self._agent(node, "POST", "/vm/suspend", {
             "id":                   sandbox_id,
             "snapshot_local_path":  snap_local,
-            "s3_prefix":            snap_s3,   # node-agent 异步上传
-        })
+        }, timeout=300)
         return {
-            "snapshot_s3":           snap_s3,
-            "snapshot_size_bytes":   resp.get("mem_file_bytes", 0),
+            "snapshot_type":          resp.get("snapshot_type", ""),
+            "snapshot_size_bytes":    resp.get("mem_file_bytes", 0),
+            "snapshot_actual_bytes":  resp.get("mem_actual_bytes", 0),
             "snapshot_create_time_s": resp.get("snapshot_create_time_s", 0),
         }
 
@@ -177,7 +190,8 @@ class FirecrackerDriver:
     # node-agent HTTP 调用
     # ------------------------------------------------------------------
 
-    def _agent(self, node: str, method: str, path: str, body: Any = None) -> dict:
+    def _agent(self, node: str, method: str, path: str, body: Any = None,
+               timeout: int = 120) -> dict:
         # node 可以是 "ip" 或 "ip:port";后者已含 port,不再追加
         host = node if ":" in node else f"{node}:{NODE_AGENT_PORT}"
         url  = f"http://{host}{path}"
@@ -185,7 +199,7 @@ class FirecrackerDriver:
         headers = {"Content-Type": "application/json"}
         req  = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             body_txt = e.read().decode(errors="replace")
