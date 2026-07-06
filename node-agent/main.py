@@ -179,8 +179,14 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
     })
     _fc(sock, "PUT", "/machine-config", {"vcpu_count": cpu, "mem_size_mib": mem_mib})
     _fc(sock, "PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap})
-    # 注: 里程碑 B 用 TAP SSH 做 exec,不配 vsock。
-    # vsock 设备会被写入快照,resume 时重绑 host UDS 报 "Address in use",且其 config 在本环境静默失败。
+    # vsock: host UDS = {d}/v.sock, guest CID=3, port=2222 供 exec 使用。
+    # exec 主通道走 vsock(不依赖 guest 网络/sshd)，SSH 仅兜底。
+    # 快照含 vsock 设备配置,resume 时由 op_resume 先 os.remove(v.sock) 避免 "Address in use"。
+    vsock_path = f"{d}/v.sock"
+    try:
+        _fc(sock, "PUT", "/vsock", {"vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_path})
+    except Exception:
+        pass  # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)
     _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
 
     return proc.pid, sock
