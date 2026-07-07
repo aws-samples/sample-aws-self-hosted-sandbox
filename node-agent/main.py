@@ -82,6 +82,11 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
     host_ip  = f"172.18.{tap_idx}.1"
     guest_ip = f"172.18.{tap_idx}.2"
     host_if  = _host_iface()
+    # 幂等清理同名残留 tap:suspend/destroy 后 tap 设备不会自动消失,
+    # 若 tap_idx 被复用(暖池 resume、tap_idx 回收重分配),残留的旧 tap 会让
+    # FC snapshot/load 打开设备时报 "Resource busy (os error 16)" → resume 失败。
+    # 先删再建,保证设备干净。
+    subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "tuntap", "add", tap, "mode", "tap"],
                    stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
@@ -469,6 +474,12 @@ def op_suspend(body: dict) -> dict:
     mem_apparent = st.st_size
     mem_actual   = st.st_blocks * 512
 
+    # kill VMM 后释放 tap 设备,防止泄漏堆积(否则 tap 会一直残留在节点上,
+    # tap_idx 复用时与残留设备冲突)。resume 侧 _setup_tap 也会幂等重建,双保险。
+    tap_name = vm.get("tap") or f"fctap{vm.get('tap_idx', '')}"
+    if tap_name and tap_name != "fctap":
+        _teardown_tap(tap_name)
+
     with _LOCK:
         vm["state"] = "suspended"
         vm["pid"]   = None
@@ -537,6 +548,13 @@ def op_resume(body: dict) -> dict:
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
 
+    # 快照来源目录:暖池 claim 时 snap_dir=SBX_BASE/{warm_id}/snap,其父目录
+    # (warm_id 目录)是快照固化的 vsock UDS 所在(v.sock 路径写死在快照里,
+    # load 时 FC 会重新绑定它)。当 sid(real_id)≠ 快照来源 id 时,vsock 仍绑
+    # 在来源目录,需清理来源目录的 v.sock,并在 sid 目录建 symlink 供 exec 用。
+    src_dir = os.path.dirname(snap_dir)
+    vsock_bound = f"{src_dir}/v.sock"   # 快照实际绑定的 UDS 路径
+
     # rootfs 准备:方案C 下 rootfs 就在状态 EBS 的 {sid}/rootfs.ext4(随卷迁移,含装的软件)。
     # 回退:本地已有→直接用;快照目录里有→复制;都没有→基础镜像 CoW。
     if not os.path.exists(rootfs):
@@ -573,10 +591,12 @@ def op_resume(body: dict) -> dict:
 
     # resume 前清理旧 vsock socket(快照含 vsock 设备,残留的 v.sock 会导致
     # "Address in use" → snapshot load 失败)。这是 Firecracker 快照恢复已知坑。
-    try:
-        os.remove(f"{d}/v.sock")
-    except FileNotFoundError:
-        pass
+    # 清理的是快照实际绑定的 UDS(来源目录),而非 sid 目录。
+    for stale in {f"{d}/v.sock", vsock_bound}:
+        try:
+            os.remove(stale)
+        except FileNotFoundError:
+            pass
 
     with open(f"{d}/vm-resume.log", "w") as lf:
         # nosemgrep: dangerous-subprocess-use-tainted-env-args -- 固定 list:FC_BIN 来自环境配置,sock 为本地派生路径,无用户输入
@@ -589,10 +609,17 @@ def op_resume(body: dict) -> dict:
     # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
     # 会自动重建 vsock 并绑定该 UDS；若旧 v.sock 文件残留会导致
     # "Address in use (os error 98)" → 必须先删旧 socket 文件。
-    try:
-        os.remove(f"{d}/v.sock")
-    except FileNotFoundError:
-        pass
+    for stale in {f"{d}/v.sock", vsock_bound}:
+        try:
+            os.remove(stale)
+        except FileNotFoundError:
+            pass
+
+    # 先重建 tap,再 load 快照。
+    # 顺序关键:snapshot/load(resume_vm=True) 会立即恢复快照里保存的网络设备并
+    # 打开宿主 tap(fctap{idx});若此时 tap 尚未就绪(或残留旧设备占用),FC 报
+    # "Open tap device failed: Resource busy" → load 失败。因此必须先 setup_tap。
+    tap, _, guest_ip = _setup_tap(tap_idx)
 
     # vm.mem 始终是最新的完整内存（Diff 的脏页已在 suspend 侧叠加进去），
     # 因此 resume 直接 load vm.mem，无需在恢复路径上做合并 → resume 保持亚秒级。
@@ -623,8 +650,17 @@ def op_resume(body: dict) -> dict:
         except OSError:
             pass  # 转正失败不影响本次已 resume 成功的 VM;下轮 suspend 会降级 Full 兜底
 
-    # 重建 tap
-    tap, _, guest_ip = _setup_tap(tap_idx)
+    # 注:tap 已在 snapshot/load 之前重建(见上,顺序关键,避免 Resource busy)。
+    # 暖池 claim(sid=real_id ≠ 快照来源):FC 已把 vsock 绑到来源目录的
+    # v.sock(快照固化路径),但 exec 按 sid 目录找 {d}/v.sock。建 symlink 让
+    # exec 的 vsock 主通道能连上,否则 exec 掉到 SSH 兜底甚至失败。
+    if os.path.abspath(vsock_bound) != os.path.abspath(f"{d}/v.sock"):
+        try:
+            if os.path.lexists(f"{d}/v.sock"):
+                os.remove(f"{d}/v.sock")
+            os.symlink(vsock_bound, f"{d}/v.sock")
+        except OSError:
+            pass
 
     with _LOCK:
         _VMS[sid] = {

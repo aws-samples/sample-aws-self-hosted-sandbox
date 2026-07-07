@@ -11,6 +11,7 @@ Kata 模式:交给 kubernetes-sigs/agent-sandbox SandboxWarmPool CRD 管理
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 import uuid
@@ -56,17 +57,29 @@ class WarmPool:
             return False
 
         try:
-            driver_fields = self._driver.resume(warm_id, record)
-            # 迁移到 real_id:排除 pool 相关字段
-            new_record = {
+            # 用 real_id 注册 VM(后续 exec/suspend 按 real_id 路由),
+            # 但从 warm_id 的快照/rootfs 恢复(本地快照在 warm_id 目录)。
+            driver_fields = self._driver.resume(real_id, record, snapshot_id=warm_id)
+            # 迁移到 real_id:create_sandbox 已先 put 了一条 id=real_id 的占位记录
+            # (state=creating),故这里必须用 force_update 覆盖,不能再 db.put
+            # ——db.put 带 attribute_not_exists(id) 条件写,对已存在的 real_id 会抛
+            # ConditionalCheckFailedException,导致 claim 静默回退冷建(暖池形同虚设)。
+            # 迁移暖池实例的运行态字段(快照/tap/node/guest_ip)到占位记录上。
+            # 排除 updated_at:force_update 内部固定 SET updated_at=:now,
+            # 若 migrate 里也带 updated_at 会导致 UpdateExpression 路径重叠报错。
+            migrate = {
                 k: v for k, v in record.items()
-                if k not in ("id", "pool_state")
+                if k not in ("id", "pool_state", "tenant_id", "created_at", "updated_at")
             }
-            new_record.update({"id": real_id, "state": "running", **driver_fields})
-            db.put(new_record)
+            migrate.update({"state": "running", **driver_fields})
+            db.force_update(real_id, migrate)
             db.delete(warm_id)
             return True
-        except Exception:
+        except Exception as e:
+            # resume 失败:该 warm 快照/VM 可能已损坏,删掉避免反复领到坏实例;
+            # 打印异常(不静默吞)——否则暖池全回退冷建时无从排查(可观测性)。
+            print(f"[warm_pool] claim resume failed for {warm_id}, "
+                  f"fallback to cold create: {e!r}", file=sys.stderr, flush=True)
             db.delete(warm_id)
             return False
 

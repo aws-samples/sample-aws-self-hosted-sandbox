@@ -355,10 +355,10 @@ class TestFirecrackerDriver(unittest.TestCase):
         record = {**cf, "id": "sbx-test2", "state": "running"}
 
         snap = drv.suspend("sbx-test2", record)
-        self.assertIn("snapshot_s3", snap)
+        # 方案C:快照落节点持久状态 EBS,不传 S3;返回 snapshot_type 而非 snapshot_s3。
+        self.assertIn("snapshot_type", snap)
         self.assertIn("snapshot_create_time_s", snap)
 
-        record["snapshot_s3"] = snap["snapshot_s3"]
         record["state"] = "suspended"
         resumed = drv.resume("sbx-test2", record)
         self.assertIn("node", resumed)
@@ -499,7 +499,8 @@ class TestAPIEndToEnd(unittest.TestCase):
             code, body = c("POST", f"/sandboxes/{sid}/suspend")
             self.assertEqual(code, 200)
             self.assertEqual(body["state"], "suspended")
-            self.assertIn("snapshot_s3", body)
+            # 方案C:快照落节点持久状态 EBS,不传 S3;返回体含 snapshot_type。
+            self.assertIn("snapshot_type", body)
 
             # POST /sandboxes/{id}/resume
             code, body = c("POST", f"/sandboxes/{sid}/resume")

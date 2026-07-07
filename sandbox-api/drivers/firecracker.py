@@ -112,12 +112,22 @@ class FirecrackerDriver:
     # resume  (从快照秒级恢复;可在不同节点)
     # ------------------------------------------------------------------
 
-    def resume(self, sandbox_id: str, record: dict) -> dict:
-        snap_local = f"{SBX_BASE}/{sandbox_id}/snap"
-        rootfs     = f"{SBX_BASE}/{sandbox_id}/rootfs.ext4"
+    def resume(self, sandbox_id: str, record: dict,
+               snapshot_id: str | None = None) -> dict:
+        # snapshot_id:快照来源沙盒的 id(暖池 claim 时 = warm_id;普通 resume 时
+        # = sandbox_id 自身)。node-agent 用 sandbox_id 注册 VM,但从 snapshot_id
+        # 的快照/rootfs 路径恢复 —— 暖池把 warm VM"改名"成 real_id 上线时,exec
+        # 等后续操作按 real_id 路由,若仍用 warm_id 注册会 "not running"。
+        snap_id    = snapshot_id or sandbox_id
+        snap_local = f"{SBX_BASE}/{snap_id}/snap"
+        rootfs     = f"{SBX_BASE}/{snap_id}/rootfs.ext4"
         snap_s3    = record.get("snapshot_s3", "")
 
-        node = self._pick_node()
+        # 优先在快照所在的原节点 resume:该节点本地已有快照文件,resume 亚秒级;
+        # 若换节点则需从 S3 下载整份内存镜像(实测跨节点 ~78s,远慢于冷建),
+        # 完全背离暖池"秒级 create"的目的。仅当原节点已死/不可达时才跨节点兜底
+        # (此时 S3 下载是恢复的必要代价)。
+        node = self._resume_node(record.get("node", ""))
 
         resp = self._agent(node, "POST", "/vm/resume", {
             "id":                  sandbox_id,
@@ -164,6 +174,19 @@ class FirecrackerDriver:
     # ------------------------------------------------------------------
     # 节点选择:按 node-agent /health 的 free_mem_mib 挑水位最高的
     # ------------------------------------------------------------------
+
+    def _resume_node(self, preferred: str) -> str:
+        """
+        resume 选点:优先复用快照原节点(本地有快照,亚秒 resume);原节点不存活
+        才退到 _pick_node 跨节点兜底(从 S3 下载,慢但能恢复)。
+        """
+        if preferred:
+            try:
+                self._agent(preferred, "GET", "/health")
+                return preferred
+            except Exception:
+                pass  # 原节点已死/不可达 → 跨节点兜底
+        return self._pick_node()
 
     def _pick_node(self) -> str:
         # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
