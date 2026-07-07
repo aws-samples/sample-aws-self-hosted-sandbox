@@ -61,13 +61,13 @@ locals {
   arch_cfg = {
     arm64 = {
       ami_type      = "AL2023_ARM_64_STANDARD"
-      default_metal = "c6g.metal"  # Graviton 裸金属
-      fc_arch       = "aarch64"    # Firecracker 发行包 / CI vmlinux 的架构后缀
+      default_metal = "c6g.metal" # Graviton 裸金属
+      fc_arch       = "aarch64"   # Firecracker 发行包 / CI vmlinux 的架构后缀
       rootfs_key    = "rootfs/rootfs-juicefs.tar.gz"
     }
     amd64 = {
       ami_type      = "AL2023_x86_64_STANDARD"
-      default_metal = "c5n.metal"  # 最便宜的主流 Intel x86 裸金属(72 vCPU/192GiB)
+      default_metal = "c5n.metal" # 最便宜的主流 Intel x86 裸金属(72 vCPU/192GiB)
       fc_arch       = "x86_64"
       rootfs_key    = "rootfs/rootfs-juicefs-x86_64.tar.gz" # 需另行构建 x86 rootfs(见 setup-host.sh)
     }
@@ -86,6 +86,23 @@ variable "rootfs_s3_uri" {
   type        = string
   description = "S3 URI of the minimal bootable arm64 rootfs tarball (B2 FC mode)"
   default     = ""
+}
+
+# ---------- 方案C:持久状态 EBS(挂 /var/lib/sbx,存快照+rootfs,spot 幸存) ----------
+variable "state_ebs_size_gb" {
+  type        = number
+  default     = 400
+  description = "每节点持久状态 EBS 容量(GB)。resume 时每 sandbox 峰值需 base(2G)+merged(2G)≈4G,50 个约 200G,再加 diff/rootfs/余量 → 400G。"
+}
+variable "state_ebs_iops" {
+  type        = number
+  default     = 4000
+  description = "状态 EBS 的 IOPS(gp3,1000MB/s 吞吐至少需 4000 IOPS)。"
+}
+variable "state_ebs_throughput" {
+  type        = number
+  default     = 1000
+  description = "状态 EBS 吞吐(MB/s)。1000=gp3 单卷上限,让 50 个 Diff 快照并发落盘 ~16s。"
 }
 
 # ---------- VPC(EKS 专用,3 AZ;裸金属在多 AZ 提高可得性) ----------
@@ -157,9 +174,14 @@ module "eks" {
       ami_type       = local.node_arch_cfg.ami_type
       instance_types = [local.metal_type]
       # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化
-      min_size       = 2
-      max_size       = 2
-      desired_size   = 2
+      min_size     = 2
+      max_size     = 2
+      desired_size = 2
+
+      # 方案C:两台节点必须【同一 AZ】—— EBS 状态卷不能跨 AZ attach。
+      # 钉死到单个 AZ 的公有子网(public_subnets[0] = azs[0] = us-east-1a),否则 EKS 会把两台
+      # 分散到不同 AZ,导致 spot 疏散后状态卷无法 attach 到另一 AZ 的新节点。
+      subnet_ids = [module.vpc.public_subnets[0]]
 
       block_device_mappings = {
         xvda = {
@@ -167,6 +189,19 @@ module "eks" {
           ebs = {
             volume_size = 200
             volume_type = "gp3"
+          }
+        }
+        # 方案C:独立【持久状态 EBS】挂 /var/lib/sbx —— 存所有 sandbox 的内存快照(base+diff)+ rootfs。
+        # 高吞吐 gp3(1000MB/s)让 50 个 Diff 快照并发落盘 ~16s。
+        # delete_on_termination=false → spot 强制终止后卷幸存,可 attach 到新机恢复(方案C核心)。
+        sbxdata = {
+          device_name = "/dev/sdf"
+          ebs = {
+            volume_size           = var.state_ebs_size_gb
+            volume_type           = "gp3"
+            iops                  = var.state_ebs_iops
+            throughput            = var.state_ebs_throughput
+            delete_on_termination = false
           }
         }
       }
@@ -185,6 +220,35 @@ module "eks" {
         echo "[pre-bootstrap] START $(date)"
 
         mkdir -p /opt/sbx /var/lib/sbx
+
+        # 方案C:挂载【持久状态 EBS】到 /var/lib/sbx —— sandbox 快照(base+diff)+ rootfs 都落这块盘。
+        # 它 delete_on_termination=false,spot 终止后幸存,可 attach 到新机恢复。
+        # 识别:非根盘、无分区表、无挂载点的块设备(附加的数据卷)。首次为空盘 → mkfs;
+        # 已有文件系统(从旧节点迁移来的幸存卷)→ 直接挂,不格式化(否则抹掉数据!)。
+        SBX_DISK=""
+        for dev in /dev/nvme*n1 /dev/sd[b-z] /dev/xvd[b-z]; do
+          [ -b "$dev" ] || continue
+          # 跳过根盘及其分区(有挂载点的)
+          if lsblk -no MOUNTPOINT "$dev" 2>/dev/null | grep -q .; then continue; fi
+          # 跳过有分区表的(根盘通常有 p1/p128)
+          parts=$(lsblk -no NAME "$dev" 2>/dev/null | wc -l)
+          [ "$parts" -gt 1 ] && continue
+          SBX_DISK="$dev"; break
+        done
+        if [ -n "$SBX_DISK" ]; then
+          # 已有 xfs 文件系统?幸存卷迁移场景 → 直接挂,保数据。空盘 → mkfs。
+          if blkid "$SBX_DISK" 2>/dev/null | grep -q 'TYPE="xfs"'; then
+            echo "[pre-bootstrap] state EBS $SBX_DISK has xfs, mounting (preserve data)"
+          else
+            echo "[pre-bootstrap] state EBS $SBX_DISK blank, mkfs.xfs"
+            mkfs.xfs -f -m reflink=1 "$SBX_DISK" 2>/dev/null
+          fi
+          mount -o noatime "$SBX_DISK" /var/lib/sbx 2>/dev/null && \
+            echo "[pre-bootstrap] state EBS $SBX_DISK -> /var/lib/sbx OK" || \
+            echo "[pre-bootstrap] state EBS mount failed (non-fatal)"
+        else
+          echo "[pre-bootstrap] no state EBS found, /var/lib/sbx on root disk"
+        fi
 
         # Firecracker (바이너리만, 빠름) —— 架构由 Terraform node_arch 注入
         ARCH=${local.node_arch_cfg.fc_arch}

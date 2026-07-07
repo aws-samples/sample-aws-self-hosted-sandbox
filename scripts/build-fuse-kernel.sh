@@ -42,21 +42,25 @@ case "$ARCH" in
     ;;
 esac
 
-KVER="${KVER:-6.1.128}"           # 与 AL2023 宿主内核同系列;可用环境变量覆盖
+KVER="${KVER:-5.10.259}"          # 与现有 guest CI 内核(5.10.223)同系列的最新 longterm。
+                                  # 注:kernel.org 只保留每系列最新点版本,旧版会 404;实测 us-east-1 从
+                                  # cdn.kernel.org 下 v6.x 点版本会 404,v5.x 正常,故默认锁 5.10。可用 KVER 覆盖。
+KMM="$(echo "$KVER" | cut -d. -f1,2)"  # 主.次(如 5.10),用于取对应的 microvm config
+KMAJ="$(echo "$KVER" | cut -d. -f1)"   # 主版本(如 5),用于 kernel.org 路径 v${KMAJ}.x
 OUT="${OUT:-/opt/sbx/vmlinux-fuse}"
 mkdir -p "$(dirname "$OUT")"
 
 # 1) 工具链
 dnf install -y gcc make flex bison elfutils-libelf-devel openssl-devel bc perl tar xz wget
 
-# 2) 内核源码
+# 2) 内核源码(路径按主版本 v${KMAJ}.x;curl 比 wget 对 CDN 更稳,失败即报错)
 cd /opt
-[ -d "linux-$KVER" ] || { wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz"; tar -xf "linux-$KVER.tar.xz"; }
+[ -d "linux-$KVER" ] || { curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${KMAJ}.x/linux-$KVER.tar.xz" -o "linux-$KVER.tar.xz"; tar -xf "linux-$KVER.tar.xz"; }
 cd "linux-$KVER"
 
-# 3) 以 Firecracker 推荐的 microvm config 为基础(按架构取;取不到则 defconfig)
-wget -q "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${KCONFIG_ARCH}-6.1.config" -O .config 2>/dev/null \
-  || wget -q "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${KCONFIG_ARCH}.config" -O .config 2>/dev/null \
+# 3) 以 Firecracker 推荐的 microvm config 为基础(按 主.次 版本取;取不到则退无版本号,再退 defconfig)
+curl -fsSL "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${KCONFIG_ARCH}-${KMM}.config" -o .config 2>/dev/null \
+  || curl -fsSL "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${KCONFIG_ARCH}.config" -o .config 2>/dev/null \
   || make ARCH="$KARCH" defconfig
 
 # 4) 打开 FUSE / overlay / inotify(R3 三项)

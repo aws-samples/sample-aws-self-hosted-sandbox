@@ -42,3 +42,7 @@ node-agent/sbx_exec_key
 # Local B2 demo/validation scripts (kept on disk, not committed)
 scripts/demo_e2e_fc.py
 scripts/demo_e2e_fc_p2.py
+
+# Ad-hoc temp/experiment scripts (never commit)
+scripts/_tmp_*
+_tmp_*

@@ -77,20 +77,34 @@ class FirecrackerDriver:
     # suspend  (Fly suspend 同款:暂停 → Full/diff 快照 → kill → 释放 RAM)
     # ------------------------------------------------------------------
 
+    def snapshot_base(self, sandbox_id: str, record: dict) -> dict:
+        """
+        方案C 预热:sandbox 运行期打一次 Full base 快照(不释放 RAM),供后续 Diff。
+        create 成功后由控制面异步调用;off spot 关键路径。
+        """
+        node = record["node"]
+        snap_local = f"{SBX_BASE}/{sandbox_id}/snap"
+        return self._agent(node, "POST", "/vm/snapshot_base", {
+            "id": sandbox_id,
+            "snapshot_local_path": snap_local,
+        }, timeout=180)
+
     def suspend(self, sandbox_id: str, record: dict) -> dict:
+        # 方案C:快照落节点持久状态 EBS(snap_local),spot 终止后卷幸存,不传 S3。
+        # 有 base 时走 Diff(只写脏页,秒级);无 base 降级 Full。
         node        = record["node"]
         snap_local  = f"{SBX_BASE}/{sandbox_id}/snap"
-        snap_s3     = f"s3://{S3_BUCKET}/sbx/{sandbox_id}/" if S3_BUCKET else ""
 
         # suspend 在慢速 EBS gp3 上 Full 快照可能 ~100s，给足 300s 避免 API 超时
+        # 方案C 不传 S3(快照落持久状态 EBS,卷幸存);不带 s3_prefix。
         resp = self._agent(node, "POST", "/vm/suspend", {
             "id":                   sandbox_id,
             "snapshot_local_path":  snap_local,
-            "s3_prefix":            snap_s3,   # node-agent 异步上传
         }, timeout=300)
         return {
-            "snapshot_s3":           snap_s3,
-            "snapshot_size_bytes":   resp.get("mem_file_bytes", 0),
+            "snapshot_type":          resp.get("snapshot_type", ""),
+            "snapshot_size_bytes":    resp.get("mem_file_bytes", 0),
+            "snapshot_actual_bytes":  resp.get("mem_actual_bytes", 0),
             "snapshot_create_time_s": resp.get("snapshot_create_time_s", 0),
         }
 
@@ -105,17 +119,21 @@ class FirecrackerDriver:
 
         node = self._pick_node()
 
-        self._agent(node, "POST", "/vm/resume", {
+        resp = self._agent(node, "POST", "/vm/resume", {
             "id":                  sandbox_id,
             "snapshot_local_path": snap_local,
             "rootfs_path":         rootfs,        # 路径约定,跨机一致
             "tap_idx":             record["tap_idx"],
             "s3_prefix":           snap_s3,       # node-agent 若本地无缓存则从 S3 拉
-        })
+        }, timeout=180)
         info = self._agent(node, "GET", f"/vm/{sandbox_id}")
         return {
-            "node":     node,
-            "guest_ip": info.get("ip", ""),
+            "node":            node,
+            "guest_ip":        info.get("ip", ""),
+            # 透传 node-agent 的恢复指标(P1 网络收敛结果 + 恢复/合并耗时),便于观测/验证。
+            "restore_time_s":  resp.get("restore_time_s"),
+            "merge_time_s":    resp.get("merge_time_s"),
+            "net_fix_ok":      resp.get("net_fix_ok"),
         }
 
     # ------------------------------------------------------------------

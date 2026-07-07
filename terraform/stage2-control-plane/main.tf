@@ -656,9 +656,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             name       = "fc-assets"
             mount_path = "/opt/sbx"
           }
+          # ⚠️ 关键:所有 Firecracker microVM 作为 node-agent 的子进程,跑在【本 Pod 的 cgroup】内。
+          # 若设 memory limit,所有 guest 内存之和会被此 limit 卡住 → OOM 杀 microVM。
+          # 方案C:一台 metal 要跑 ~50 个 2GB sandbox(~100GB),故【不设 memory limit】,
+          # 让 node-agent(及其 microVM 子进程)可用到节点物理内存上限。
+          # 只保留 CPU request 用于调度;不设 cpu/memory limit。
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
-            limits   = { cpu = "2", memory = "4Gi" }
           }
         }
         volume {
