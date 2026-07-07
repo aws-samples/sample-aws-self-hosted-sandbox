@@ -519,3 +519,65 @@ FC 官方文档印证:"Guest network connectivity is not guaranteed to be preser
 - 本地 HEAD `dec729b` 落后 origin/main 2 commit(同事 vsock)。本地 node-agent 有方案C+Diff 改动(未提交)。
 - **合并策略**:等同事 vsock 定稿 → 先 commit 本地方案C+Diff → 再 merge origin/main → 解 node-agent 冲突
   (两边都改 op_exec/op_resume 区域)。
+
+
+---
+
+## 满载疏散实测:密度 vs 120s 窗口(2026-07-06,单块 gp3 1000MB/s)
+
+> 修正之前"空跑 sandbox"的乐观数据。本轮每个 sandbox 配 1.5G,**实际灌到 ~1.2GB 常驻内存并触碰所有页**
+> (模拟满载 openclaw:一半可压文本 + 一半 urandom)。这才是接近生产的真实成本。
+> 分批创建(每批10)+ base 限流,避免瞬间 OOM。
+
+### 内存使用真相(关键澄清)
+- Firecracker 用 `MAP_PRIVATE` mmap base.mem → guest 未用的页不占物理内存,只在页缓存(可回收)。
+- **空跑**:70 个 FC 进程 RSS 仅 ~11GB,MemAvailable 117G(严重低估真实需求)。
+- **满载**:每个真实占 ~1.2GB → 70 个 used **98.9GB**、available 仅 **27.5GB**;60 个 available 42G;50 个 available 56G。
+- **结论:内存不能超卖。按【真实占用】而非配置值定密度。** 空跑测试会误导容量规划。
+
+### 满载疏散实测(各 ~1.2GB,并发12,单块 gp3 1000MB/s)
+| 密度 | Diff 写盘量 | 疏散墙钟 | 进120s? | 余量 | 内存 available |
+|---|---|---|---|---|---|
+| 70 | 91.9GB | **127.1s** | ❌ 超窗 | -7s | 27.5GB |
+| 60 | 77.4GB | **105.0s** | ⚠️ 勉强 | 15s | 42GB |
+| **50** | **65.0GB** | **84.8s** | ✅ 安全 | **35s** | 56GB |
+
+- 数据线性:墙钟 ≈ 写盘量 ÷ 1000MB/s + ~20s 编排开销 → **瓶颈是单卷 EBS 带宽**。
+- **满载下 Diff ≈ Full**(平均 ~1300MB/个):满载 openclaw 把大部分内存用脏,Diff 省时优势基本消失。
+  → Diff 只在"脏页 << 总内存"(空闲/轻负载)时省;满载场景要靠**带宽**而非 Diff。
+
+### 生产容量定论(单块 c6g.metal + 单块 1000MB/s gp3)
+- **满载 openclaw 安全密度 = ~50 个**(疏散 84.8s 余量35s + 内存 available 56G,双约束都舒服)。
+- 60 个"能进但不安全"(余量15s);70 个超窗(127s)。
+- **要更高密度**:(a) 提高 EBS 带宽——多卷并行/io2 冲整机 2375MB/s,65GB÷2375≈27s,可上 70+;
+  (b) openclaw 实际内存占用低则 Diff 变小,密度自然上去。
+- 三档实测(空跑50/满载70/60/50)把满载真实边界摸清,作为容量规划依据。
+
+
+---
+
+## P1 网络收敛 + resume 正确性修复(2026-07-06/07)
+
+### 跨机恢复实测(50 个满载,node1→node2 EBS 迁移)
+- 迁移:node1 sync+umount 状态卷 → detach **35s**(已 umount 故快) → attach 到 node2 **5s** → mount(50 diffs+bases 完整)。
+- 批量 resume:**50/50 成功**,墙钟 154s(满载 merged 1.2G/个 从 EBS 加载,并发争带宽);内存标记 `FILL-xxx` 精确续上、guest 网络 NET_OK。
+
+### P1(经 vsock 加速网络收敛)
+- 机制:resume 后经 **vsock**(不依赖 guest IP 网络) 下发 `ip neigh flush all` + `arping -U`(gratuitous ARP)。
+- 验证:人为灌错误网关 MAC(动态 stale ARP) → 不修复内核 ~6s 自愈;经 vsock 下发 flush → **0.1s 即恢复**。
+- 已实施:node-agent `op_resume` 成功后自动经 vsock 刷新;driver 透传 `net_fix_ok`。
+  单 sandbox 多代实测 **net_fix_ok=True** 两代都成功。
+- 注:常规跨机 resume 因 **tap_idx 保留**(网关 IP 不变),网络本就秒级收敛;P1 主要兜底极端 stale ARP + 加速。
+
+### ⚠️ resume 内存合并正确性修复(重要)
+- **原 bug**:op_resume 用"稀疏比例启发式"判断是否合并 diff——满载 diff 占盘接近全量(非稀疏)时
+  **跳过合并、直接 load vm.mem(diff)**。但 Diff 的 mem 是稀疏文件,**自 base 以来的干净页是空洞(读为0)**,
+  直接 load → 干净页变 0 → **内存静默损坏**(满载时因几乎全脏侥幸没暴露,但原理上错误)。
+- **修复**:只要存在 base 就**无条件合并** base+diff→merged 再 load(不再用稀疏比例判断)。
+  合并语义:base 副本 + diff 非空洞页覆盖 = 完整内存;对 Full 的 vm.mem 合并也安全(无空洞=全量覆盖)。
+- 配合 P0:merged load 成功后原子转正为新 base。多代实测 marks=AB PASS,merge 耗时 0.03s。
+
+### 合并代码状态(feat/ebs-diff-scheme-c)
+- 已含:方案C EBS+Diff、P0 merged转正、P1 vsock网络刷新、always-merge正确性修复、
+  driver net_fix透传、同事 vsock exec(合并保留)。
+- 镜像已构建推送;真机验证:单sandbox多代 PASS、50满载疏散(84.8s)、跨机恢复 50/50。

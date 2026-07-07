@@ -119,17 +119,21 @@ class FirecrackerDriver:
 
         node = self._pick_node()
 
-        self._agent(node, "POST", "/vm/resume", {
+        resp = self._agent(node, "POST", "/vm/resume", {
             "id":                  sandbox_id,
             "snapshot_local_path": snap_local,
             "rootfs_path":         rootfs,        # 路径约定,跨机一致
             "tap_idx":             record["tap_idx"],
             "s3_prefix":           snap_s3,       # node-agent 若本地无缓存则从 S3 拉
-        })
+        }, timeout=180)
         info = self._agent(node, "GET", f"/vm/{sandbox_id}")
         return {
-            "node":     node,
-            "guest_ip": info.get("ip", ""),
+            "node":            node,
+            "guest_ip":        info.get("ip", ""),
+            # 透传 node-agent 的恢复指标(P1 网络收敛结果 + 恢复/合并耗时),便于观测/验证。
+            "restore_time_s":  resp.get("restore_time_s"),
+            "merge_time_s":    resp.get("merge_time_s"),
+            "net_fix_ok":      resp.get("net_fix_ok"),
         }
 
     # ------------------------------------------------------------------

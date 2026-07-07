@@ -534,16 +534,18 @@ def op_resume(body: dict) -> dict:
     diff_mem = f"{snap_dir}/vm.mem"
     mem_backend_path = diff_mem
     merge_time = 0.0
-    if os.path.exists(base_mem):
-        # 判断 vm.mem 是否为 Diff(稀疏,占盘远小于 apparent)。base==diff 时说明上次是 Full,无需合并。
-        st = os.stat(diff_mem)
-        is_sparse_diff = (st.st_blocks * 512) < (st.st_size * 0.9)
-        if is_sparse_diff:
-            merged = f"{snap_dir}/vm.mem.merged"
-            tm = time.monotonic()
-            _merge_diff_into_base(base_mem, diff_mem, merged)
-            merge_time = time.monotonic() - tm
-            mem_backend_path = merged
+    if os.path.exists(base_mem) and os.path.exists(diff_mem):
+        # ⚠️ 正确性:只要存在 base,就【必须】把 vm.mem 合并到 base 上再 load,不能直接 load vm.mem。
+        #   原因:Diff 的 mem 是稀疏文件,自 base 以来【未改动的干净页是空洞(读为0)】。
+        #   直接 load diff → 干净页变成 0 → 内存损坏。即使 diff 看起来"很满"(满载),
+        #   仍可能有少量干净页是空洞,直接 load 会静默损坏这些页。
+        #   合并语义:base 副本 + diff 的非空洞页覆盖 = 完整内存。对 Full 的 vm.mem 合并也安全
+        #   (Full 无空洞,覆盖=全量拷贝)。故【无条件合并】,不再用稀疏比例启发式判断。
+        merged = f"{snap_dir}/vm.mem.merged"
+        tm = time.monotonic()
+        _merge_diff_into_base(base_mem, diff_mem, merged)
+        merge_time = time.monotonic() - tm
+        mem_backend_path = merged
 
     sock = f"{d}/api-resume.sock"
     try:
@@ -617,14 +619,33 @@ def op_resume(body: dict) -> dict:
             "dir":     d,
         }
 
-    # 方案 B：JuiceFS resume 后，guest 内的 FUSE 连接会自动重连 S3
-    # （JuiceFS daemon 随内存快照一起恢复，重连是 JuiceFS 内部行为）
-    # 如果连接未自动恢复，需在 guest 内执行 remount（极少数情况）：
-    #   juicefs umount /workspace && juicefs mount <redis_addr> /workspace -d
-    # 这里不主动 remount，依赖 JuiceFS 自动重连机制。
+    # ---- P1: resume 后经 vsock 加速 guest 网络收敛 ----
+    # 跨机 resume 后,guest 内存快照固化了旧宿主 tap 的网关 MAC(stale ARP)。
+    # 新宿主 tap 是不同 MAC → guest 发包到旧 MAC → 网络不通,要等内核 ARP STALE 探测
+    # 重新学习(实测同机 ~6s、50并发跨机 ~30s)。
+    # 修复:经 vsock(不依赖 guest IP 网络,正好此刻网络不通) 下发 ip neigh flush + gratuitous ARP,
+    #      清掉 stale 项并主动通告,实测 0.1s 即恢复(见 P1 验证)。
+    # 走 vsock 通道(v.sock 存在时),失败不阻断 resume(内核最终也会自愈)。
+    net_fix_ok = False
+    vsock_uds = f"{d}/v.sock"
+    if os.path.exists(vsock_uds):
+        # ip neigh flush 清 stale;arping -U 发 gratuitous ARP 让网关/邻居更新对 guest 的映射。
+        fix_cmd = ("ip neigh flush all 2>/dev/null; "
+                   "ip neigh flush dev eth0 2>/dev/null; "
+                   f"(command -v arping >/dev/null 2>&1 && arping -U -c1 -w1 -I eth0 {guest_ip} >/dev/null 2>&1); "
+                   "echo NETFIX_DONE")
+        for _ in range(8):  # 等 guest vsock agent 就绪(resume 后 agent 随内存恢复,通常立即可用)
+            try:
+                r = _vsock_exec(vsock_uds, fix_cmd, timeout=8)
+                if "NETFIX_DONE" in (r.get("stdout") or ""):
+                    net_fix_ok = True
+                    break
+            except Exception:
+                time.sleep(0.5)  # nosemgrep: arbitrary-sleep -- 等 vsock agent 就绪的退避
 
     return {"restore_time_s": round(dt, 4), "ip": guest_ip,
             "merge_time_s": round(merge_time, 4),
+            "net_fix_ok": net_fix_ok,
             "juicefs_mode": JUICEFS_ENABLED}
 
 
