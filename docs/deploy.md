@@ -497,7 +497,11 @@ cd ../phase3 && terraform destroy -auto-approve \
 #     --query 'SecurityGroups[0].GroupId' --output text)
 #   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
 
-# 5. 删 DynamoDB
+# 5. 删 DynamoDB（建议彻底删，不要保留）
+#    stage1 共 5 张表：sandboxes / events / tap-idx / nodes / locks
+#    ⚠️ 彻底删而非保留 —— 保留会遗留上一轮脏数据：旧沙盒记录(下次重建后节点 IP 全变、
+#       reconcile 起来会把它们全标 orphaned)、旧 node 心跳、locks 锁、tap_idx counter
+#       接着上次的值继续涨。重建仅需 ~10s（PAY_PER_REQUEST 空表零费用），无保留的理由。
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # 6. 清理残留（不清理会阻塞下次重建）
