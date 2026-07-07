@@ -12,14 +12,14 @@
 #   terraform apply -var="enable_juicefs=true" ...
 
 variable "enable_juicefs" {
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
   description = "启用 JuiceFS workspace（方案 B：workspace 在 S3，快照不含磁盘）"
 }
 
 variable "juicefs_redis_node_type" {
   type        = string
-  default     = ""   # 留空时按 node_arch 选默认(arm64→cache.t4g.micro / amd64→cache.t3.micro)
+  default     = "" # 留空时按 node_arch 选默认(arm64→cache.t4g.micro / amd64→cache.t3.micro)
   description = "JuiceFS 元数据 Redis(ElastiCache)节点类型。留空则随 node_arch:arm64=cache.t4g.micro(Graviton),amd64=cache.t3.micro(Intel)。"
 }
 
@@ -64,9 +64,9 @@ resource "aws_security_group" "juicefs_redis" {
   vpc_id      = data.aws_vpc.cluster.id
 
   ingress {
-    from_port   = 6379
-    to_port     = 6379
-    protocol    = "tcp"
+    from_port = 6379
+    to_port   = 6379
+    protocol  = "tcp"
     # 只允许 .metal 节点子网访问（guest 内 JuiceFS client 通过 TAP 走宿主 IP）
     cidr_blocks = [data.aws_vpc.cluster.cidr_block]
   }
@@ -84,16 +84,16 @@ resource "aws_security_group" "juicefs_redis" {
 resource "aws_elasticache_replication_group" "juicefs" {
   count = var.enable_juicefs ? 1 : 0
 
-  replication_group_id = "${var.cluster_name}-jfs"
-  description          = "JuiceFS metadata engine for sandbox workspaces"
-  node_type            = local.juicefs_redis_node_type
-  num_cache_clusters   = 1   # POC 单节点；生产改为 2（multi-AZ）
-  engine_version       = "7.1"
-  port                 = 6379
-  subnet_group_name    = aws_elasticache_subnet_group.juicefs[0].name
-  security_group_ids   = [aws_security_group.juicefs_redis[0].id]
+  replication_group_id       = "${var.cluster_name}-jfs"
+  description                = "JuiceFS metadata engine for sandbox workspaces"
+  node_type                  = local.juicefs_redis_node_type
+  num_cache_clusters         = 1 # POC 单节点；生产改为 2（multi-AZ）
+  engine_version             = "7.1"
+  port                       = 6379
+  subnet_group_name          = aws_elasticache_subnet_group.juicefs[0].name
+  security_group_ids         = [aws_security_group.juicefs_redis[0].id]
   at_rest_encryption_enabled = true
-  transit_encryption_enabled = true    # 生产默认开启（防同 VPC 旁路窃听 /workspace 元数据）
+  transit_encryption_enabled = true # 生产默认开启（防同 VPC 旁路窃听 /workspace 元数据）
   # 注：开启 TLS 后 JuiceFS mount 命令需加 --tls 参数，且节点需信任 ElastiCache 证书
 
   tags = { Project = "claude-sbx-poc" }
@@ -108,10 +108,10 @@ resource "aws_iam_role_policy" "node_agent_juicefs" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
-                  "s3:ListBucket", "s3:ListMultipartUploadParts",
-                  "s3:AbortMultipartUpload"]
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+        "s3:ListBucket", "s3:ListMultipartUploadParts",
+      "s3:AbortMultipartUpload"]
       Resource = [
         aws_s3_bucket.juicefs[0].arn,
         "${aws_s3_bucket.juicefs[0].arn}/*",

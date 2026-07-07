@@ -33,10 +33,10 @@
 
 1. **认证 = 硬门槛**：FC/Kata 都一样——控制面若 `API_KEYS` 未设、又没设 `ALLOW_UNAUTHENTICATED=1`，则**所有写操作（create/exec/suspend…）直接返回 503 `control plane not configured`**。生产必须传 `-var="api_keys=..."`；本地测试可给控制面 deployment 加 env `ALLOW_UNAUTHENTICATED=1`（见 Step 9 排障）。
 2. **DynamoDB 表必须先建**（Step 1）。漏了这步，控制面 create 会报 `ResourceNotFoundException`（boto3 找不到表），且报错发生在业务逻辑里、不易一眼看出。
-3. **FC 模式必须传 `fc_nodes`**：控制面靠 `FC_NODES`（逗号分隔的 .metal 节点内网 IP）找 node-agent。**只填就绪且稳定的节点 IP**——`_pick_node` 对列表里每个节点串行探 `/health`，遇到不可达节点会阻塞最长 120s（表现为 create 请求"卡住无响应"）。若某台 metal 节点 NotReady/抖动，务必把它从 `fc_nodes` 剔除。
+3. **FC 模式的 `fc_nodes` 现在是 fallback，节点发现优先走 DynamoDB 心跳表**：P0 加固后 node-agent 每 30s 写 `claude-sbx-nodes` 表，控制面 `_pick_node` 优先从心跳表选活节点（按 `last_seen` 超时剔除死节点），`fc_nodes` 仅在心跳表为空时兜底。**首次部署 fc_nodes 仍建议只填稳定节点**（心跳还没写起来时靠它），但节点增减后无需再改 `fc_nodes` + 重启控制面——心跳表会自动反映。查活节点：`aws dynamodb scan --table-name claude-sbx-nodes --query 'Items[].{node:node_id.S,last_seen:last_seen.S}'`。
 4. **rootfs 必须是含 vsock agent 的 min-rootfs**：FC 的 exec 走 vsock 通道，需要 `scripts/build-min-rootfs.sh` 产出的 rootfs（内含 `/sbin/vsock-exec-agent.py`，sbxinit 后台启动）。**别用 phase3 `rootfs_s3_uri` 的默认 juicefs 版**——apply phase3 时必须显式传 `-var="rootfs_s3_uri=s3://<bucket>/rootfs/min-rootfs.tar.gz"`（见 Step 1.5 + Step 2）。
 5. **不要用 kata-deploy DaemonSet**（仅 Kata 相关）：Kata 由 Karpenter EC2NodeClass.userData 在节点 bootstrap 阶段预装。kata-deploy DaemonSet 会在节点已运行时重启 containerd，导致 c6g.metal 节点 hang 约 12 分钟，触发 ASG 节点替换死循环。
-6. **.metal 节点冷启动可能抖动**：实测 c6g.metal 节点起来后可能出现短暂 NotReady 抖动（kubelet heartbeat 波动）。缓解：等节点稳定 Ready 再部署控制面；把控制面 pod 用 cordon/nodeSelector 固定到稳定节点；`fc_nodes` 只填稳定节点（见坑 3）。
+6. **.metal 节点反复 NotReady / ASG 替换循环 —— 真因是 ASG grace period 太短，已固化修复**：c6g.metal 过 EC2 status check 需 5-10 分钟，而 EKS 托管节点组建的 ASG 默认 health check grace period 仅 **15 秒** → 节点刚起就被判 unhealthy 替换 → 无限替换循环，永远收敛不到全 Ready（2026-07-07 实测定位，纠正了旧认知"暂态自愈"）。**`terraform/phase3/main.tf` 已用 `null_resource.metal_asg_grace_period` 固化 grace period=900s，apply 时自动 patch，正常情况无需干预**。若仍见反复替换：`aws autoscaling describe-scaling-activities --auto-scaling-group-name <asg>` 看 cause 是否 "EC2 instance status checks failure"，`aws ec2 describe-instance-status --instance-ids <iid>` 看 status check 是否卡在 initializing/impaired；确认 grace period 已生效：`aws autoscaling describe-auto-scaling-groups ... --query '...HealthCheckGracePeriod'` 应为 900。**给足 15-20 分钟等 metal 过 status check + kubelet 注册**，别在头几分钟手动删节点。
 7. **arm64 镜像 + rootfs**：控制面/node-agent 镜像**和** min-rootfs 都必须在 arm64 机器上构建（M 系列 Mac、Graviton EC2 或 .metal 节点）。Mac 上若用 colima：`colima start --arch aarch64`。
 8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
@@ -382,9 +382,45 @@ curl -s -X POST $BASE/sandboxes/$SID/exec -H "Authorization: Bearer $API_KEY" \
 # 走的是 vsock 通道的证据：node-agent 上 /var/lib/sbx/<id>/v.sock 存在（PUT /vsock 生效）
 ```
 
+**验证 P0 高可用编排能力**（reconcile / 心跳 / leader / S3 强一致）：
+
+```bash
+# P0-A 节点心跳：node-agent 每 30s 写 nodes 表（起 pod 后等 ~35s）
+aws dynamodb scan --table-name claude-sbx-nodes --region us-east-1 \
+  --query 'Items[].{node:node_id.S,free_mem:free_mem_mib.N,last_seen:last_seen.S}'
+# 期望：每台 node-agent 节点一条，last_seen 随周期刷新
+#   ⚠️ 若为空：node-agent 心跳失败。查 node-agent 日志 stderr 有无 [heartbeat] failed；
+#      确认 stage2 已给 node-agent IAM 加 dynamodb:PutItem on nodes 表 + env DYNAMODB_NODES_TABLE
+
+# P0-B leader 选举：控制面 2 副本，locks 表只有一个 reconciler 锁、单一 owner
+aws dynamodb get-item --table-name claude-sbx-locks --key '{"lock_id":{"S":"reconciler"}}' \
+  --region us-east-1 --query 'Item.{owner:owner.S,rvn:rvn.N}'
+# 期望：owner 为某副本，rvn 持续自增（每 ~10s +1）= leader 在续租
+# 故障转移：kubectl delete pod <leader pod> → 等 ~40s → owner 转移到另一副本
+
+# P0-D S3 强一致：suspend 返回 suspended ⟺ S3 确有快照
+curl -s -X POST $BASE/sandboxes/$SID/suspend -H "Authorization: Bearer $API_KEY" | \
+  python3 -c "import sys,json;print(json.load(sys.stdin).get('state'))"   # → suspended
+aws s3 ls "s3://<snapshot-bucket>/sbx/$SID/" --region us-east-1
+# 期望：vm.mem + vm.snapshot（方案A还有 rootfs.ext4）都在 → 不变式成立
+
+# P0-E reconcile 漂移：制造 running 但节点无 VM 的漂移记录，等一轮对账（~20-40s）
+NODE_IP=$(aws dynamodb scan --table-name claude-sbx-nodes --region us-east-1 --query 'Items[0].ip.S' --output text)
+aws dynamodb put-item --table-name claude-sbx-sandboxes --region us-east-1 --item \
+  "{\"id\":{\"S\":\"drift-test\"},\"tenant_id\":{\"S\":\"t\"},\"state\":{\"S\":\"running\"},\"driver\":{\"S\":\"firecracker\"},\"node\":{\"S\":\"$NODE_IP\"},\"tap_idx\":{\"N\":\"99\"},\"updated_at\":{\"S\":\"2020-01-01T00:00:00+00:00\"}}"
+sleep 40
+aws dynamodb get-item --table-name claude-sbx-sandboxes --key '{"id":{"S":"drift-test"}}' \
+  --region us-east-1 --query 'Item.{state:state.S,reason:reconcile_reason.S}'
+# 期望：state=orphaned, reason=runtime_unknown（reconcile 检出漂移并自动标记）
+aws dynamodb delete-item --table-name claude-sbx-sandboxes --key '{"id":{"S":"drift-test"}}' --region us-east-1
+```
+
+> 完整 P0 真机测试报告见 **[docs/P0编排加固-真机测试报告-2026-07-07.md](P0编排加固-真机测试报告-2026-07-07.md)**。
+
 > **排障：**
 > - **create/exec 全 503 `control plane not configured`** → 没配 API_KEYS。测试环境快速放行：`kubectl set env deployment/sandbox-control-plane -n sandbox-system ALLOW_UNAUTHENTICATED=1`（生产严禁）。
-> - **create 卡住无响应（~90-120s）** → `FC_NODES` 里有不可达/抖动节点，`_pick_node` 探 `/health` 阻塞。改成只留稳定节点：`kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
+> - **create 卡住无响应（~90-120s）** → `_pick_node` 探到不可达节点的 `/health` 阻塞。P0 后正常情况节点来自心跳表（死节点按 last_seen 自动剔除），但若心跳表为空回退到 `FC_NODES` 且里面有抖动节点会阻塞。先查心跳表 `aws dynamodb scan --table-name claude-sbx-nodes`；若心跳未起，临时改 `kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
+> - **nodes 表为空 / 节点发现不到** → node-agent 心跳失败。查 `kubectl logs -n sandbox-system <node-agent-pod>` 有无 `[heartbeat] failed`；确认 node-agent IAM 有 `dynamodb:PutItem` on nodes 表、env 有 `DYNAMODB_NODES_TABLE`。
 > - **create 报 `ResourceNotFoundException`** → 漏了 Step 1（DynamoDB 表）。
 > - **控制面 Pending / 节点 NotReady 抖动** → cordon 抖动节点，把控制面固定到稳定节点：`kubectl cordon <抖动节点>; kubectl delete pod -n sandbox-system -l app=sandbox-control-plane`。
 > - **节点上 FC 资产核查**（SSM 用 `AWS-RunShellScript`，或经 node-agent 容器）：
@@ -497,7 +533,11 @@ cd ../phase3 && terraform destroy -auto-approve \
 #     --query 'SecurityGroups[0].GroupId' --output text)
 #   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
 
-# 5. 删 DynamoDB
+# 5. 删 DynamoDB（建议彻底删，不要保留）
+#    stage1 共 5 张表：sandboxes / events / tap-idx / nodes / locks
+#    ⚠️ 彻底删而非保留 —— 保留会遗留上一轮脏数据：旧沙盒记录(下次重建后节点 IP 全变、
+#       reconcile 起来会把它们全标 orphaned)、旧 node 心跳、locks 锁、tap_idx counter
+#       接着上次的值继续涨。重建仅需 ~10s（PAY_PER_REQUEST 空表零费用），无保留的理由。
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # 6. 清理残留（不清理会阻塞下次重建）

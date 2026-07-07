@@ -97,6 +97,17 @@ POST /sandboxes/{id}/exec
 - 强制 IMDSv2（`http_tokens=required`）：阻断 SSRF 经 IMDSv1 窃取宿主机实例凭据
 - Karpenter 空闲整合：.metal 节点闲置 30 分钟自动回收
 
+#### 5. 高可用编排（控制面自愈，非"手搓 POC"）
+
+控制面无状态、状态全落 DynamoDB，配合一组 DynamoDB 原语实现生产级编排能力（对标 E2B 的中心化控制面，详见 [docs/编排层调研与改进路线.md](docs/编排层调研与改进路线.md)）：
+
+- **reconcile loop（状态自愈）**：后台周期对账 DynamoDB 期望态 vs node-agent 实况；发现漂移（如节点/VM 消失但记录仍 `running`）自动标 `orphaned` 并回收泄漏资源，杜绝状态永久漂移。
+- **leader 选举（多副本不打架）**：DynamoDB 条件写租约 + fencing token（rvn），控制面多副本下只有 leader 跑 reconcile/暖池补充；leader pod 挂掉后另一副本秒级接管。
+- **节点心跳注册表（弹性发现）**：node-agent 每 30s 上报 `free_mem/vm_count/last_seen`，控制面按 `last_seen` 超时自动剔除死节点、`_pick_node` 从注册表选节点——不再靠硬编码 `FC_NODES`。
+- **快照上传强一致**：suspend 先同步确认快照上传 S3 成功、再释放 VMM 内存；上传失败则恢复 VM 运行而非静默丢数据。保证不变式 **状态标 `suspended` ⟺ S3 确有快照**。
+
+> 上述能力均已 **真机验证通过**（EKS + c6g.metal，含 leader 故障转移、reconcile 漂移检测、S3 强一致），详见实测数据表。
+
 ---
 
 ### 与主流方案对比
@@ -110,6 +121,7 @@ POST /sandboxes/{id}/exec
 | **24×7 长驻** | ✅ | ✅ | ✅ | ❌ 有 TTL |
 | **快照 suspend/resume** | ✅ 实测 1.2s | ✅ | ✅ | ❌ |
 | **凭据隔离** | ✅ LiteLLM IRSA（已落地）| ✅ | ✅ | N/A |
+| **控制面自愈** | ✅ reconcile + leader + 心跳发现 | ✅ ~20s sync loop | ✅ 去中心化 flyd | ✅ 托管 |
 | **数据主权** | ✅ 数据留 AWS 账号内 | ❌ 第三方 | ❌ 第三方 | ✅ |
 | **K8s 生态集成** | ✅ 原生 | ❌ | ❌ | ❌ |
 
@@ -123,16 +135,18 @@ POST /sandboxes/{id}/exec
 │  托管节点组（系统节点）          Karpenter c6g.metal 节点（沙盒）     │
 │  ┌──────────────────────────┐      ┌───────────────────────────┐   │
 │  │ sandbox-control-plane    │ HTTP │  Kata microVM (kata-qemu) │   │
-│  │ (Deployment, IRSA)       │─────►│  kata 由 UserData 预装    │   │
+│  │ (Deployment, 2 副本,IRSA)│─────►│  kata 由 UserData 预装    │   │
 │  │  KataDriver (k8s client) │      │  node-agent DaemonSet     │   │
-│  │  FirecrackerDriver       │      │  jailer / tap / snapshot  │   │
-│  │  WarmPool                │      └───────────────────────────┘   │
+│  │  FirecrackerDriver       │◄─────│   ├ jailer / tap / snapshot│   │
+│  │  WarmPool                │ 心跳 │   └ 每 30s 上报 nodes 表  │   │
+│  │  Reconciler (leader-only)│      └───────────────────────────┘   │
 │  │  无状态 → DynamoDB        │                                       │
 │  └──────────────────────────┘                                       │
 │         ↑ ingress-nginx (NLB)                                       │
 │         api.sbx.<domain>  ←── 生产外部访问（POC 推荐 port-forward）  │
 │                                                                      │
-│  DynamoDB  LiteLLM(Bedrock代理)  Karpenter(.metal自动扩缩+预装kata)  │
+│  DynamoDB: sandboxes / events / tap-idx / nodes(心跳) / locks(leader)│
+│  LiteLLM(Bedrock代理)   Karpenter(.metal自动扩缩+预装kata)           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -174,7 +188,8 @@ POST /sandboxes/{id}/exec
 - EKS 集群 claude-sbx，c6g.metal 节点，Kata 3.31 + kata-qemu runtime
 - 控制面：sandbox-system namespace，Deployment 2 副本
   外部访问：http://api.sbx.<domain>（ingress-nginx NLB）
-- 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx）
+- 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx / nodes / locks）
+- 高可用编排：控制面 leader-only reconcile loop（对账自愈）+ node-agent 心跳注册表 + DynamoDB leader 锁
 - 凭据隔离：LiteLLM（litellm namespace）持有 Bedrock IRSA，沙盒无凭据
 - 快照：S3 bucket，三件套（vm.mem + vm.snapshot + rootfs.ext4）
 - Karpenter：kata-metal NodePool，空闲 30 分钟自动整合节点
@@ -193,11 +208,19 @@ POST /sandboxes/{id}/exec
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
    done
 
+9. 查看活节点心跳：aws dynamodb scan --table-name claude-sbx-nodes --query 'Items[].{node:node_id.S,free_mem:free_mem_mib.N,last_seen:last_seen.S}'
+   （last_seen 超 90s 的节点会被控制面判死、自动剔除出调度池）
+10. 查看当前 reconcile leader：aws dynamodb get-item --table-name claude-sbx-locks --key '{"lock_id":{"S":"reconciler"}}' --query 'Item.{owner:owner.S,rvn:rvn.N}'
+    （rvn 持续自增 = leader 在正常续租；owner 变更 = 发生了故障转移）
+11. 排查孤儿沙盒：aws dynamodb scan --table-name claude-sbx-sandboxes --filter-expression "#s = :o" --expression-attribute-names '{"#s":"state"}' --expression-attribute-values '{":o":{"S":"orphaned"}}'
+    （state=orphaned 是 reconcile 检出的漂移记录，reconcile_reason 字段说明原因）
+
 监控关注点：
 - node-agent 内存水位：kubectl exec -n sandbox-system daemonset/node-agent -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/health').read().decode())"
 - DynamoDB 写入延迟：AWS Console → DynamoDB → Metrics → SuccessfulRequestLatency
 - Karpenter 节点利用率：kubectl top nodes
 - LiteLLM 请求量：kubectl logs -n litellm deployment/litellm | grep "INFO:"
+- reconcile 健康：控制面日志无 reconcile 异常 + locks 表 rvn 持续自增
 ```
 
 ---
@@ -208,7 +231,7 @@ POST /sandboxes/{id}/exec
 # 无需 AWS，本地直接跑
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# 期望：21/21 PASS
+# 期望：29/29 PASS（含 leader 锁 / 节点注册表 / reconcile 漂移检测）
 ```
 
 ---
@@ -225,7 +248,13 @@ python3 sandbox-api/smoke_test.py
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
 | e2e 测试通过率 | **17/17（ALL PASS）** | 集群部署，Kata driver |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |
-| FC suspend→resume | 快照 512MB→S3 / resume 0.27s | 内存态跨快照精确保留 |
+| FC suspend→resume | 快照 512MB→S3 / resume 0.11s | 内存态跨快照精确保留（数据保真已验证）|
+| 节点心跳注册 | 每 30s 写 nodes 表，`_pick_node` 从表选点 | 替换硬编码 FC_NODES |
+| leader 故障转移 | 删 leader pod → 另一副本秒级接管（owner 转移）| DynamoDB 条件写租约 + rvn |
+| reconcile 漂移检测 | running 但 runtime 消失 → 自动标 orphaned | 后台 20s 对账 |
+| S3 上传强一致 | suspend=suspended ⟺ S3 确有三件套 | 上传确认后才释放内存 |
+
+> P0 编排加固（reconcile / 心跳 / leader / S3 强一致）已于 2026-07-07 真机验证通过，设计与借鉴来源见 [docs/编排层调研与改进路线.md](docs/编排层调研与改进路线.md)。
 
 ---
 

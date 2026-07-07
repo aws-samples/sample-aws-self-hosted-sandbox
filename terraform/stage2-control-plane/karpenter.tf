@@ -113,8 +113,8 @@ resource "aws_iam_role_policy" "karpenter_node_s3" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
       Resource = local.snapshot_bucket != "" ? [
         "arn:aws:s3:::${local.snapshot_bucket}",
         "arn:aws:s3:::${local.snapshot_bucket}/*",
@@ -149,11 +149,11 @@ resource "aws_iam_role_policy" "karpenter_controller_node_role" {
 #     --principal-arn arn:aws:iam::<acct>:role/claude-sbx-karpenter-node \
 #     --type EC2_LINUX
 resource "aws_eks_access_entry" "karpenter_node" {
-  cluster_name      = var.cluster_name
-  principal_arn     = aws_iam_role.karpenter_node.arn
+  cluster_name  = var.cluster_name
+  principal_arn = aws_iam_role.karpenter_node.arn
   # EC2_LINUX 类型自动附加 AmazonEKSWorkerNodePolicy 所需的系统组
   # (system:bootstrappers, system:nodes)，节点才能通过 TLS bootstrap join 集群
-  type              = "EC2_LINUX"
+  type = "EC2_LINUX"
 }
 
 # ---------- Karpenter Helm（安装 controller）----------
@@ -171,7 +171,7 @@ resource "helm_release" "karpenter" {
   name             = "karpenter"
   repository       = "oci://public.ecr.aws/karpenter"
   chart            = "karpenter"
-  version          = "1.3.3"   # 与手动安装版本一致
+  version          = "1.3.3" # 与手动安装版本一致
   namespace        = "karpenter"
   create_namespace = true
 
@@ -325,6 +325,6 @@ output "karpenter_role_arn" {
 }
 
 output "karpenter_node_role_name" {
-  value = aws_iam_role.karpenter_node.name
+  value       = aws_iam_role.karpenter_node.name
   description = "EC2NodeClass spec.role 的值，Karpenter 用此 Role 启动节点"
 }

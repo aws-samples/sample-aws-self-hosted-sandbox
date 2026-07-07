@@ -159,7 +159,7 @@ resource "kubernetes_deployment" "litellm" {
           }
           resources {
             requests = { cpu = "250m", memory = "1Gi" }
-            limits   = { cpu = "2",    memory = "4Gi" }  # 2Gi 会 OOMKilled，实测需 4Gi
+            limits   = { cpu = "2", memory = "4Gi" } # 2Gi 会 OOMKilled，实测需 4Gi
           }
           readiness_probe {
             http_get {

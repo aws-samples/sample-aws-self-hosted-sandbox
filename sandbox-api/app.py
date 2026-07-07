@@ -36,6 +36,7 @@ from botocore.exceptions import ClientError
 
 from sandbox_api import db
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
+from sandbox_api.reconcile import Reconciler
 from sandbox_api.warm_pool import WarmPool
 
 # ---------- driver 选择 ----------
@@ -48,8 +49,14 @@ else:
     from sandbox_api.drivers.kata import KataDriver
     _driver = KataDriver()
 
+# reconcile loop + leader 选举(P0-1 / P1-4)。
+# 暖池补充与 reconcile 共用同一 leader 门控:多副本控制面下只有 leader 跑后台
+# loop,请求路径仍全副本无状态服务。
+_reconciler = Reconciler(_driver, _DRIVER_NAME)
+_reconciler.start_loop()
+
 _warm_pool = WarmPool(_DRIVER_NAME, _driver)
-_warm_pool.start_replenish_loop()
+_warm_pool.start_replenish_loop(is_leader=lambda: _reconciler.is_leader)
 
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
@@ -234,7 +241,10 @@ def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
             return 409, {"error": "sandbox is not in running state or is locked"}
         return 500, {"error": str(e)}
     except Exception as e:
-        db.force_update(sid, {"state": "failed", "error": str(e)})
+        # suspend 失败(如快照上传失败):node-agent 已尝试恢复 VM 到运行态,
+        # 内存未释放 → 回滚 running(而非 failed),绝不标 suspended。
+        # 若 VM 实际已死,后台 reconcile 会探到 runtime 不存在并标 orphaned。
+        db.force_update(sid, {"state": "running", "error": str(e)})
         return 500, {"error": str(e)}
     finally:
         if lease_id:

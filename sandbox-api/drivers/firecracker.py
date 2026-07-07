@@ -148,6 +148,18 @@ class FirecrackerDriver:
     # ------------------------------------------------------------------
 
     def _pick_node(self) -> str:
+        # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
+        # 拿不到注册表(如本地测试用 FC_NODES)时回退到逐个探 /health。
+        registry = self._active_nodes_from_registry()
+        if registry:
+            for node_id, _ in sorted(registry, key=lambda x: -x[1]):
+                try:
+                    self._agent(node_id, "GET", "/health")  # 存活兜底确认
+                    return node_id
+                except Exception:
+                    continue
+            raise RuntimeError("all registered nodes unreachable")
+
         nodes = self._list_metal_nodes()
         if not nodes:
             raise RuntimeError("no available .metal nodes")
@@ -166,10 +178,27 @@ class FirecrackerDriver:
             raise RuntimeError("all nodes unreachable")
         return best_node
 
+    def _active_nodes_from_registry(self) -> list[tuple[str, int]]:
+        """
+        从 DynamoDB 心跳注册表拉活节点,返回 [(node_ident, free_mem_mib), ...]。
+        node_ident 用 ip(node-agent 心跳里写的内网 IP),与 _agent 的 host 解析一致。
+        表为空(未部署心跳/本地测试)返回 []，调用方回退 FC_NODES。
+        """
+        try:
+            nodes = db.list_active_nodes()
+        except Exception:
+            return []
+        out: list[tuple[str, int]] = []
+        for n in nodes:
+            ident = n.get("ip") or n.get("node_id")
+            if ident:
+                out.append((ident, int(n.get("free_mem_mib", 0))))
+        return out
+
     def _list_metal_nodes(self) -> list[str]:
         """
-        从 DynamoDB node registry 或 EC2 DescribeInstances 拉可用 .metal 节点 IP 列表。
-        POC 阶段:环境变量 FC_NODES=ip1,ip2 直接传入。
+        节点发现 fallback:环境变量 FC_NODES=ip1,ip2(本地测试/心跳表未就绪时用)。
+        生产走 _active_nodes_from_registry() 的 DynamoDB 心跳注册表(P0-3)。
         """
         raw = os.environ.get("FC_NODES", "")
         return [n.strip() for n in raw.split(",") if n.strip()]

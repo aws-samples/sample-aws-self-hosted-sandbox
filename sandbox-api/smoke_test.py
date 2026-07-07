@@ -45,6 +45,8 @@ os.environ.update({
     "DYNAMODB_TABLE":            "sandboxes",
     "DYNAMODB_EVENTS_TABLE":     "sandbox_events",
     "DYNAMODB_TAPIDX_TABLE":     "sandbox_tap_idx",
+    "DYNAMODB_NODES_TABLE":      "sandbox_nodes",
+    "DYNAMODB_LOCKS_TABLE":      "sandbox_locks",
     "SANDBOX_DRIVER":            "firecracker",
     "FC_KERNEL_PATH":            "/fake/vmlinux",
     "SNAPSHOT_S3_BUCKET":        "test-bucket",
@@ -184,6 +186,20 @@ def _create_tables():
     # 初始化 counter
     ddb.Table("sandbox_tap_idx").put_item(
         Item={"node": "global", "next_idx": 0}
+    )
+
+    # P0:节点心跳注册表 + 分布式锁表
+    ddb.create_table(
+        TableName="sandbox_nodes",
+        BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "node_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "node_id", "AttributeType": "S"}],
+    )
+    ddb.create_table(
+        TableName="sandbox_locks",
+        BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "lock_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "lock_id", "AttributeType": "S"}],
     )
 
 
@@ -657,6 +673,147 @@ class TestAPIAuth(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────
+# P0:节点注册表 + leader 锁
+# ────────────────────────────────────────────────
+
+class TestNodeRegistry(unittest.TestCase):
+    """心跳注册 + last_seen TTL 过滤(P0-3)。"""
+
+    @mock_aws
+    def test_heartbeat_and_list_active(self):
+        _create_tables()
+        from sandbox_api import db
+        db.heartbeat_node("nodeA", "10.0.1.5", 8000, 2)
+        db.heartbeat_node("nodeB", "10.0.1.6", 4000, 1)
+        active = db.list_active_nodes(ttl_s=90)
+        self.assertEqual({n["node_id"] for n in active}, {"nodeA", "nodeB"})
+
+    @mock_aws
+    def test_stale_node_filtered(self):
+        _create_tables()
+        from sandbox_api import db
+        # 手动写一条 last_seen 远超 TTL 的旧心跳
+        db._nodes().put_item(Item={
+            "node_id": "dead", "ip": "10.0.9.9",
+            "free_mem_mib": 0, "vm_count": 0,
+            "last_seen": db._utcnow_minus(3600),  # 1 小时前
+        })
+        db.heartbeat_node("live", "10.0.1.5", 8000, 0)
+        active = db.list_active_nodes(ttl_s=90)
+        self.assertEqual({n["node_id"] for n in active}, {"live"})
+
+
+class TestLeaderLock(unittest.TestCase):
+    """leader 锁抢占/续租/过期(P1-4)。"""
+
+    @mock_aws
+    def test_only_one_leader(self):
+        _create_tables()
+        from sandbox_api import db
+        rvn_a = db.acquire_leader_lock("reconciler", "ownerA", ttl_s=30)
+        rvn_b = db.acquire_leader_lock("reconciler", "ownerB", ttl_s=30)
+        self.assertIsNotNone(rvn_a)
+        self.assertIsNone(rvn_b)  # A 未过期,B 抢不到
+
+    @mock_aws
+    def test_renew_keeps_leadership(self):
+        _create_tables()
+        from sandbox_api import db
+        rvn1 = db.acquire_leader_lock("reconciler", "ownerA", ttl_s=30)
+        rvn2 = db.renew_leader_lock("reconciler", "ownerA", ttl_s=30)
+        self.assertIsNotNone(rvn2)
+        self.assertGreater(rvn2, rvn1)  # rvn 每次自增(fencing token)
+
+    @mock_aws
+    def test_expired_lock_can_be_taken(self):
+        _create_tables()
+        from sandbox_api import db
+        # 写一条已过期的锁(expires 在过去)
+        db._locks().put_item(Item={
+            "lock_id": "reconciler", "owner": "old",
+            "expires": db._utcnow_minus(10), "rvn": 5,
+        })
+        rvn = db.acquire_leader_lock("reconciler", "newOwner", ttl_s=30)
+        self.assertIsNotNone(rvn)  # 过期 → 可被新 owner 抢占
+
+
+# ────────────────────────────────────────────────
+# P0:reconcile 对账
+# ────────────────────────────────────────────────
+
+class TestReconcile(unittest.TestCase):
+    """状态漂移检测与自动修正(P0-1)。"""
+
+    @mock_aws
+    def test_drift_running_marked_orphaned(self):
+        _create_tables()
+        from sandbox_api import db
+        from sandbox_api.reconcile import Reconciler
+
+        # 沙盒记录说 running,落在活节点上,但 runtime 探针返回 unknown
+        db.put({"id": "sbx1", "tenant_id": "t1", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5", "tap_idx": 7,
+                "updated_at": db._utcnow()})
+        db.heartbeat_node("nodeA", "10.0.1.5", 8000, 1)
+
+        class _Drv:
+            def capabilities(self):
+                from sandbox_api.driver import Capabilities
+                return Capabilities(suspend_resume=True, warm_pool=True, migrate=True)
+            def get_runtime_state(self, sid, rec):
+                return "unknown"  # 节点上已无此 VM → 漂移
+
+        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        self.assertEqual(stats["orphaned"], 1)
+        self.assertEqual(db.get("sbx1")["state"], "orphaned")
+
+    @mock_aws
+    def test_dead_node_suspended_marked_needs_reschedule(self):
+        _create_tables()
+        from sandbox_api import db
+        from sandbox_api.reconcile import Reconciler
+
+        # suspended 沙盒落在一个没有心跳的死节点上
+        db.put({"id": "sbx2", "tenant_id": "t1", "state": "suspended",
+                "driver": "firecracker", "node": "10.0.9.9", "tap_idx": 3,
+                "snapshot_s3": "s3://b/sbx2/", "updated_at": db._utcnow()})
+        # 不写任何心跳 → 节点视为死
+
+        class _Drv:
+            def capabilities(self):
+                from sandbox_api.driver import Capabilities
+                return Capabilities(suspend_resume=True, warm_pool=True, migrate=True)
+            def get_runtime_state(self, sid, rec):
+                return "unknown"
+
+        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        self.assertEqual(stats["needs_reschedule"], 1)
+        self.assertEqual(db.get("sbx2")["state"], "needs_reschedule")
+
+    @mock_aws
+    def test_healthy_running_left_alone(self):
+        _create_tables()
+        from sandbox_api import db
+        from sandbox_api.reconcile import Reconciler
+
+        db.put({"id": "sbx3", "tenant_id": "t1", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5", "tap_idx": 1,
+                "updated_at": db._utcnow()})
+        db.heartbeat_node("nodeA", "10.0.1.5", 8000, 1)
+
+        class _Drv:
+            def capabilities(self):
+                from sandbox_api.driver import Capabilities
+                return Capabilities(suspend_resume=True, warm_pool=True, migrate=True)
+            def get_runtime_state(self, sid, rec):
+                return "running"  # 一致
+
+        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        self.assertEqual(stats["ok"], 1)
+        self.assertEqual(db.get("sbx3")["state"], "running")  # 未被动
+
+
+# ────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────
 
@@ -665,7 +822,8 @@ if __name__ == "__main__":
     suite  = unittest.TestSuite()
 
     for cls in [TestDB, TestFirecrackerDriver, TestKataCapabilities,
-                TestAPIEndToEnd, TestWarmPool, TestAPIAuth]:
+                TestAPIEndToEnd, TestWarmPool, TestAPIAuth,
+                TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

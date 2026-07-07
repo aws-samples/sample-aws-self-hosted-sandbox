@@ -133,10 +133,45 @@ resource "aws_dynamodb_table_item" "tap_idx_init" {
     next_idx = { N = "0" }
   })
 
-  lifecycle { ignore_changes = [item] }   # 只初始化一次,不覆盖运行时自增的值
+  lifecycle { ignore_changes = [item] } # 只初始化一次,不覆盖运行时自增的值
+}
+
+# ---------- 节点心跳注册表(P0-3:替换 FC_NODES 环境变量硬编码) ----------
+# node-agent 每 ~30s upsert 一条,写 last_seen(ISO8601)。
+# 控制面读时按 last_seen 超时过滤活节点 —— 不用 DynamoDB TTL 自动删
+# (TTL 删除延迟可达 48h,不可靠;死节点必须即时从调度池剔除)。
+resource "aws_dynamodb_table" "nodes" {
+  name         = "${var.prefix}-nodes"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "node_id"
+
+  attribute {
+    name = "node_id"
+    type = "S"
+  }
+
+  tags = { Project = "claude-sbx-poc" }
+}
+
+# ---------- 分布式锁表(P1-4:reconcile/暖池 loop 的 leader 选举) ----------
+# 单条 item(lock_id="reconciler")存 owner/expires/rvn。
+# 独立小表,不污染 sandboxes 表的 GSI。
+resource "aws_dynamodb_table" "locks" {
+  name         = "${var.prefix}-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "lock_id"
+
+  attribute {
+    name = "lock_id"
+    type = "S"
+  }
+
+  tags = { Project = "claude-sbx-poc" }
 }
 
 # ---------- 输出 ----------
-output "sandboxes_table"      { value = aws_dynamodb_table.sandboxes.name }
-output "events_table"         { value = aws_dynamodb_table.sandbox_events.name }
-output "tap_idx_table"        { value = aws_dynamodb_table.tap_idx.name }
+output "sandboxes_table" { value = aws_dynamodb_table.sandboxes.name }
+output "events_table" { value = aws_dynamodb_table.sandbox_events.name }
+output "tap_idx_table" { value = aws_dynamodb_table.tap_idx.name }
+output "nodes_table" { value = aws_dynamodb_table.nodes.name }
+output "locks_table" { value = aws_dynamodb_table.locks.name }
