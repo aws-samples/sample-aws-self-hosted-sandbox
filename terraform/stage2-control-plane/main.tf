@@ -27,10 +27,10 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws        = { source = "hashicorp/aws",        version = "~> 5.0" }
-    kubernetes = { source = "hashicorp/kubernetes",  version = "~> 2.0" }
-    helm       = { source = "hashicorp/helm",        version = "~> 2.0" }
-    null       = { source = "hashicorp/null",        version = "~> 3.0" }
+    aws        = { source = "hashicorp/aws", version = "~> 5.0" }
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.0" }
+    helm       = { source = "hashicorp/helm", version = "~> 2.0" }
+    null       = { source = "hashicorp/null", version = "~> 3.0" }
   }
 }
 
@@ -158,13 +158,15 @@ data "aws_iam_openid_connect_provider" "eks" {
 
 # DynamoDB 表名(直接用变量,不跨 state 引用以降低耦合)
 locals {
-  account_id          = data.aws_caller_identity.current.account_id
-  oidc_provider_arn   = data.aws_iam_openid_connect_provider.eks.arn
+  account_id        = data.aws_caller_identity.current.account_id
+  oidc_provider_arn = data.aws_iam_openid_connect_provider.eks.arn
   # OIDC issuer URL 去掉 https://
-  oidc_issuer         = replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
-  dynamodb_table      = "${var.cluster_name}-sandboxes"
-  dynamodb_events     = "${var.cluster_name}-sandbox-events"
-  dynamodb_tap_idx    = "${var.cluster_name}-tap-idx"
+  oidc_issuer      = replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")
+  dynamodb_table   = "${var.cluster_name}-sandboxes"
+  dynamodb_events  = "${var.cluster_name}-sandbox-events"
+  dynamodb_tap_idx = "${var.cluster_name}-tap-idx"
+  dynamodb_nodes   = "${var.cluster_name}-nodes" # P0-3: 节点心跳注册表
+  dynamodb_locks   = "${var.cluster_name}-locks" # P1-4: reconcile leader 锁
 }
 
 # ---------- Snapshot S3 Bucket(optional, 若未提供则跳过) ----------
@@ -220,14 +222,16 @@ resource "aws_iam_role_policy" "control_plane" {
     Statement = [
       # DynamoDB 读写
       {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:UpdateItem",
-                    "dynamodb:DeleteItem","dynamodb:Query","dynamodb:Scan"]
+        Effect = "Allow"
+        Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"]
         Resource = [
           "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_table}",
           "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_table}/index/*",
           "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_events}",
           "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_tap_idx}",
+          "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_nodes}",
+          "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_locks}",
         ]
       },
       # EC2 DescribeInstances(节点 IP → 实例 ID)
@@ -239,13 +243,13 @@ resource "aws_iam_role_policy" "control_plane" {
       # SSM SendCommand(备用:通过 SSM 调 node-agent)
       {
         Effect   = "Allow"
-        Action   = ["ssm:SendCommand","ssm:GetCommandInvocation"]
+        Action   = ["ssm:SendCommand", "ssm:GetCommandInvocation"]
         Resource = ["*"]
       },
       # S3 快照读写
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"]
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
         Resource = local.snapshot_bucket != "" ? [
           "arn:aws:s3:::${local.snapshot_bucket}",
           "arn:aws:s3:::${local.snapshot_bucket}/*",
@@ -283,8 +287,8 @@ resource "aws_iam_role_policy" "node_agent" {
     Statement = [
       # S3 快照上传/下载
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"]
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
         Resource = local.snapshot_bucket != "" ? [
           "arn:aws:s3:::${local.snapshot_bucket}",
           "arn:aws:s3:::${local.snapshot_bucket}/*",
@@ -292,10 +296,16 @@ resource "aws_iam_role_policy" "node_agent" {
       },
       # ECR 拉镜像(rootfs 构建产物)
       {
-        Effect   = "Allow"
-        Action   = ["ecr:GetAuthorizationToken","ecr:BatchGetImage",
-                    "ecr:GetDownloadUrlForLayer"]
+        Effect = "Allow"
+        Action = ["ecr:GetAuthorizationToken", "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"]
         Resource = ["*"]
+      },
+      # P0-3: 心跳注册表写入(node-agent 定期 upsert 本节点状态)
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = ["arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_nodes}"]
       },
     ]
   })
@@ -305,7 +315,7 @@ resource "aws_iam_role_policy" "node_agent" {
 
 resource "kubernetes_namespace" "sandbox_system" {
   metadata {
-    name = "sandbox-system"
+    name   = "sandbox-system"
     labels = { "app.kubernetes.io/managed-by" = "terraform" }
   }
 }
@@ -339,24 +349,24 @@ resource "kubernetes_cluster_role" "control_plane" {
   metadata { name = "sandbox-control-plane" }
   rule {
     api_groups = [""]
-    resources  = ["pods","services","configmaps","secrets"]
-    verbs      = ["get","list","watch","create","update","patch","delete","deletecollection"]
+    resources  = ["pods", "services", "configmaps", "secrets"]
+    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   }
   rule {
     # pods/exec 是独立子资源,exec 走 websocket 需要 get+create
     api_groups = [""]
     resources  = ["pods/exec"]
-    verbs      = ["get","create"]
+    verbs      = ["get", "create"]
   }
   rule {
     api_groups = ["networking.k8s.io"]
     resources  = ["ingresses"]
-    verbs      = ["get","list","watch","create","update","patch","delete","deletecollection"]
+    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   }
   rule {
     api_groups = ["agents.x-k8s.io"]
-    resources  = ["sandboxes","sandboxtemplates","sandboxwarmpools","sandboxclaims"]
-    verbs      = ["get","list","watch","create","update","patch","delete"]
+    resources  = ["sandboxes", "sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
+    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete"]
   }
 }
 
@@ -379,8 +389,8 @@ resource "kubernetes_cluster_role_binding" "control_plane" {
 # 生产开启:创建 Fargate 执行角色后设 enable_fargate=true
 
 variable "enable_fargate" {
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
   description = "是否为 sandbox-system namespace 创建 Fargate Profile"
 }
 
@@ -429,7 +439,7 @@ resource "aws_eks_fargate_profile" "sandbox_system" {
     labels    = { "fargate" = "true" }
   }
 
-  tags = { Project = "claude-sbx-poc" }
+  tags       = { Project = "claude-sbx-poc" }
   depends_on = [aws_iam_role_policy_attachment.fargate_pod_execution]
 }
 
@@ -463,25 +473,27 @@ resource "kubernetes_config_map" "control_plane" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
   data = {
-    SANDBOX_DRIVER          = var.sandbox_driver   # B2: 可传 firecracker
-    DYNAMODB_TABLE          = local.dynamodb_table
-    DYNAMODB_EVENTS_TABLE   = local.dynamodb_events
-    DYNAMODB_TAPIDX_TABLE   = local.dynamodb_tap_idx
-    AWS_REGION              = var.region
-    SANDBOX_IMAGE           = var.sandbox_image
-    LITELLM_URL             = var.litellm_url
-    SANDBOX_DOMAIN          = var.sandbox_domain
-    KATA_RUNTIME_CLASS      = "kata-qemu"
-    K8S_NAMESPACE           = "default"
-    SNAPSHOT_S3_BUCKET      = local.snapshot_bucket
-    WARM_POOL_SIZE          = tostring(var.warm_pool_size)
-    WARM_POOL_REFILL_S      = "60"
-    LISTEN_PORT             = "8000"
-    LISTEN_HOST             = "0.0.0.0"
-    NODE_AGENT_PORT         = "8002"
+    SANDBOX_DRIVER        = var.sandbox_driver # B2: 可传 firecracker
+    DYNAMODB_TABLE        = local.dynamodb_table
+    DYNAMODB_EVENTS_TABLE = local.dynamodb_events
+    DYNAMODB_TAPIDX_TABLE = local.dynamodb_tap_idx
+    DYNAMODB_NODES_TABLE  = local.dynamodb_nodes # P0-3: 节点发现/reconcile
+    DYNAMODB_LOCKS_TABLE  = local.dynamodb_locks # P1-4: leader 锁
+    AWS_REGION            = var.region
+    SANDBOX_IMAGE         = var.sandbox_image
+    LITELLM_URL           = var.litellm_url
+    SANDBOX_DOMAIN        = var.sandbox_domain
+    KATA_RUNTIME_CLASS    = "kata-qemu"
+    K8S_NAMESPACE         = "default"
+    SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
+    WARM_POOL_SIZE        = tostring(var.warm_pool_size)
+    WARM_POOL_REFILL_S    = "60"
+    LISTEN_PORT           = "8000"
+    LISTEN_HOST           = "0.0.0.0"
+    NODE_AGENT_PORT       = "8002"
     # B2(FirecrackerDriver): 控制面靠 FC_NODES(逗号分隔的节点内网 IP)找 node-agent
-    FC_NODES                = var.fc_nodes
-    FC_KERNEL_PATH          = "/opt/sbx/vmlinux"
+    FC_NODES       = var.fc_nodes
+    FC_KERNEL_PATH = "/opt/sbx/vmlinux"
   }
 }
 
@@ -505,8 +517,8 @@ resource "kubernetes_deployment" "control_plane" {
       spec {
         service_account_name = kubernetes_service_account.control_plane.metadata[0].name
         container {
-          name  = "api"
-          image = var.control_plane_image
+          name    = "api"
+          image   = var.control_plane_image
           command = ["python3", "-m", "sandbox_api.app"]
           port { container_port = 8000 }
           env_from {
@@ -518,7 +530,7 @@ resource "kubernetes_deployment" "control_plane" {
           }
           resources {
             requests = { cpu = "250m", memory = "512Mi" }
-            limits   = { cpu = "1",    memory = "1Gi"   }
+            limits   = { cpu = "1", memory = "1Gi" }
           }
           readiness_probe {
             http_get {
@@ -618,6 +630,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             name  = "SNAPSHOT_S3_BUCKET"
             value = local.snapshot_bucket
           }
+          # P0-3: 心跳注册表名(node-agent 定期写本节点 free_mem/vm_count/last_seen)
+          env {
+            name  = "DYNAMODB_NODES_TABLE"
+            value = local.dynamodb_nodes
+          }
           security_context {
             privileged = true
           }
@@ -641,7 +658,7 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           }
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
-            limits   = { cpu = "2",    memory = "4Gi"   }
+            limits   = { cpu = "2", memory = "4Gi" }
           }
         }
         volume {
@@ -685,11 +702,11 @@ variable "create_ingress_nginx" {
 }
 
 resource "helm_release" "ingress_nginx" {
-  count      = var.create_ingress_nginx ? 1 : 0
-  name       = "ingress-nginx"
-  repository = "https://kubernetes.github.io/ingress-nginx"
-  chart      = "ingress-nginx"
-  namespace  = "ingress-nginx"
+  count            = var.create_ingress_nginx ? 1 : 0
+  name             = "ingress-nginx"
+  repository       = "https://kubernetes.github.io/ingress-nginx"
+  chart            = "ingress-nginx"
+  namespace        = "ingress-nginx"
   create_namespace = true
   set {
     name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
@@ -707,8 +724,8 @@ resource "helm_release" "ingress_nginx" {
 # 生产应配 ACM 证书 + Route53；POC 用 HTTP 或 kubectl port-forward。
 
 variable "expose_control_plane" {
-  type    = bool
-  default = false
+  type        = bool
+  default     = false
   description = "是否通过 Ingress 对外暴露控制面 API（生产需同时配置 TLS + API_KEYS Secret）"
 }
 

@@ -21,14 +21,18 @@ SANDBOXES_TABLE = os.environ.get("DYNAMODB_TABLE", "sandboxes")
 EVENTS_TABLE    = os.environ.get("DYNAMODB_EVENTS_TABLE", "sandbox_events")
 REGION          = os.environ.get("AWS_REGION", "us-east-1")
 TAP_IDX_TABLE   = os.environ.get("DYNAMODB_TAPIDX_TABLE", "sandbox_tap_idx")
+NODES_TABLE     = os.environ.get("DYNAMODB_NODES_TABLE", "sandbox_nodes")
+LOCKS_TABLE     = os.environ.get("DYNAMODB_LOCKS_TABLE", "sandbox_locks")
 
 
 def _res():
     return boto3.resource("dynamodb", region_name=REGION)
 
-def _sb():  return _res().Table(SANDBOXES_TABLE)
-def _ev():  return _res().Table(EVENTS_TABLE)
-def _tap(): return _res().Table(TAP_IDX_TABLE)
+def _sb():    return _res().Table(SANDBOXES_TABLE)
+def _ev():    return _res().Table(EVENTS_TABLE)
+def _tap():   return _res().Table(TAP_IDX_TABLE)
+def _nodes(): return _res().Table(NODES_TABLE)
+def _locks(): return _res().Table(LOCKS_TABLE)
 
 
 # ---------- 基础 CRUD ----------
@@ -63,6 +67,32 @@ def list_by_tenant(tenant_id: str, limit: int = 100) -> list[dict]:
         Limit=limit,
     )
     return [_from_dynamo(i) for i in resp.get("Items", [])]
+
+
+def list_by_states(states: list[str]) -> list[dict]:
+    """
+    扫全表取 state ∈ states 的沙盒,供 reconcile 对账用。
+    POC 规模(数百沙盒)全表 scan 可接受;量大后应建 state-index GSI 改 query。
+    """
+    if not states:
+        return []
+    # FilterExpression: #s IN (:s0, :s1, ...)
+    placeholders = {f":s{i}": s for i, s in enumerate(states)}
+    filter_expr  = "#s IN (" + ", ".join(placeholders) + ")"
+    items: list[dict] = []
+    kwargs: dict = {
+        "FilterExpression": filter_expr,
+        "ExpressionAttributeNames": {"#s": "state"},
+        "ExpressionAttributeValues": placeholders,
+    }
+    while True:
+        resp = _sb().scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return [_from_dynamo(i) for i in items]
 
 
 from decimal import Decimal
@@ -162,6 +192,84 @@ def release_lease(sandbox_id: str, lease_id: str) -> None:
         pass
 
 
+# ---------- 节点心跳注册表(P0-3) ----------
+
+def heartbeat_node(node_id: str, ip: str, free_mem_mib: int,
+                   vm_count: int, labels: dict | None = None) -> None:
+    """node-agent 定期 upsert 一条心跳。last_seen 由控制面按 TTL 判活。"""
+    _nodes().put_item(Item={
+        "node_id":      node_id,
+        "ip":           ip,
+        "free_mem_mib": int(free_mem_mib),
+        "vm_count":     int(vm_count),
+        "last_seen":    _utcnow(),
+        "labels":       labels or {},
+    })
+
+
+def list_active_nodes(ttl_s: int = 90) -> list[dict]:
+    """
+    返回 last_seen 在 ttl_s 内的活节点。scan 全表(节点数量级小,可接受)。
+    死节点(超时)不返回 → 自动从调度池剔除。
+    """
+    cutoff = _utcnow_minus(ttl_s)
+    resp   = _nodes().scan()
+    out: list[dict] = []
+    for item in resp.get("Items", []):
+        if item.get("last_seen", "") >= cutoff:
+            out.append(_from_dynamo(item))
+    return out
+
+
+# ---------- 分布式 leader 锁(P1-4:reconcile/暖池 loop 单实例) ----------
+# 复用 lease 的"条件写 + TTL 过期"模式,但作用于独立的 LOCKS_TABLE 单条 item,
+# 语义是"全局单 leader",区别于 per-sandbox 的 acquire_lease。
+
+def acquire_leader_lock(lock_id: str, owner: str, ttl_s: int = 30) -> int | None:
+    """
+    抢占/续持 leader 锁。成功返回 rvn(record version number,fencing token),
+    失败(已被他人持有且未过期)返回 None。
+
+    条件:锁不存在 OR 已过期 OR owner 就是自己(续租)。
+    每次成功写都自增 rvn —— 后续自动重调度可用它做 fencing。
+    """
+    now     = _utcnow()
+    expires = _utcnow_plus(ttl_s)
+    try:
+        resp = _locks().update_item(
+            Key={"lock_id": lock_id},
+            UpdateExpression="SET #o = :owner, expires = :exp ADD rvn :one",
+            ConditionExpression=(
+                "attribute_not_exists(lock_id) OR expires < :now OR #o = :owner"
+            ),
+            ExpressionAttributeNames={"#o": "owner"},
+            ExpressionAttributeValues={
+                ":owner": owner, ":exp": expires, ":now": now, ":one": 1,
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+        return int(resp["Attributes"]["rvn"])
+    except Exception:
+        return None
+
+
+def renew_leader_lock(lock_id: str, owner: str, ttl_s: int = 30) -> int | None:
+    """续租(仅当自己仍是 owner)。语义等同 acquire 的续租分支,单列以示意图。"""
+    return acquire_leader_lock(lock_id, owner, ttl_s)
+
+
+def release_leader_lock(lock_id: str, owner: str) -> None:
+    try:
+        _locks().delete_item(
+            Key={"lock_id": lock_id},
+            ConditionExpression="#o = :owner",
+            ExpressionAttributeNames={"#o": "owner"},
+            ExpressionAttributeValues={":owner": owner},
+        )
+    except Exception:
+        pass
+
+
 # ---------- Warm Pool ----------
 
 def mark_warm(sandbox_id: str) -> None:
@@ -239,6 +347,10 @@ def _utcnow() -> str:
 
 def _utcnow_plus(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _utcnow_minus(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 
 def _dt_now() -> datetime:

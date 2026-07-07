@@ -247,6 +247,27 @@ module "eks" {
 # 节点角色不再持有 Bedrock 权限 —— 沙盒内代码无法直接调 Bedrock(R8 凭据隔离落地)
 # 沙盒走: Claude Code → ANTHROPIC_BASE_URL=http://litellm.litellm:4000 → LiteLLM Pod → Bedrock
 
+# ---------- .metal ASG health check grace period 加长(防冷启动替换循环) ----------
+# 根因:c6g.metal 裸金属过 EC2 status check 需 5-10 分钟,而 EKS 托管节点组建的 ASG
+# 默认 grace period 仅 15s → 节点刚起就被判 unhealthy 替换 → 无限替换循环,节点永远
+# 收敛不到全部 Ready(实测 07-07 重建时踩到,老 memory 误判为"暂态自愈")。
+# EKS 托管节点组的 API/模块不暴露 ASG grace period,只能在节点组创建后 patch ASG。
+resource "null_resource" "metal_asg_grace_period" {
+  # 节点组变化(如换机型/架构)时重新 patch
+  triggers = {
+    asg_name = module.eks.eks_managed_node_groups["metal_${var.node_arch}"].node_group_autoscaling_group_names[0]
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws autoscaling update-auto-scaling-group \
+        --auto-scaling-group-name ${self.triggers.asg_name} \
+        --health-check-grace-period 900 \
+        --region ${var.region}
+    EOT
+  }
+}
+
 # ---------- ECR 仓库(直接创建,不依赖 phase1) ----------
 resource "aws_ecr_repository" "sbx" {
   name                 = "claude-sbx"

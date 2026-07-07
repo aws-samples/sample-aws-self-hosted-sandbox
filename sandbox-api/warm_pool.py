@@ -114,14 +114,21 @@ class WarmPool:
                 except Exception:
                     pass
 
-    def start_replenish_loop(self) -> None:
+    def start_replenish_loop(self, is_leader=None) -> None:
+        """
+        后台补充暖池水位。
+        is_leader: 可选的无参 callable,返回 True 才补充。多副本控制面下由
+        Reconciler 的 leader 门控注入,避免多副本重复补池互相打架(gap P1-4)。
+        None(默认)= 单副本/测试,始终补充。
+        """
         def _loop():
             while True:
                 try:
-                    self.replenish()
+                    if is_leader is None or is_leader():
+                        self.replenish()
                 except Exception:
                     pass
-                time.sleep(REFILL_EVERY)
+                time.sleep(REFILL_EVERY)  # nosemgrep: arbitrary-sleep -- 暖池补充周期
 
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
