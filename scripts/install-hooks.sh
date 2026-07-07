@@ -26,8 +26,8 @@ for hook in "$SRC_DIR"/*; do
 done
 
 chmod +x "$REPO_ROOT/scripts/code-review.sh" 2>/dev/null || true
-chmod +x "$REPO_ROOT/scripts/update-readme.sh" 2>/dev/null || true
-echo "完成。提交时将自动运行 AI code review，并按需自动更新 README（中/英文版）。"
+chmod +x "$REPO_ROOT/scripts/update-docs.sh" 2>/dev/null || true
+echo "完成。提交时将自动运行 AI code review，并按需自动同步文档（README 中/英文 + docs/deploy.md 等）。"
 echo "临时跳过 code review：SKIP_CODE_REVIEW=1 git commit"
-echo "临时跳过 README 更新：SKIP_README_UPDATE=1 git commit"
+echo "临时跳过 文档更新：SKIP_DOC_UPDATE=1 git commit"
 echo "跳过全部 hook：git commit --no-verify"
