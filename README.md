@@ -121,6 +121,7 @@ POST /sandboxes/{id}/exec
 | **24×7 长驻** | ✅ | ✅ | ✅ | ❌ 有 TTL |
 | **快照 suspend/resume** | ✅ 实测 1.2s | ✅ | ✅ | ❌ |
 | **凭据隔离** | ✅ LiteLLM IRSA（已落地）| ✅ | ✅ | N/A |
+| **控制面自愈** | ✅ reconcile + leader + 心跳发现 | ✅ ~20s sync loop | ✅ 去中心化 flyd | ✅ 托管 |
 | **数据主权** | ✅ 数据留 AWS 账号内 | ❌ 第三方 | ❌ 第三方 | ✅ |
 | **K8s 生态集成** | ✅ 原生 | ❌ | ❌ | ❌ |
 
