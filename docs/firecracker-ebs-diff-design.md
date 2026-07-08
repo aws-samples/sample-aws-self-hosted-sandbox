@@ -633,3 +633,42 @@ FC 官方文档印证:"Guest network connectivity is not guaranteed to be preser
 - `node-agent/main.py`：`_vsock_uds_in_snapshot()` + resume 清理集合并入固化 UDS 路径。
 - `sandbox-api/app.py`：`RESUME_CONCURRENCY` 信号量（默认 12）限流 resume。
 - 两项均随新镜像部署、真机回归通过。
+
+---
+
+## Block 1:spot 回收信号监听 → 自动疏散(2026-07-08，DRY-RUN 落地）
+
+> 补上"未闭合缺口"的第一块(也是最时间敏感的一块):真实 spot 回收时,**谁**在 120s 窗口内
+> 触发批量疏散。之前的 50 满载测试都是**手动**调 suspend 模拟疏散;本块把"检测信号→决策疏散"
+> 自动化,先做 **DRY-RUN**(只算并上报疏散计划,不真打快照),验证链路后再开真疏散。
+
+### 设计:放在 node-agent(on-host,最低延迟)
+- node-agent 跑在每台 metal 上,天然有 **IMDS 访问** + 知道**本节点的 running VM**(`_VMS`)。
+- 后台线程 `start_reclaim_watch_loop()` 每 `RECLAIM_POLL_S`(默认5s)轮询 IMDSv2:
+  - `/latest/meta-data/spot/instance-action` —— 硬通知(~120s 明确终止)。
+  - `/latest/meta-data/events/recommendations/rebalance` —— 软通知(更早的再平衡预警)。
+- 检出信号 → `_evacuate_local()`:枚举本节点 running 沙盒,产出疏散计划。
+
+### DRY-RUN vs REAL(默认 DRY-RUN,零风险)
+- `RECLAIM_AUTO_EVACUATE=0`(默认):只 log + 记录计划(`GET /reclaim/status` 可观测),**不打快照**。
+- `RECLAIM_AUTO_EVACUATE=1`:对每个本地 running VM 打 Diff 快照到持久 EBS(方案C,不传 S3)。
+
+### 测试注入(EKS 托管节点非 spot,真 ITN 不触发)
+- `POST /reclaim/simulate {type}`:注入一个模拟信号,立即算疏散计划(用于验证链路)。
+- `POST /reclaim/reset`:清检测态,便于重复测试。
+- `GET /reclaim/status`:看最近一次检测/计划。
+
+### 真机验证(2026-07-08,node2 上 5 个 running 沙盒)
+- 注入 `spot-termination` → node-agent 检出 → 计划正确列出全部 **5 个本地沙盒**,`mode=DRY-RUN`,est~26.5s。
+- **DRY-RUN 未动沙盒**:5 个仍全部 `running` ✅。`/reclaim/status` 正确反映 detected/plan ✅。
+- 真 IMDS 轮询在非 spot 节点返回无信号、无报错(链路正常,只是没有真信号)。
+
+### 相关代码 / 配置
+- `node-agent/main.py`:`_imds_token/_imds_get/_check_reclaim_signal/_local_running_vms/_evacuate_local/start_reclaim_watch_loop` + `/reclaim/{status,simulate,reset}` 端点。
+- 环境变量:`RECLAIM_WATCH_ENABLED`(默认1)、`RECLAIM_POLL_S`(默认5)、`RECLAIM_AUTO_EVACUATE`(默认0=DRY-RUN)、`IMDS_BASE`。
+
+### 上生产前的收尾(本块 REAL 化 + 与 Block 2 衔接)
+1. **状态一致性**:节点自救打快照后,DynamoDB 状态由控制面 reconcile 感知(节点消失→needs_reschedule)。
+   REAL 疏散建议同时通知控制面做状态迁移(而非仅节点侧打快照),避免 DB 与实际短暂不一致。
+2. **信号响应余量**:120s 窗口要扣掉轮询间隔(≤5s)+ 批量下发延迟;疏散并发建议由控制面统一限流。
+3. **Block 2 衔接**:疏散(本块)+ 跨机拉起(Block 2:选存活节点→attach EBS→resume)才闭环。

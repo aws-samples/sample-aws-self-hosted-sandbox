@@ -34,6 +34,8 @@ import subprocess
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -59,6 +61,18 @@ HEARTBEAT_EVERY_S = int(os.environ.get("HEARTBEAT_EVERY_S", "30"))
 # 上报给控制面的节点标识:必须是控制面能 HTTP 连到 node-agent 的地址。
 # 默认自动探测主网卡内网 IP;可用 NODE_ADVERTISE_IP 覆盖。
 NODE_ADVERTISE_IP = os.environ.get("NODE_ADVERTISE_IP", "")
+
+# ---------- Spot 回收信号监听(Block 1:IMDS → 自动疏散)----------
+# node-agent 在本节点(有 IMDS 访问)轮询 spot 回收信号,收到后疏散本节点沙盒。
+# 默认 DRY-RUN:只记录/上报"会疏散哪些",不真打快照 —— 先验证检测+决策链路。
+IMDS_BASE             = os.environ.get("IMDS_BASE", "http://169.254.169.254")
+RECLAIM_WATCH         = os.environ.get("RECLAIM_WATCH_ENABLED", "1").lower() in ("1", "true")
+RECLAIM_POLL_S        = int(os.environ.get("RECLAIM_POLL_S", "5"))
+# =0(默认)DRY-RUN 只记录计划;=1 才真正触发疏散(打 Diff 快照到持久 EBS)。
+RECLAIM_AUTO_EVACUATE = os.environ.get("RECLAIM_AUTO_EVACUATE", "0").lower() in ("1", "true")
+# 最近一次回收检测/疏散计划(供 GET /reclaim/status 观测;injected 供测试注入)
+_RECLAIM_STATE: dict = {"detected": False, "signal": None, "at": None,
+                        "plan": None, "evacuated": False, "injected": None}
 
 # ---------- JuiceFS 配置（方案 B：workspace 在 S3，快照不含磁盘）----------
 JUICEFS_ENABLED    = os.environ.get("JUICEFS_ENABLED", "false").lower() == "true"
@@ -949,6 +963,129 @@ def _tap_idx_guess(sid: str) -> int:
     return 1
 
 
+# ---------- Spot 回收信号监听 → 疏散(Block 1) ----------
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _imds_token() -> str | None:
+    """取 IMDSv2 token(PUT /latest/api/token)。IMDSv1 环境失败返回 None 仍可继续。"""
+    try:
+        req = urllib.request.Request(
+            f"{IMDS_BASE}/latest/api/token", method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return r.read().decode()
+    except Exception:
+        return None
+
+
+def _imds_get(path: str, token: str | None) -> tuple[int, str]:
+    headers = {"X-aws-ec2-metadata-token": token} if token else {}
+    try:
+        req = urllib.request.Request(f"{IMDS_BASE}{path}", headers=headers)
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, ""      # 正常无信号时 spot/instance-action 返回 404
+    except Exception:
+        return 0, ""           # IMDS 不可达(本地/非 EC2)
+
+
+def _check_reclaim_signal() -> dict | None:
+    """
+    检查 spot 回收信号,返回信号 dict 或 None。
+    - 测试注入(_RECLAIM_STATE['injected'])优先 —— EKS 托管节点非 spot,真 ITN 不会触发,
+      故用 POST /reclaim/simulate 注入来验证检测→决策链路。
+    - spot/instance-action:硬通知(~120s 明确终止)。
+    - events/recommendations/rebalance:软通知(更早的再平衡预警)。
+    """
+    inj = _RECLAIM_STATE.get("injected")
+    if inj:
+        return inj
+    token = _imds_token()
+    st, body = _imds_get("/latest/meta-data/spot/instance-action", token)
+    if st == 200 and body:
+        try:
+            info = json.loads(body)
+        except Exception:
+            info = {"raw": body}
+        return {"type": "spot-termination", **info}
+    st, body = _imds_get("/latest/meta-data/events/recommendations/rebalance", token)
+    if st == 200 and body:
+        try:
+            info = json.loads(body)
+        except Exception:
+            info = {"raw": body}
+        return {"type": "rebalance-recommendation", **info}
+    return None
+
+
+def _local_running_vms() -> list[str]:
+    with _LOCK:
+        return [sid for sid, vm in _VMS.items() if vm.get("state") == "running"]
+
+
+def _evacuate_local(signal: dict) -> dict:
+    """
+    收到回收信号 → 疏散本节点所有 running 沙盒。
+    - DRY-RUN(默认):只算并记录疏散计划,不真打快照。
+    - REAL(RECLAIM_AUTO_EVACUATE=1):对每个本地 running VM 打 Diff 快照到持久 EBS
+      (方案C,不传 S3)。状态回写 DynamoDB 由控制面 reconcile 感知(节点消失→
+      needs_reschedule),编排层跨机拉起见 Block 2(尚未实现)。
+    """
+    import sys
+    sids = _local_running_vms()
+    # 疏散耗时粗估:满载 ~1.3GB/个 Diff、单卷 1000MB/s,实测 50 个并发 ~80s。
+    est_s = round(len(sids) * 1.3 + 20, 1)
+    mode  = "REAL" if RECLAIM_AUTO_EVACUATE else "DRY-RUN"
+    plan  = {"node": NODE_ID, "signal": signal, "count": len(sids),
+             "sandboxes": sids, "est_evac_s": est_s, "mode": mode}
+    _RECLAIM_STATE.update({"detected": True, "signal": signal,
+                           "at": _now_iso(), "plan": plan})
+    print(f"[reclaim] SIGNAL={signal.get('type')} → evacuate {len(sids)} sandboxes "
+          f"on {NODE_ID} (mode={mode}, est~{est_s}s): {sids}",
+          file=sys.stderr, flush=True)
+    if not RECLAIM_AUTO_EVACUATE:
+        print("[reclaim] DRY-RUN: 不实际疏散。设 RECLAIM_AUTO_EVACUATE=1 开启真疏散。",
+              file=sys.stderr, flush=True)
+        return plan
+    # REAL 疏散:逐个打 Diff 快照(方案C 落持久 EBS)。批量并发由控制面侧限流更合适,
+    # 这里节点自救走串行/尽力而为,保证内存先落盘幸存。
+    ok = 0
+    for sid in sids:
+        try:
+            op_suspend({"id": sid, "snapshot_local_path": f"{SBX_BASE}/{sid}/snap"})
+            ok += 1
+        except Exception as e:
+            print(f"[reclaim] evacuate {sid} failed: {e}", file=sys.stderr, flush=True)
+    plan["evacuated_ok"] = ok
+    _RECLAIM_STATE["evacuated"] = True
+    print(f"[reclaim] REAL evacuation done: {ok}/{len(sids)}", file=sys.stderr, flush=True)
+    return plan
+
+
+def start_reclaim_watch_loop() -> None:
+    """后台轮询 IMDS 回收信号;检出一次即疏散(去重:同一检测只触发一次)。"""
+    if not RECLAIM_WATCH:
+        return
+    import sys
+
+    def _loop():
+        while True:
+            try:
+                sig = _check_reclaim_signal()
+                if sig and not _RECLAIM_STATE.get("detected"):
+                    _evacuate_local(sig)
+            except Exception as e:
+                print(f"[reclaim] watch error: {e}", file=sys.stderr, flush=True)
+            time.sleep(RECLAIM_POLL_S)  # nosemgrep: arbitrary-sleep -- 回收信号轮询周期
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 # ---------- HTTP handler ----------
 
 def _check_caller_allowed(client_ip: str) -> bool:
@@ -1000,6 +1137,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/health":
                 return self._send(200, op_health())
+            if path == "/reclaim/status":
+                return self._send(200, _RECLAIM_STATE)
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "vm":
                 return self._send(200, op_get(parts[1]))
@@ -1027,6 +1166,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, op_resume(body))
             if path == "/vm/exec":
                 return self._send(200, op_exec(body))
+            # Block 1 测试:注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
+            if path == "/reclaim/simulate":
+                sig = {"type": body.get("type", "spot-termination"),
+                       "action": body.get("action", "terminate"),
+                       "time": body.get("time", _now_iso()),
+                       "injected": True}
+                _RECLAIM_STATE["detected"] = False  # 允许重复测试
+                return self._send(200, _evacuate_local(sig))
+            # 清除检测态(测试用:恢复后重置,让 watch loop 可再次触发)
+            if path == "/reclaim/reset":
+                _RECLAIM_STATE.update({"detected": False, "signal": None, "at": None,
+                                       "plan": None, "evacuated": False, "injected": None})
+                return self._send(200, {"reset": True})
             self._send(404, {"error": "not found"})
         except KeyError:
             self._send(404, {"error": "not found"})
@@ -1045,6 +1197,11 @@ if __name__ == "__main__":
 
     # 心跳注册:控制面据此发现活节点(P0-3)
     start_heartbeat_loop()
+
+    # Block 1:spot 回收信号监听 → 自动疏散(默认 DRY-RUN)
+    start_reclaim_watch_loop()
+    print(f"[reclaim] watch={'on' if RECLAIM_WATCH else 'off'} "
+          f"poll={RECLAIM_POLL_S}s mode={'REAL' if RECLAIM_AUTO_EVACUATE else 'DRY-RUN'}")
 
     print(f"node-agent [{NODE_ID}] 在 {LISTEN_HOST}:{LISTEN_PORT} "
           f"(advertise: {_advertise_ip()}, "
