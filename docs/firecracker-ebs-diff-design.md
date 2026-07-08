@@ -581,3 +581,55 @@ FC 官方文档印证:"Guest network connectivity is not guaranteed to be preser
 - 已含:方案C EBS+Diff、P0 merged转正、P1 vsock网络刷新、always-merge正确性修复、
   driver net_fix透传、同事 vsock exec(合并保留)。
 - 镜像已构建推送;真机验证:单sandbox多代 PASS、50满载疏散(84.8s)、跨机恢复 50/50。
+
+---
+
+## 合并后复测 + 两个生产级修复(2026-07-08，重建环境 origin/main）
+
+> 背景：`feat/ebs-diff-scheme-c` 已合入 main，且同事又推了 PR#4(P0 编排加固)、PR#5(暖池 e2e + 4 个 resume/claim bug)。
+> 用**当前 main** 重建全环境(stage1→phase3→stage2，2×c6g.metal 单 AZ + 持久状态 EBS)重跑 50 满载疏散+跨机恢复，
+> 目的是确认合并没破坏方案C，并把发现的问题修掉。
+
+### 复测结果(50 个满载，各 ~1.2GB 真实内存，单块 gp3 1000MB/s)
+- **疏散(suspend)**：50/50 全 Diff，**墙钟 79.7s**（<120s 窗口，余量 40s），写盘 65.7GB，avg 1.3GB/个。与上轮 84.8s 一致 → 合并未损性能。
+- **跨机恢复**：node1 状态卷 detach→attach 到 node2→挂载(180G 快照完整迁移)，**47/50 成功**，`net_fix_ok` 成功项 100%。
+- **内存正确性**：抽查恢复后的 `FILL-*` 标记原样命中、内存驻留正常 → always-merge 跨机无损再确认。
+
+### ⚠️ 修复 1：resume 侧 vsock UDS 固化路径未清理（暖池来源沙盒跨机 resume 必失败）
+- **现象**：3/50 resume 报 `VsockUnixBackend: Error binding to the host-side Unix socket: Address in use (os error 98)`。
+- **根因**：这 3 个是**从暖池领取(claim)**的沙盒，内存快照里**固化了暖池源目录**的 vsock UDS 路径
+  (`{SBX_BASE}/warm-xxxx/v.sock`)，≠ 自己 sid 目录。原 `op_resume` 只清理 `dirname(snap_dir)/v.sock`（sid 目录），
+  **清不到固化的 warm 路径**；上次失败的 FC 尝试在该路径留下 stale socket → 下次 bind “Address in use” → 死循环失败。
+  (同事 PR#5 的暖池 vsock 处理只在 **claim 那一次 resume** 生效，后续/跨机 resume 不覆盖。)
+- **修复**（`node-agent/main.py`）：新增 `_vsock_uds_in_snapshot()`，直接从 `vm.snapshot` 二进制里正则扫出**固化的真实 UDS 路径**，
+  并入 resume 前的清理集合（冷建/暖池两种来源统一覆盖）。已用真机快照验证正则能抠出 `…/warm-xxxx/v.sock`；修复后该错误不再出现。
+- **验证闭环**：故意在固化 warm 路径植入 stale socket → 旧代码必失败；新代码自动清理该路径，错误消失（越过 vsock 阶段）。
+
+### ⚠️ 修复 2：resume 并发限流（避免单卷 EBS 被 merge I/O 打爆）
+- **量化实测**（同一批 47 个冷沙盒，先全 suspend 再按不同并发 resume，300s 超时，单块 1000MB/s gp3）：
+
+  | resume 并发 | 墙钟 | 单个 load(含merge) p50 | merge p50 | 失败 |
+  |---|---|---|---|---|
+  | 6 | 62.6s | 7.0s | 5.7s | 0/47 |
+  | **15** | **32.7s** | 8.9s | 6.5s | 0/47 |
+  | 47(无限) | 33.2s | **25.1s** | 21.2s | 0/47 |
+
+- **结论**：EBS 带宽在 **~15 并发饱和**——超过后墙钟不再降(33s)，只是把单个 merge 从 ~6s 拖到 ~25s（纯 I/O 争抢，无收益，还易触发超时误判）；太低(C=6)则带宽没吃满、墙钟偏高。
+  **最优 ~12 并发**：墙钟接近最优 + 单个延迟低 + 留 headroom。
+- **澄清一个假象**：之前那次“30 分钟/20 失败”**不是真实上限**，是三个假象叠加——①客户端 180s 超时太短(饱和时单个>100s 被误判)②误开了两个并发 resume 批次 ③上面修复 1 的 vsock bug。限流 + 足够超时后 **0 失败**。
+- **修复**（`sandbox-api/app.py`）：resume 加信号量 `RESUME_CONCURRENCY`(默认 12，类比 `BASE_SNAPSHOT_CONCURRENCY`)，
+  排队期沙盒停 `resuming`(可观测)，计时不含排队。`0`=不限流。
+- **回归验证**：新镜像重建 12 个冷沙盒 → suspend 12/12(7.9s) → resume 12/12 0 失败(8.8s)、`net_fix_ok` 12/12、marks 命中，冷路径无回归。
+
+### 🔴 未闭合的设计缺口：reconciler 的 needs_reschedule 没有“跨机拉起”落地
+- 同事 P0 reconciler（PR#4）检测到节点心跳消失，会把该节点上 `suspended` 的沙盒标 `needs_reschedule/node_down`
+  （其注释明确：“**第一版不自动跨机重调度**，留 P1”）。
+- **但目前没有任何路径把 `needs_reschedule` 的沙盒在新节点拉起来** —— 而这正是方案C 的核心动作（spot 死→新机 attach EBS→resume）。
+  resume 端只接受 `suspended` 态，对 `needs_reschedule` 返回 409。本轮测试是**手动**把状态改回 `suspended@新节点` 才 resume 的。
+- **待办（方案C 上生产前必补）**：加“重调度/迁移”编排——节点死亡后，把其 `needs_reschedule` 沙盒的状态卷 attach 到存活节点、
+  更新 `node`、置回 `suspended` 并触发 resume（可复用 `migrate` 能力）。这是 EBS detach/attach 编排 + reconciler 的衔接。
+
+### 本轮落地的代码改动
+- `node-agent/main.py`：`_vsock_uds_in_snapshot()` + resume 清理集合并入固化 UDS 路径。
+- `sandbox-api/app.py`：`RESUME_CONCURRENCY` 信号量（默认 12）限流 resume。
+- 两项均随新镜像部署、真机回归通过。

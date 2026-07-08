@@ -25,6 +25,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import signal
 import shutil
 import signal
@@ -534,6 +535,28 @@ def _merge_diff_into_base(base_mem: str, diff_mem: str, merged: str) -> None:
         os.fsync(fm.fileno())
 
 
+def _vsock_uds_in_snapshot(snapshot_path: str) -> list[str]:
+    """
+    从 Firecracker 的 vm.snapshot 里解析出【固化的 vsock host UDS 路径】。
+
+    为什么需要:load 时 FC 会绑定快照里写死的那个 UDS 路径,不是我们约定的路径。
+    暖池领取(claim)的沙盒,快照固化的是【暖池源目录】的 v.sock
+    (如 {SBX_BASE}/warm-xxxx/v.sock),≠ 本沙盒 sid 目录。若那个路径残留 stale
+    socket(上次失败的 FC 尝试留下的),bind 报 "Address in use (os error 98)"
+    → resume 必失败。仅按 sid/dirname 猜路径清不掉它(实测 bug)。
+    故直接从快照里把真实路径抠出来清理,冷建/暖池两种来源统一覆盖。
+
+    快照是 bincode 二进制,但 UDS 路径以可读字符串内嵌,按 SBX_BASE 前缀正则扫描即可。
+    """
+    try:
+        with open(snapshot_path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        return []
+    pat = re.escape(SBX_BASE.encode()) + rb"/[A-Za-z0-9._\-]+/v\.sock"
+    return sorted({m.decode("utf-8", "ignore") for m in re.findall(pat, blob)})
+
+
 def op_resume(body: dict) -> dict:
     sid        = body["id"]
     snap_dir   = body["snapshot_local_path"]
@@ -553,7 +576,11 @@ def op_resume(body: dict) -> dict:
     # load 时 FC 会重新绑定它)。当 sid(real_id)≠ 快照来源 id 时,vsock 仍绑
     # 在来源目录,需清理来源目录的 v.sock,并在 sid 目录建 symlink 供 exec 用。
     src_dir = os.path.dirname(snap_dir)
-    vsock_bound = f"{src_dir}/v.sock"   # 快照实际绑定的 UDS 路径
+    vsock_bound = f"{src_dir}/v.sock"   # 按目录约定推测的 UDS 路径
+    # 权威来源:直接从快照里抠出固化的 vsock UDS 路径(暖池来源 ≠ sid 目录时,
+    # 仅靠上面的目录约定清不掉真实路径 → "Address in use")。合并成待清理集合。
+    stale_vsocks = {f"{d}/v.sock", vsock_bound}
+    stale_vsocks.update(_vsock_uds_in_snapshot(f"{snap_dir}/vm.snapshot"))
 
     # rootfs 准备:方案C 下 rootfs 就在状态 EBS 的 {sid}/rootfs.ext4(随卷迁移,含装的软件)。
     # 回退:本地已有→直接用;快照目录里有→复制;都没有→基础镜像 CoW。
@@ -591,8 +618,8 @@ def op_resume(body: dict) -> dict:
 
     # resume 前清理旧 vsock socket(快照含 vsock 设备,残留的 v.sock 会导致
     # "Address in use" → snapshot load 失败)。这是 Firecracker 快照恢复已知坑。
-    # 清理的是快照实际绑定的 UDS(来源目录),而非 sid 目录。
-    for stale in {f"{d}/v.sock", vsock_bound}:
+    # 清理集合含:sid 目录、目录约定路径、以及从快照抠出的固化真实路径(暖池来源)。
+    for stale in stale_vsocks:
         try:
             os.remove(stale)
         except FileNotFoundError:
@@ -609,7 +636,7 @@ def op_resume(body: dict) -> dict:
     # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
     # 会自动重建 vsock 并绑定该 UDS；若旧 v.sock 文件残留会导致
     # "Address in use (os error 98)" → 必须先删旧 socket 文件。
-    for stale in {f"{d}/v.sock", vsock_bound}:
+    for stale in stale_vsocks:
         try:
             os.remove(stale)
         except FileNotFoundError:

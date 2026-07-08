@@ -185,6 +185,15 @@ import threading as _threading
 _BASE_CONCURRENCY = int(os.environ.get("BASE_SNAPSHOT_CONCURRENCY", "2"))
 _BASE_SEM = _threading.Semaphore(_BASE_CONCURRENCY)
 
+# 方案C:resume 侧限流。跨机疏散后在新节点批量 resume,每个都要把 base+diff 合并成
+# 完整内存镜像(~base 大小的读 + 写,单个 ~1.5GB×2 I/O)。50 个同时 resume 会打满
+# 单块状态 EBS 带宽 → 每个 merge 从 ~6s 恶化到 ~25s,墙钟不降反噪、易触发超时误判。
+# 实测(单块 1000MB/s gp3,50 个 1.5G):并发 6→墙钟 63s;并发 15→33s(单个~9s);
+# 并发 47→33s 但单个恶化到 25s。带宽在 ~15 并发饱和,超过纯属徒增单个延迟。
+# 故限流到 ~12:墙钟接近最优且留 headroom。0 → 不限流。
+_RESUME_CONCURRENCY = int(os.environ.get("RESUME_CONCURRENCY", "12"))
+_RESUME_SEM = _threading.Semaphore(_RESUME_CONCURRENCY) if _RESUME_CONCURRENCY > 0 else None
+
 
 def _maybe_snapshot_base_async(sid: str) -> None:
     """后台线程给 sandbox 打 Full base 快照(方案C Diff 前提)。off 关键路径,失败不影响 create。
@@ -298,9 +307,17 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
     try:
         lease_id = db.acquire_lease(sid)
         db.update_state(sid, "resuming", "suspended")
-        t0 = time.monotonic()
-        driver_fields = _driver.resume(sid, record)
-        restore_time  = round(time.monotonic() - t0, 4)
+        # 限流:同时最多 _RESUME_CONCURRENCY 个 resume 走 driver(合并+load 的 EBS I/O 重)。
+        # 排队期间沙盒停在 resuming(可观测),不额外占资源。t0 只计真正 resume 不含排队。
+        if _RESUME_SEM is not None:
+            _RESUME_SEM.acquire()
+        try:
+            t0 = time.monotonic()
+            driver_fields = _driver.resume(sid, record)
+            restore_time  = round(time.monotonic() - t0, 4)
+        finally:
+            if _RESUME_SEM is not None:
+                _RESUME_SEM.release()
         db.update_state(sid, "running", "resuming",
                         {**driver_fields, "restore_time_s": str(restore_time)})
         db.write_event(sid, "resumed", "suspended",
