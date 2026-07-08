@@ -21,8 +21,12 @@ if [[ ! -d "$REPO_ROOT/$HOOKS_DIR" ]]; then
   exit 1
 fi
 
-# 确保 hook 及被调脚本可执行(clone 后权限位一般保留,保险起见再设一次)
-chmod +x "$REPO_ROOT/$HOOKS_DIR"/* 2>/dev/null || true
+# 确保 hook 及被调脚本可执行(clone 后权限位一般保留,保险起见再设一次)。
+# 只给真正的 hook 加 +x,跳过 README.md 等非可执行文件(避免给纯文本误加执行位)。
+for f in "$REPO_ROOT/$HOOKS_DIR"/*; do
+  [[ "$(basename "$f")" == "README.md" ]] && continue
+  chmod +x "$f" 2>/dev/null || true
+done
 chmod +x "$REPO_ROOT/scripts/code-review.sh" 2>/dev/null || true
 chmod +x "$REPO_ROOT/scripts/update-docs.sh" 2>/dev/null || true
 
