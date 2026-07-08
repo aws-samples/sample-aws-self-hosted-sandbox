@@ -621,8 +621,9 @@ def op_resume(body: dict) -> dict:
     # "Open tap device failed: Resource busy" → load 失败。因此必须先 setup_tap。
     tap, _, guest_ip = _setup_tap(tap_idx)
 
-    # vm.mem 始终是最新的完整内存（Diff 的脏页已在 suspend 侧叠加进去），
-    # 因此 resume 直接 load vm.mem，无需在恢复路径上做合并 → resume 保持亚秒级。
+    # load 用 mem_backend_path:有 base(Diff 快照)时 = 上面合并出的 merged;
+    # 无 base(Full 快照,如暖池首份)时 = vm.mem 本身。合并只发生在存在 base 时,
+    # 是正确性所需(见上方 always-merge 说明),而非亚秒级恢复的阻碍。
     t0 = time.monotonic()
     _fc(sock, "PUT", "/snapshot/load", {
         "snapshot_path": f"{snap_dir}/vm.snapshot",
