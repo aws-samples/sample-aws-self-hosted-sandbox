@@ -3,7 +3,7 @@
 # pre-commit hook —— 提交前依次执行：
 #   1) Claude AI code review（发现严重问题时阻断提交）；
 #   2) 依据本次改动自动同步项目文档（README 中/英文 + docs/deploy.md 等，不阻断提交）。
-# 此文件通过 scripts/install-hooks.sh 安装到 .git/hooks/pre-commit。
+# 本 hook 位于版本库内的 .githooks/,由 core.hooksPath 生效(运行 scripts/install-hooks.sh 启用)。
 #
 set -uo pipefail
 

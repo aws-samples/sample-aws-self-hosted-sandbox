@@ -258,6 +258,21 @@ python3 sandbox-api/smoke_test.py
 
 ---
 
+### 参与开发（Git Hooks，团队共享）
+
+克隆仓库后**运行一次**，启用提交前的 AI code review + 文档自动同步：
+
+```bash
+./scripts/install-hooks.sh    # 设置 git config core.hooksPath .githooks
+```
+
+- hook 源文件在版本库的 `.githooks/`，**随 `git pull` 自动更新，无需重装**。
+- git 出于安全不会自动改本地配置，故 `core.hooksPath` 需每位成员各自设一次（之后一直生效）。
+- 临时跳过：`SKIP_CODE_REVIEW=1` / `SKIP_DOC_UPDATE=1 git commit`；全跳过：`git commit --no-verify`。
+- 细节见 [.githooks/README.md](.githooks/README.md)。
+
+---
+
 ### 实测关键数据
 
 | 指标 | 实测值 | 环境 |

@@ -10,15 +10,19 @@
 
 ## 安装
 
-克隆仓库后运行一次（`.git/hooks/` 不纳入版本控制，每位成员需各自安装）：
+hook 源文件就在版本库的 `.githooks/`（随仓库版本化、`git pull` 即更新）。启用方式是把 git 的 hook 目录指向它——**每位成员克隆后运行一次**即可（git 出于安全不允许仓库自动改本地配置，故需各自设一次；之后一直生效）：
 
 ```bash
-./scripts/install-hooks.sh
+./scripts/install-hooks.sh          # 等价于 git config core.hooksPath .githooks
 ```
+
+> 与旧的"复制到 `.git/hooks/`"方式不同：现在 hook 逻辑随 `git pull` 自动更新，无需每次改动后重装。若 `.git/hooks/pre-commit` 有旧的复制残留，可删除（设了 `core.hooksPath` 后它不再生效）。
+
+> ⚠️ **供应链信任提示**：因为 `.githooks/` 下的内容会随 `git pull` **自动生效**（无需重装或确认），一旦有人向 `.githooks/pre-commit` 或它调用的 `scripts/code-review.sh` / `scripts/update-docs.sh` 合入恶意改动，所有已启用的成员会在下次 `git commit` 时无感知执行。因此**这几个文件的改动必须按"可执行代码"的标准严格 code review**（不能只当文档看待）。不信任某次改动时，用 `git commit --no-verify` 临时绕过。
 
 ## 工作方式
 
-`git commit` 触发 `.git/hooks/pre-commit`：
+`git commit` 触发 `.githooks/pre-commit`（由 `core.hooksPath` 指向）：
 
 **① `scripts/code-review.sh`**
 

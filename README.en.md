@@ -481,8 +481,23 @@ Monitoring:
 ```bash
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# Expected: 21/21 PASS
+# Expected: 29/29 PASS
 ```
+
+---
+
+### Contributing (Git Hooks, team-shared)
+
+After cloning, **run once** to enable the pre-commit AI code review + doc auto-sync:
+
+```bash
+./scripts/install-hooks.sh    # sets git config core.hooksPath .githooks
+```
+
+- Hook sources live in `.githooks/` (version-controlled), so they **update automatically on `git pull` — no reinstall needed**.
+- Git won't change local config automatically for security reasons, so each member sets `core.hooksPath` once (persists afterwards).
+- Skip temporarily: `SKIP_CODE_REVIEW=1` / `SKIP_DOC_UPDATE=1 git commit`; skip all: `git commit --no-verify`.
+- Details: [.githooks/README.md](.githooks/README.md).
 
 ---
 
