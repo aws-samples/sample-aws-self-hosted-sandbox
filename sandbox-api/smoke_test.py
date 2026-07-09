@@ -7,7 +7,7 @@
   2. FirecrackerDriver — 用内嵌 mock node-agent HTTP server
   3. 统一 API (app.py) — create / get / wait / suspend / resume / destroy / exec
   4. Warm Pool — replenish + claim 路径
-  5. Capability 模型 — Kata driver 的 suspend 返回 501
+  5. Reconcile / 心跳 / leader 锁
 
 所有 DynamoDB 操作通过 moto 在内存中 mock。
 node-agent 用 threading.Thread 起一个最小 stub HTTP server。
@@ -384,24 +384,6 @@ class TestFirecrackerDriver(unittest.TestCase):
         self.assertEqual(out, "hello")
 
 
-class TestKataCapabilities(unittest.TestCase):
-    """KataDriver capability 模型 — suspend 应返回 501 语义。"""
-
-    def test_suspend_raises(self):
-        from sandbox_api.drivers.kata import KataDriver
-        from sandbox_api.driver import UnsupportedOperation
-        drv = KataDriver()
-        self.assertFalse(drv.capabilities().suspend_resume)
-        with self.assertRaises(UnsupportedOperation):
-            drv.suspend("any", {})
-
-    def test_resume_raises(self):
-        from sandbox_api.drivers.kata import KataDriver
-        from sandbox_api.driver import UnsupportedOperation
-        with self.assertRaises(UnsupportedOperation):
-            KataDriver().resume("any", {})
-
-
 class TestAPIEndToEnd(unittest.TestCase):
     """app.py HTTP API 端到端测试(内嵌 ThreadingHTTPServer)。"""
 
@@ -535,22 +517,6 @@ class TestAPIEndToEnd(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    @mock_aws
-    def test_kata_suspend_returns_501(self):
-        _create_tables()
-        from sandbox_api.drivers.kata import KataDriver
-        srv, port = self._start_api(KataDriver())
-        try:
-            from sandbox_api import db as db_module
-            db_module.put({"id": "fake-kata", "tenant_id": "t1",
-                           "state": "running", "driver": "kata",
-                           "updated_at": db_module._utcnow()})
-            code, body = self._call(port, "POST", "/sandboxes/fake-kata/suspend")
-            self.assertEqual(code, 501)
-        finally:
-            srv.shutdown()
-
-
 class TestWarmPool(unittest.TestCase):
     """WarmPool replenish + claim 路径。"""
 
@@ -602,9 +568,9 @@ class TestAPIAuth(unittest.TestCase):
         app_module._API_KEYS = set()
         app_module._ALLOW_UNAUTH = True  # 明确开发模式
 
-        from sandbox_api.drivers.kata import KataDriver
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
         from http.server import ThreadingHTTPServer
-        app_module._driver = KataDriver()
+        app_module._driver = FirecrackerDriver()
         app_module._warm_pool.claim = lambda *a, **kw: False
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
@@ -626,9 +592,9 @@ class TestAPIAuth(unittest.TestCase):
         app_module._API_KEYS = {"test-key-abc"}
         app_module._ALLOW_UNAUTH = False   # 关闭开发模式以测试真实鉴权
 
-        from sandbox_api.drivers.kata import KataDriver
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
         from http.server import ThreadingHTTPServer
-        app_module._driver = KataDriver()
+        app_module._driver = FirecrackerDriver()
         app_module._warm_pool.claim = lambda *a, **kw: False
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
@@ -764,7 +730,7 @@ class TestReconcile(unittest.TestCase):
             def get_runtime_state(self, sid, rec):
                 return "unknown"  # 节点上已无此 VM → 漂移
 
-        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        stats = Reconciler(_Drv()).reconcile_once()
         self.assertEqual(stats["orphaned"], 1)
         self.assertEqual(db.get("sbx1")["state"], "orphaned")
 
@@ -787,7 +753,7 @@ class TestReconcile(unittest.TestCase):
             def get_runtime_state(self, sid, rec):
                 return "unknown"
 
-        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        stats = Reconciler(_Drv()).reconcile_once()
         self.assertEqual(stats["needs_reschedule"], 1)
         self.assertEqual(db.get("sbx2")["state"], "needs_reschedule")
 
@@ -809,7 +775,7 @@ class TestReconcile(unittest.TestCase):
             def get_runtime_state(self, sid, rec):
                 return "running"  # 一致
 
-        stats = Reconciler(_Drv(), "firecracker").reconcile_once()
+        stats = Reconciler(_Drv()).reconcile_once()
         self.assertEqual(stats["ok"], 1)
         self.assertEqual(db.get("sbx3")["state"], "running")  # 未被动
 
@@ -822,7 +788,7 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite  = unittest.TestSuite()
 
-    for cls in [TestDB, TestFirecrackerDriver, TestKataCapabilities,
+    for cls in [TestDB, TestFirecrackerDriver,
                 TestAPIEndToEnd, TestWarmPool, TestAPIAuth,
                 TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))

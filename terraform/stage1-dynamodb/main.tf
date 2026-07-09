@@ -72,7 +72,7 @@ resource "aws_dynamodb_table" "sandboxes" {
     projection_type = "ALL"
   }
 
-  # 暖池查询(pool_state=warm, driver=firecracker/kata)
+  # 暖池查询(pool_state=warm, driver=firecracker)
   global_secondary_index {
     name            = "pool_state-driver-index"
     hash_key        = "pool_state"

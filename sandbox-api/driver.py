@@ -1,11 +1,14 @@
 """
-Sandbox driver abstraction — 统一接口,后端可插拔。
-控制面 API 层只依赖这里的 Protocol,不直接碰 kubectl / Firecracker REST。
+Sandbox 数据模型与能力声明。
+
+历史上这里是"可插拔 driver"的 Protocol 抽象(Firecracker / Kata 两个后端)。
+Kata 因无法快照/恢复(与本平台 spot 疏散核心诉求不符)已移除,现仅剩
+FirecrackerDriver 一个实现,故抽象层已拍平——本模块只保留共享的数据类
+(SandboxSpec / ServiceSpec / Capabilities)与 UnsupportedOperation。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
 
 
 class UnsupportedOperation(Exception):
@@ -32,46 +35,6 @@ class SandboxSpec:
 
 @dataclass
 class Capabilities:
-    suspend_resume: bool   # FC=True, Kata v1=False
+    suspend_resume: bool   # Firecracker=True
     warm_pool: bool
     migrate: bool          # 跨机迁移
-
-
-@runtime_checkable
-class SandboxDriver(Protocol):
-    def capabilities(self) -> Capabilities: ...
-
-    def create(self, sandbox_id: str, spec: SandboxSpec) -> dict:
-        """
-        启动沙盒,返回 driver 专属字段写回 DynamoDB:
-          FC:   {"node": instance_id, "guest_ip": ..., "tap_idx": N}
-          Kata: {"pod_name": ..., "node": nodeName}
-        """
-        ...
-
-    def destroy(self, sandbox_id: str, record: dict) -> None: ...
-
-    def suspend(self, sandbox_id: str, record: dict) -> dict:
-        """
-        暂停+快照,返回 {"snapshot_s3": "s3://..."}.
-        不支持时 raise UnsupportedOperation.
-        """
-        ...
-
-    def resume(self, sandbox_id: str, record: dict) -> dict:
-        """
-        从快照恢复,返回 {"node": ..., "guest_ip": ...}.
-        不支持时 raise UnsupportedOperation.
-        """
-        ...
-
-    def exec(self, sandbox_id: str, record: dict, cmd: str) -> tuple[int, str, str]:
-        """在沙盒内执行命令,返回 (rc, stdout, stderr)。"""
-        ...
-
-    def get_runtime_state(self, sandbox_id: str, record: dict) -> str:
-        """
-        实时查 VMM/Pod 存活状态,用于健康对账。
-        返回: "running" | "stopped" | "unknown"
-        """
-        ...

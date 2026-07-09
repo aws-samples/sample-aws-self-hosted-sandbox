@@ -2,9 +2,8 @@
 """
 统一沙盒控制面 API — v2
 
-后端通过 SandboxDriver Protocol 插拔:
-  SANDBOX_DRIVER=firecracker  → FirecrackerDriver(裸 FC + node-agent,支持 suspend/resume)
-  SANDBOX_DRIVER=kata         → KataDriver(EKS + Kata + K8s API)
+后端为 FirecrackerDriver(裸 FC microVM + node-agent,支持 suspend/resume 快照)。
+(历史上曾有可插拔的 Kata 后端,因无法快照/恢复、与 spot 疏散核心诉求不符,已移除。)
 
 接口(对齐 Fly Machines API):
   POST   /sandboxes                    创建沙盒
@@ -19,8 +18,7 @@
   GET    /capabilities                 当前 driver 能力
 
 运行:
-  SANDBOX_DRIVER=firecracker FC_NODES=10.0.1.5 python3 app.py
-  SANDBOX_DRIVER=kata python3 app.py
+  FC_NODES=10.0.1.5 python3 app.py
 """
 from __future__ import annotations
 
@@ -39,20 +37,16 @@ from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.reconcile import Reconciler
 from sandbox_api.warm_pool import WarmPool
 
-# ---------- driver 选择 ----------
-_DRIVER_NAME = os.environ.get("SANDBOX_DRIVER", "kata").lower()
-
-if _DRIVER_NAME == "firecracker":
-    from sandbox_api.drivers.firecracker import FirecrackerDriver
-    _driver = FirecrackerDriver()
-else:
-    from sandbox_api.drivers.kata import KataDriver
-    _driver = KataDriver()
+# ---------- driver(仅 Firecracker,抽象层已拍平)----------
+# _DRIVER_NAME 仅作为写入 DynamoDB 记录的 driver 标签 + 暖池 GSI 分区键,固定 firecracker。
+_DRIVER_NAME = "firecracker"
+from sandbox_api.drivers.firecracker import FirecrackerDriver
+_driver = FirecrackerDriver()
 
 # reconcile loop + leader 选举(P0-1 / P1-4)。
 # 暖池补充与 reconcile 共用同一 leader 门控:多副本控制面下只有 leader 跑后台
 # loop,请求路径仍全副本无状态服务。
-_reconciler = Reconciler(_driver, _DRIVER_NAME)
+_reconciler = Reconciler(_driver)
 _reconciler.start_loop()
 
 _warm_pool = WarmPool(_DRIVER_NAME, _driver)
@@ -265,9 +259,6 @@ def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
 
-    if not _driver.capabilities().suspend_resume:
-        return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
-
     lease_id = None
     try:
         lease_id = db.acquire_lease(sid)
@@ -299,9 +290,6 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
-
-    if not _driver.capabilities().suspend_resume:
-        return 501, {"error": f"not supported by driver: {_DRIVER_NAME}"}
 
     lease_id = None
     try:

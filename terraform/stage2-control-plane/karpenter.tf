@@ -266,53 +266,16 @@ resource "null_resource" "karpenter_nodepools" {
           consolidationPolicy: WhenEmptyOrUnderutilized
           consolidateAfter: 1m
       ---
-      # EC2NodeClass for sandbox .metal nodes
-      apiVersion: karpenter.k8s.aws/v1
-      kind: EC2NodeClass
-      metadata:
-        name: kata-metal
-      spec:
-        amiSelectorTerms:
-          - alias: al2023@latest
-        role: ${aws_iam_role.karpenter_node.name}
-        subnetSelectorTerms:
-          - tags:
-              kubernetes.io/role/elb: "1"
-        securityGroupSelectorTerms:
-          - tags:
-              kubernetes.io/cluster/${var.cluster_name}: owned
-        blockDeviceMappings:
-          - deviceName: /dev/xvda
-            ebs:
-              volumeSize: 200Gi
-              volumeType: gp3
-      ---
-      apiVersion: karpenter.sh/v1
-      kind: NodePool
-      metadata:
-        name: kata-metal
-      spec:
-        template:
-          metadata:
-            labels:
-              sandbox: "true"
-          spec:
-            requirements:
-              - {key: node.kubernetes.io/instance-type, operator: In, values: ["${local.metal_type}"]}
-              - {key: kubernetes.io/arch, operator: In, values: ["${var.node_arch}"]}
-              - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
-            taints:
-              - {key: kata-dedicated, value: "true", effect: NoSchedule}
-            nodeClassRef:
-              group: karpenter.k8s.aws
-              kind: EC2NodeClass
-              name: kata-metal
-        disruption:
-          consolidationPolicy: WhenEmpty
-          consolidateAfter: 30m
-        limits:
-          cpu: "1024"
-          memory: 2Ti
+      # NOTE: 承载 sandbox 的 .metal 节点当前由 phase3 的托管节点组提供
+      #       (固定 desired，打 sandbox=true label，node-agent DaemonSet 直起裸 Firecracker)。
+      #       因此这里【不再】定义 sandbox 的 metal NodePool。
+      #
+      #       历史上曾有一个 `kata-metal` NodePool(带 kata-dedicated 污点，供 Kata pod 调度)，
+      #       随 Kata 后端移除已删除。
+      #
+      #       预留位:未来落地 spot 回收自动恢复(见 docs/spot-reclaim-recovery-design.md)时，
+      #       可在此新增一个【FC-only】的 metal NodePool —— 用于在 spot 节点被回收后，
+      #       同 AZ 快速拉起替补 .metal 节点承接跨机恢复(无 kata 污点，打 sandbox=true)。
       NODEPOOL
     EOT
   }

@@ -1,5 +1,8 @@
 # FlexAI Workshop 方案借鉴与优化 —— 含实现方式
 
+> 📌 **历史存档**:本文借鉴点部分基于当时的 Kata + `k8s/sandbox.yaml` 实现,而 **Kata driver 已从项目移除**
+> (当前为裸 Firecracker 单一后端)。借鉴思路(凭据隔离/节点自动化/生命周期等)仍有参考价值,但涉及 Kata/`k8s/sandbox.yaml` 的具体代码已不存在。仅作历史参考。
+
 > 来源:AWS Workshop《FlexAI Workshop: 基于 EKS & Graviton 部署 OpenClaw & Hermes 智能助理》
 > (`afba7f08-c987-40dc-afa5-da3e200ae7c5`)
 > 对照对象:本仓库 `POC-技术文档.md` 的 Claude Code 沙盒方案

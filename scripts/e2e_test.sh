@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # ---------- 参数解析 ----------
-DRIVER="kata"
+DRIVER="firecracker"
 API_URL=""
 CURL_EXTRA=""
 while [[ $# -gt 0 ]]; do
@@ -208,7 +208,7 @@ if [[ "$CODE" == "200" ]]; then
   STDOUT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('stdout',''))" 2>/dev/null || echo "")
   pass "POST /exec → 200 (stdout='$STDOUT')"
 else
-  # exec 在 Kata 下通过 kubectl exec,FC 下通过 SSH;若未配 SSH 则 skip
+  # exec 走 vsock（优先）+ SSH 兜底;若 rootfs 未配 vsock agent/SSH 则 skip
   info "exec returned $CODE (may be expected if SSH not configured)"
 fi
 
@@ -238,19 +238,6 @@ else
   info "suspend_resume=false (driver=$DRIVER_REPORTED), skip T10"
 fi
 
-# ---- T11: Kata suspend → 501 ----
-info "T11: Kata driver returns 501 for suspend"
-if [[ "$SUPPORTS_SR" == "False" ]]; then
-  call POST "/sandboxes/${SID}/suspend"
-  if [[ "$CODE" == "501" ]]; then
-    pass "suspend on Kata → 501 (correct)"
-  else
-    fail "Expected 501, got $CODE"
-  fi
-else
-  info "FC driver supports suspend, skip T11"
-fi
-
 # ---- T12: wait timeout ----
 info "T12: Wait endpoint with short timeout on nonexistent state"
 call GET "/sandboxes/${SID}/wait?state=nonexistent-state&timeout=3"
@@ -278,23 +265,6 @@ if [[ "$CODE" == "404" ]]; then
   pass "GET after destroy → 404"
 else
   fail "GET after destroy → $CODE (expected 404)"
-fi
-
-# ---- T15: Kata 节点 microVM 保真度验证 ----
-info "T15: Kata microVM fidelity (if Kata Pod accessible)"
-KATA_POD=$(kubectl get pods -l app=claude-sbx -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-if [[ -n "$KATA_POD" ]]; then
-  NPROC=$(kubectl exec "$KATA_POD" -- nproc 2>/dev/null || echo "")
-  KERNEL=$(kubectl exec "$KATA_POD" -- uname -r 2>/dev/null || echo "")
-  NODE_KERNEL=$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.kernelVersion}' 2>/dev/null || echo "")
-  if [[ "$KERNEL" != "$NODE_KERNEL" && -n "$KERNEL" ]]; then
-    pass "Kata guest kernel ($KERNEL) ≠ node kernel ($NODE_KERNEL) → true microVM"
-  else
-    info "Kata kernel check: guest=$KERNEL node=$NODE_KERNEL"
-  fi
-  [[ -n "$NPROC" ]] && pass "nproc=$NPROC (guest quota, not host)"
-else
-  info "No claude-sbx pods found, skip T15"
 fi
 
 # ---- 结果汇总 ----

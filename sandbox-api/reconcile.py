@@ -37,9 +37,8 @@ NODE_TTL_S        = int(os.environ.get("NODE_TTL_S", "90"))
 class Reconciler:
     """对账循环 + leader 选举。持一个 driver 引用做 runtime 探针。"""
 
-    def __init__(self, driver, driver_name: str):
+    def __init__(self, driver):
         self._driver      = driver
-        self._driver_name = driver_name
         # 唯一 owner id:主机名 + 随机后缀,区分同主机多副本
         self._owner       = f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
         self._is_leader   = False
@@ -83,10 +82,6 @@ class Reconciler:
     def reconcile_once(self) -> dict:
         """返回本次处置计数,便于测试/可观测。"""
         stats = {"checked": 0, "orphaned": 0, "needs_reschedule": 0, "ok": 0}
-
-        # 仅 FC 类 driver 有节点表/runtime 探针语义;Kata 交给 K8s reconcile
-        if not self._driver.capabilities().suspend_resume:
-            return stats
 
         active_ids = {n["node_id"] for n in db.list_active_nodes(NODE_TTL_S)}
         # node-agent 心跳里 node_id 可能是 hostname,而沙盒 record["node"] 存的是

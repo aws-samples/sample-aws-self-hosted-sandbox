@@ -1,8 +1,7 @@
 """
 Warm Pool — 对外隐藏冷启动,让 create 永远秒级完成。
 
-FC 模式:预先 suspend 一批空白沙盒,create = resume + 注入配置(~7ms)
-Kata 模式:交给 kubernetes-sigs/agent-sandbox SandboxWarmPool CRD 管理
+预先 suspend 一批空白沙盒,create = resume + 注入配置(~秒级),对外隐藏冷启动。
 
 使用方式:
   在控制面启动时 start_replenish_loop() 开始后台补充。
@@ -45,9 +44,6 @@ class WarmPool:
         尝试从暖池取一个沙盒并 resume,填充真实配置。
         成功返回 True(调用方跳过冷建);失败返回 False(调用方走冷建)。
         """
-        if not self._driver.capabilities().suspend_resume:
-            return False   # Kata 模式交给 SandboxWarmPool CRD,这里不干预
-
         warm_id = db.claim_warm_item(self._driver_name)
         if not warm_id:
             return False
@@ -88,9 +84,6 @@ class WarmPool:
     # ------------------------------------------------------------------
 
     def replenish(self) -> None:
-        if not self._driver.capabilities().suspend_resume:
-            return
-
         current = db.count_warm(self._driver_name)
         need    = POOL_SIZE - current
         if need <= 0:

@@ -1,18 +1,17 @@
 # Sandbox Control Plane
 
-统一沙盒控制面 API —— 后端可插拔(Firecracker / Kata)。
+统一沙盒控制面 API —— 后端为裸 Firecracker microVM（支持 suspend/resume 快照）。
 
 ## 目录结构
 
 ```
 sandbox-api/
   app.py            # HTTP API 服务(Fly Machines 风格接口)
-  driver.py         # SandboxDriver Protocol(抽象接口)
+  driver.py         # 共享数据模型 + Capabilities(SandboxSpec/ServiceSpec)
   db.py             # DynamoDB 封装(状态/lease/幂等/warm pool)
-  warm_pool.py      # 暖池(FC: 预快照; Kata: SandboxWarmPool CRD)
+  warm_pool.py      # 暖池(预快照 + resume 秒级 create)
   drivers/
     firecracker.py  # FirecrackerDriver → node-agent HTTP API
-    kata.py         # KataDriver → kubectl / K8s API
   Dockerfile        # 控制面镜像(arm64)
   smoke_test.py     # 本地冒烟测试(moto mock,无需真实 AWS)
 
@@ -30,13 +29,11 @@ node-agent/
 | GET | /sandboxes/{id} | 查单个 |
 | GET | /sandboxes/{id}/wait?state=running&timeout=30 | 等待状态 |
 | DELETE | /sandboxes/{id} | 销毁 |
-| POST | /sandboxes/{id}/suspend | 挂起+快照(FC only) |
-| POST | /sandboxes/{id}/resume | 从快照恢复(FC only) |
+| POST | /sandboxes/{id}/suspend | 挂起+快照 |
+| POST | /sandboxes/{id}/resume | 从快照恢复 |
 | POST | /sandboxes/{id}/exec | 在沙盒内执行命令 |
 | GET | /sandboxes/{id}/locate | 定位 VMM(调试) |
 | GET | /capabilities | 当前 driver 能力 |
-
-Kata driver 的 suspend/resume 返回 `501`(capability 模型)。
 
 ## 本地冒烟测试(无需 AWS)
 
@@ -44,7 +41,7 @@ Kata driver 的 suspend/resume 返回 `501`(capability 模型)。
 pip install "moto[dynamodb]" boto3
 cd <project-root>
 python3 sandbox-api/smoke_test.py
-# 期望: 19/19 PASS
+# 期望: 全部 PASS
 ```
 
 ## 部署到 EKS
@@ -79,18 +76,14 @@ terraform apply \
 ### 4. 端到端测试
 
 ```bash
+# 需 .metal 节点 + node-agent 就绪
 bash scripts/e2e_test.sh
-# Kata driver:
-bash scripts/e2e_test.sh --driver kata
-# FC driver(需 .metal 节点 + node-agent 就绪):
-bash scripts/e2e_test.sh --driver firecracker
 ```
 
 ## 关键环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| SANDBOX_DRIVER | kata | `firecracker` \| `kata` |
 | DYNAMODB_TABLE | sandboxes | 主状态表名 |
 | AWS_REGION | us-east-1 | |
 | SANDBOX_IMAGE | (必填) | 沙盒容器镜像 |

@@ -61,14 +61,7 @@ variable "node_agent_image" {
   description = "ECR URL for node-agent image"
 }
 
-# B2(FirecrackerDriver): driver 选择,默认 kata;FC 模式传 firecracker
-variable "sandbox_driver" {
-  type        = string
-  description = "Sandbox backend driver: kata | firecracker"
-  default     = "kata"
-}
-
-# B2: FC 模式下控制面访问 node-agent 的节点内网 IP(逗号分隔)
+# 控制面访问 node-agent 的节点内网 IP(逗号分隔)
 variable "fc_nodes" {
   type        = string
   description = "Comma-separated private IPs of metal nodes running node-agent (firecracker mode)"
@@ -473,7 +466,6 @@ resource "kubernetes_config_map" "control_plane" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
   data = {
-    SANDBOX_DRIVER        = var.sandbox_driver # B2: 可传 firecracker
     DYNAMODB_TABLE        = local.dynamodb_table
     DYNAMODB_EVENTS_TABLE = local.dynamodb_events
     DYNAMODB_TAPIDX_TABLE = local.dynamodb_tap_idx
@@ -483,7 +475,6 @@ resource "kubernetes_config_map" "control_plane" {
     SANDBOX_IMAGE         = var.sandbox_image
     LITELLM_URL           = var.litellm_url
     SANDBOX_DOMAIN        = var.sandbox_domain
-    KATA_RUNTIME_CLASS    = "kata-qemu"
     K8S_NAMESPACE         = "default"
     SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
     WARM_POOL_SIZE        = tostring(var.warm_pool_size)
@@ -686,11 +677,6 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             path = "/opt/sbx"
             type = "DirectoryOrCreate"
           }
-        }
-        toleration {
-          key      = "kata-dedicated"
-          operator = "Exists"
-          effect   = "NoSchedule"
         }
       }
     }

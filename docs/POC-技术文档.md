@@ -1,5 +1,8 @@
 # 在 AWS 上自建 Claude Code 沙盒平台 — POC 技术文档
 
+> 📌 **历史存档**:本文记录 POC 期的技术调研与选型,含 Kata-on-EKS 编排(H3)等**已从项目移除**的方案。
+> Kata driver 因无法快照/恢复已删除,当前项目为裸 Firecracker 单一后端(见 README.md)。此文仅作历史参考,不再回改。
+
 > 目标读者:负责在 AWS 上搭建最小可行原型(POC)、验证可行性的工程师
 > 版本日期:2026-06-11
 > 背景:客户现用 Fly.io(Firecracker microVM on bare metal)+ JuiceFS + S3 运行 Claude Code agent,遇到成本与扩展性问题,希望迁移到 AWS 自建。已排除 E2B-on-AWS(运维过重)与 AWS AgentCore(无法自定义镜像/任意端口/24×7)。

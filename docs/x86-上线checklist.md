@@ -1,5 +1,8 @@
 # Intel x86(amd64)上线 Checklist
 
+> 📌 **历史存档**:本文含 Kata Pod / `k8s/sandbox.yaml` 等**已从项目移除**的步骤(Kata driver 已删除,
+> 当前为裸 Firecracker 单一后端)。x86 架构切换本身(`node_arch=amd64`)仍有效,但涉及 Kata 的步骤已不适用。仅作历史参考。
+
 把 sandbox 从 Graviton(arm64)切到 Intel x86(amd64)的完整步骤。设计为 `node_arch` 参数化二选一,默认机型 `c5n.metal`(最便宜的主流 Intel x86 裸金属,72 vCPU/192 GiB)。
 
 > 背景与代码改动范围见 `terraform/README.md` 的"选择 CPU 架构"小节。本文是按顺序执行的操作手册。

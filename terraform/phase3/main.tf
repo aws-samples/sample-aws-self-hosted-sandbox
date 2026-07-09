@@ -1,7 +1,7 @@
-# Phase 3 基础设施 —— EKS 集群 + .metal 托管节点组(验 H3:Kata 编排 + 任意端口)
+# Phase 3 基础设施 —— EKS 集群 + .metal 托管节点组(裸 Firecracker 沙盒节点 + 持久状态 EBS)
 #
 # 目标:用 Terraform 管理 EKS 控制平面 + 一个 .metal 节点组(打 sandbox=true label)。
-#       Kata 安装、RuntimeClass、ingress-nginx、ACM、测试 Pod 是集群内操作(kubectl/helm),不归此处。
+#       控制面 / node-agent / LiteLLM 等集群内资源由 stage2-control-plane 部署,不归此处。
 #
 # 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或 amd64(Intel x86 c5n.metal)。
 #       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
@@ -160,15 +160,9 @@ module "eks" {
     }
   }
 
-  # 托管节点组:集群【系统节点】—— 跑控制面 / ingress-nginx / LiteLLM / Karpenter controller。
-  #
-  # ⚠️ 架构说明（方案 A）：本节点组【不】承载 sandbox，因此【不打 sandbox=true label】。
-  #    sandbox 由 Karpenter 的 kata-metal NodePool（Step 7，UserData 预装 Kata）承载。
-  #    控制面 KataDriver 创建的 sandbox pod 用 nodeSelector sandbox=true，只会落到
-  #    Karpenter 起的、带 sandbox=true + katacontainers.io/kata-runtime=true 的 .metal 节点。
-  #
-  #    本组用 .metal 仅因 POC 早期需要它引导集群；纯系统节点其实无需裸金属，
-  #    可把 metal_instance_type 改小（如 c6g.xlarge）显著省成本——改小后系统组件照常运行。
+  # 托管 .metal 节点组:既跑系统组件（控制面 / LiteLLM），也【承载 sandbox】——
+  #   打 sandbox=true label，让 node-agent DaemonSet 调度上来，在本机直起裸 Firecracker microVM。
+  #   挂持久状态 EBS（/dev/sdf → /var/lib/sbx），存内存快照（base + Diff），spot 疏散跨机恢复。
   eks_managed_node_groups = {
     "metal_${var.node_arch}" = {
       ami_type       = local.node_arch_cfg.ami_type
@@ -290,9 +284,7 @@ module "eks" {
       EOT
       }]
 
-      # B2(FirecrackerDriver 模式): 本组承载 sandbox(裸 Firecracker microVM),
-      # 打 sandbox=true 让 node-agent DaemonSet 调度上来。
-      # (kata 模式下本组是纯系统节点不打此 label;B2 改为兼作沙盒节点)
+      # 本组承载 sandbox(裸 Firecracker microVM),打 sandbox=true 让 node-agent DaemonSet 调度上来。
       labels = {
         role    = "system"
         sandbox = "true"

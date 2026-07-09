@@ -1,11 +1,14 @@
 # POC 实测结果 —— H1 / H3 / H4 + 快照 + 文件系统
 
+> 📌 **历史存档**:本文是 POC 各阶段的实测记录(某时间点快照),含 Kata 编排(H3)等**已从项目移除**的方案。
+> Kata driver 因无法快照/恢复已删除,当前项目为裸 Firecracker 单一后端(见 README.md)。此文仅作历史参考,不再回改。
+
 > 实测日期:2026-06-11 ~ 06-12 · 区域:us-east-1 · 验证方式:全程经 AWS SSM
 > 机型:H1/H4/快照初轮用 `c7g.metal`,H3/JuiceFS/跨机轮用 `c6g.metal`(两者同为 Graviton 64vCPU/128GiB,结论通用)
 > 基础设施由 `terraform/phase1`(单机)与 `terraform/phase3`(EKS)创建
 >
-> **相关专题文档**:文件系统对比见 `文件系统方案对比.md`;快照存储架构见 `快照存储架构.md`;
-> Kata 快照定位见 `Kata快照定位机制.md`。本文件汇总各轮实测的核心数字与结论。
+> **相关专题文档**:文件系统对比见 `文件系统方案对比.md`;快照存储架构见 `快照存储架构.md`。
+> 本文件汇总各轮实测的核心数字与结论。
 
 ## 一、H1 —— Claude Code 在 Firecracker microVM 内原生跑通(✅ 通过)
 
@@ -86,35 +89,6 @@
 - 基础设施:`terraform/phase1/`(`terraform apply` 重建)
 - 主机准备:`scripts/setup-host.sh`(装 Firecracker / 取内核 / 构建 rootfs / 配 TAP,已验证)
 - 主机内验证/压测脚本:`/opt/sbx-setup.sh`、`/opt/run-vm-test2.sh`、`/opt/stress-big.sh`(在实例上)
-
-## 四点五、H3 —— EKS + Kata 编排 + 任意端口(✅ 通过)
-
-用 Terraform(官方 `terraform-aws-modules/eks` + `vpc`)创建 EKS 1.31 + Graviton `c7g.metal` 托管节点组,装 Kata 3.31.0,部署 Claude Code 沙盒 Pod,端到端验证三要素。
-
-**最终验证结果:**
-
-| H3 要素 | 实测 | 结论 |
-|---|---|---|
-| (a) 自定义镜像 | Pod `runtimeClassName: kata-qemu` + 自建 ECR 镜像 `claude-sbx:poc` 正常拉起 | ✅ |
-| microVM 保真度 | guest `kernel=6.18.28`(节点是 `6.1.172`,**完全不同**)、`nproc=1`(自己的配额)、独立 inotify=16052 | ✅ 真 microVM,非共享宿主内核 |
-| Claude Code | `2.1.173` 在 Kata Pod 内就绪 | ✅ |
-| (b) 任意端口 | 沙盒内起 8080 dev server,经**共享 ingress-nginx(单 NLB)按 Host 头 `8080-sbx1.sbx.example.com` 路由**,集群内访问返回沙盒内容 | ✅ 3.4 节方案验证可行 |
-| (c) 24×7 | Pod `Running` 无 TTL,长驻 | ✅ |
-
-> 端口暴露:集群内经 ingress Host 路由已验证打通(`hello from kata microVM sandbox`)。外部 NLB 那一跳因测试机出口 IP 被 NLB 安全组挡未直连,生产配好 Route53 通配符 DNS + 安全组即通——路由机制本身已证明。
-
-**过程中暴露的真实坑(对客户决策有价值):**
-
-1. **EIP 配额坑(共享账号典型)**:默认私有子网 + NAT 方案,NAT 需 EIP。本账号 EIP 配额 5 却已被无关资源占满 16 个 → `AddressLimitExceeded` → NAT 建不成 → 节点无法出网 → **join 失败(`NodeCreationFailure`)**。
-   - **修复**:节点组改公有子网 + 公网 IP、禁用 NAT。生产应提前申请 EIP 配额,或用 VPC Endpoint 让私有子网免 NAT 访问 ECR/S3/EKS。
-2. **`.metal` 节点启动慢**:Graviton `.metal` cloud-init 实测 **~606 秒(10 分钟)**,EKS 节点组创建总耗时远超普通实例。→ 印证"裸金属需 warm buffer",Karpenter 扩容要预留缓冲。
-3. **Kata `kata-clh`(Cloud Hypervisor)shim 默认未注册(R2 实锤)**:kata-deploy 3.31.0 helm chart 默认只把 **qemu 系列** runtime 写进 containerd drop-in,**没写 `kata-clh`**——RuntimeClass `kata-clh` 存在但 containerd 无对应 handler,Pod 报 `no runtime for "kata-clh" is configured`。
-   - **回退(已验证)**:改用 **`kata-qemu`**,保真度与 clh 完全相同(都是真 guest 内核),仅启动稍慢。这正是文档 R2 早写好的预案。
-   - **生产**:若要 clh(virtio-fs/热插拔),需在 kata-deploy values 显式启用 clh shim 并确认其 containerd 配置写入。**arm64 + clh 的开箱可用性确实不如 qemu**,选型时纳入。
-4. **节点网络重建会让 Pod 短暂 NotReady**:Terraform 改子网/重建节点组时,运行中的节点会经历 unreachable→恢复;生产变更网络需滚动、避开业务高峰。
-5. **Kata Pod 需设 resources**:`BestEffort`(无 requests/limits)的 Kata Pod 实测不稳定(Exit 9 / CrashLoopBackOff);设明确 `requests/limits`(2vCPU/4Gi)后稳定 0 重启。沙盒模板必须带资源声明。
-6. **kata-deploy DaemonSet 在 c6g.metal 上致节点 hang + ASG 替换循环(★第二轮实测确证,已弃用 kata-deploy)**:照 README 早期用 `helm install kata-deploy` 后,c6g.metal + AL2023(containerd 2.2.3) 节点 kubelet 失联,`uptime -s` 证实**整个裸金属节点 hang ~12 分钟后才重新开机**。SSM journalctl 定位:**containerd 重启本身仅 200ms 不慢**,是在【已运行 kubelet+多容器】的 metal 节点上重启 containerd 留下孤儿 shim → 节点级挂死;期间 EC2 reachability 失败 → 托管节点组 ASG 反复替换节点(实测连换 105→49→225 三个),**与 c6g/c7g 机型无关**。
-   - **根治 = 方案 A(已验证)**:不用 kata-deploy DaemonSet;改由 Karpenter `EC2NodeClass.userData` 在节点 **bootstrap 阶段(kubelet 注册前)预装 kata**(kata-static-*.tar.zst 解压 + containerd v2 drop-in + restart)。此时容器为空、EKS 还看不到节点,containerd 重启瞬时完成。实测新 c6g.metal 节点 **30-60s Ready、零抖动、零替换**,e2e ALL TESTS PASSED。详见 `部署验证日志-2026-06-14.md` 与 README.md Step 3/7。
 
 ## 四点六、H2 文件系统(JuiceFS)—— 已实测(详见 `文件系统方案对比.md`)
 
