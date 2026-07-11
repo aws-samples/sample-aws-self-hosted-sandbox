@@ -339,6 +339,36 @@ def write_event(sandbox_id: str, event: str, prev_state: str, detail: dict | Non
     })
 
 
+def list_events(sandbox_id: str | None = None, limit: int = 100) -> list[dict]:
+    """
+    读事件历史,供 Dashboard 时间线展示。
+      - sandbox_id 给定 → query 单沙盒事件(走主键 id,最新在前)。
+      - sandbox_id 为空 → 全局时间线:全表 scan 后按 ts 倒序取 limit 条
+        (POC 规模数百沙盒 × 少量事件可接受;量大后应建 GSI 或改按时间分区,
+         同 list_by_states 的取舍)。
+    """
+    if sandbox_id:
+        resp = _ev().query(
+            KeyConditionExpression="id = :i",
+            ExpressionAttributeValues={":i": sandbox_id},
+            ScanIndexForward=False,  # ts 倒序,最新在前
+            Limit=limit,
+        )
+        return [_from_dynamo(i) for i in resp.get("Items", [])]
+
+    items: list[dict] = []
+    kwargs: dict = {}
+    while True:
+        resp = _ev().scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    items.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return [_from_dynamo(i) for i in items[:limit]]
+
+
 # ---------- 内部工具 ----------
 
 def _utcnow() -> str:

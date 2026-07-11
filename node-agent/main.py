@@ -578,7 +578,10 @@ def op_resume(body: dict) -> dict:
     tap_idx    = int(body["tap_idx"])
     s3_prefix  = body.get("s3_prefix", "")
 
-    # 若本地无快照文件，从 S3 拉回(方案C 主路径不走 S3,卷已 attach;此为兜底)
+    # 兜底:若本地无快照文件且传了 s3_prefix,从 S3 拉回。
+    # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
+    # s3_prefix 恒为空 → 这段兜底当前【不会触发】,为未来可选的 S3 归档预留。
+    # 现实的跨机恢复靠持久状态 EBS 卷幸存 + attach 到新节点(卷已 attach 则本地就有快照)。
     if not os.path.exists(f"{snap_dir}/vm.snapshot") and s3_prefix:
         _s3_download(s3_prefix, snap_dir)
 

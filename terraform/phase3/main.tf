@@ -56,6 +56,12 @@ variable "metal_instance_type" {
   description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜的 Intel x86 裸金属)。"
 }
 
+variable "metal_node_count" {
+  type        = number
+  default     = 1
+  description = ".metal 节点常驻台数(min=max=desired)。成本优先默认 1 台(单机可测全生命周期);跨机快照/spot 疏散演示需设为 2。"
+}
+
 locals {
   # 架构派生:AMI 类型、默认 .metal 机型、Firecracker/内核下载用的架构标识(uname -m 风格)
   arch_cfg = {
@@ -167,10 +173,12 @@ module "eks" {
     "metal_${var.node_arch}" = {
       ami_type       = local.node_arch_cfg.ami_type
       instance_types = [local.metal_type]
-      # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化
-      min_size     = 2
-      max_size     = 2
-      desired_size = 2
+      # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化。
+      # 成本优先的单机 demo:降到 1 台(单机可测 create/exec/suspend/resume/destroy 全流程,
+      # 仅跨机快照/spot 疏散演示需要 2 台)。由 metal_node_count 变量控制,默认 1。
+      min_size     = var.metal_node_count
+      max_size     = var.metal_node_count
+      desired_size = var.metal_node_count
 
       # 方案C:两台节点必须【同一 AZ】—— EBS 状态卷不能跨 AZ attach。
       # 钉死到单个 AZ 的公有子网(public_subnets[0] = azs[0] = us-east-1a),否则 EKS 会把两台

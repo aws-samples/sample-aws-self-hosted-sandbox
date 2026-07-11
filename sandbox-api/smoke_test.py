@@ -316,6 +316,24 @@ class TestDB(unittest.TestCase):
         # 已被 claim,再取应返回 None
         self.assertIsNone(db.claim_warm_item("firecracker"))
 
+    @mock_aws
+    def test_list_events_single_and_global(self):
+        _create_tables()
+        from sandbox_api import db
+        db.write_event("sbxA", "created", "creating")
+        db.write_event("sbxA", "suspended", "running", {"snapshot_size_bytes": 1024})
+        db.write_event("sbxB", "created", "creating")
+
+        # 单沙盒:只返回该沙盒事件,最新在前
+        a = db.list_events("sbxA")
+        self.assertEqual({e["id"] for e in a}, {"sbxA"})
+        self.assertEqual(a[0]["event"], "suspended")
+
+        # 全局:跨沙盒,按 ts 倒序,limit 生效
+        g = db.list_events(limit=2)
+        self.assertEqual(len(g), 2)
+        self.assertEqual({e["id"] for e in db.list_events()}, {"sbxA", "sbxB"})
+
 
 class TestFirecrackerDriver(unittest.TestCase):
     """FirecrackerDriver + node-agent stub 集成测试。"""
@@ -516,6 +534,98 @@ class TestAPIEndToEnd(unittest.TestCase):
             self.assertEqual(r1["id"], r2["id"])
         finally:
             srv.shutdown()
+
+class TestAdminAggregates(unittest.TestCase):
+    """portal Dashboard 用的只读聚合 endpoint(/admin/*)。"""
+
+    def _call(self, port, method, path, body=None, api_key=None):
+        url  = f"http://127.0.0.1:{port}{path}"
+        data = json.dumps(body).encode() if body else None
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def _start_api(self):
+        from sandbox_api import app as app_module
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        from http.server import ThreadingHTTPServer
+        app_module._driver = FirecrackerDriver()
+        app_module._warm_pool.claim = lambda *a, **kw: False
+        srv  = ThreadingHTTPServer(("127.0.0.1", 0), app_module.Handler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        time.sleep(0.1)  # nosemgrep: arbitrary-sleep -- 测试:等后台 HTTP server 线程绑定端口
+        return srv, port
+
+    @mock_aws
+    def test_admin_views(self):
+        _create_tables()
+        from sandbox_api import db
+        # 跨租户造数据:两个不同 tenant 的沙盒 + 一个暖池 + 节点心跳 + 事件
+        db.put({"id": "s1", "tenant_id": "t1", "state": "running",
+                "driver": "firecracker", "updated_at": db._utcnow()})
+        db.put({"id": "s2", "tenant_id": "t2", "state": "suspended",
+                "driver": "firecracker", "updated_at": db._utcnow()})
+        db.put({"id": "w1", "tenant_id": "__pool__", "state": "warm",
+                "driver": "firecracker", "pool_state": "warm",
+                "updated_at": db._utcnow()})
+        db.heartbeat_node("nodeA", "10.0.1.5", 90000, 2)
+        db.write_event("s1", "created", "creating")
+
+        srv, port = self._start_api()
+        try:
+            # /admin/sandboxes:跨租户全部可见(单租户 GET /sandboxes 做不到)
+            code, body = self._call(port, "GET", "/admin/sandboxes")
+            self.assertEqual(code, 200)
+            self.assertEqual({s["id"] for s in body["sandboxes"]}, {"s1", "s2", "w1"})
+
+            # /admin/nodes
+            code, body = self._call(port, "GET", "/admin/nodes")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["nodes"][0]["node_id"], "nodeA")
+
+            # /admin/stats:计数 + 内存 + 暖池水位
+            code, body = self._call(port, "GET", "/admin/stats")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["total_sandboxes"], 3)
+            self.assertEqual(body["by_state"]["running"], 1)
+            self.assertEqual(body["node_count"], 1)
+            self.assertEqual(body["cluster_free_mem_mib"], 90000)
+            self.assertEqual(body["warm_pool"], 1)
+
+            # /admin/events
+            code, body = self._call(port, "GET", "/admin/events?id=s1")
+            self.assertEqual(code, 200)
+            self.assertEqual(body["events"][0]["event"], "created")
+        finally:
+            srv.shutdown()
+
+    @mock_aws
+    def test_admin_requires_admin_key(self):
+        _create_tables()
+        import sandbox_api.app as app_module
+        app_module._API_KEYS = {"tenant-key"}
+        app_module._KEY_TENANT = {"tenant-key": "t1"}  # 非 default → 非 admin
+        app_module._ALLOW_UNAUTH = False
+        try:
+            srv, port = self._start_api()
+            try:
+                # 非 admin key → 403
+                code, _ = self._call(port, "GET", "/admin/sandboxes", api_key="tenant-key")
+                self.assertEqual(code, 403)
+            finally:
+                srv.shutdown()
+        finally:
+            app_module._API_KEYS = set()
+            app_module._KEY_TENANT = {}
+            app_module._ALLOW_UNAUTH = True
+
 
 class TestWarmPool(unittest.TestCase):
     """WarmPool replenish + claim 路径。"""
@@ -789,7 +899,7 @@ if __name__ == "__main__":
     suite  = unittest.TestSuite()
 
     for cls in [TestDB, TestFirecrackerDriver,
-                TestAPIEndToEnd, TestWarmPool, TestAPIAuth,
+                TestAPIEndToEnd, TestAdminAggregates, TestWarmPool, TestAPIAuth,
                 TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
