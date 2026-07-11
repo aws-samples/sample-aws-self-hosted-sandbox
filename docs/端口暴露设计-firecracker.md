@@ -195,3 +195,12 @@ tap 网段），再由它转进 guest。
 
 > Portal 本地运行(无 NLB)时,`/api/cluster` 的 BFF 把空 `proxy_base` 回退为控制面地址
 > (`SANDBOX_API_URL`,port-forward 的 `http://localhost:18000`),使终端/Web 链接指向控制面而非 Portal 自身。
+
+### 文件上传/下载
+- guest 文件系统只能经 exec 通道访问(node-agent 在 microVM 外),故走 **base64 over exec**:
+  - 上传 `PUT /sandboxes/{id}/files?path=` body `{content_b64}` → guest 内 `mkdir -p + base64 -d > path`。
+  - 下载 `GET /sandboxes/{id}/files?path=` → guest 内 `base64 path` → 返回 `{content_b64}`。
+- path 用 `shlex.quote` 防注入;`MAX_FILE_BYTES`(默认 10MB)限大小。适合中小文件(代码/产物/配置);
+  大文件应走端口暴露 + guest 内 http。
+- Portal 详情页"文件传输"卡片:浏览器 File API 读文件→base64→PUT;下载则 GET→解码→Blob 触发保存。
+- 真机验证:含中文(UTF-8)+ 二进制字节的文件上传下载往返一致;不存在文件 404。

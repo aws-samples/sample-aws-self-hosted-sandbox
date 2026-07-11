@@ -7,6 +7,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { Timeline } from "@/components/Timeline";
 import { ApiResponseViewer } from "@/components/ApiResponseViewer";
 import { ExposedServices } from "@/components/ExposedServices";
+import { FileTransfer } from "@/components/FileTransfer";
 import { fmtBytes, fmtMib, fmtSecs, fmtTime } from "@/lib/format";
 import { demoWebCommand } from "@/lib/demoWeb";
 import { termServerCommand, TERMINAL_PORT } from "@/lib/termServer";
@@ -243,6 +244,13 @@ export default function SandboxDetailPage() {
               allowAllPorts={allowAllPorts}
               exposeToken={exposeToken}
             />
+          </div>
+
+          <div className="card" style={{ marginTop: 14 }}>
+            <div className="section-title" style={{ marginTop: 0 }}>
+              文件传输
+            </div>
+            <FileTransfer sid={id} running={sb?.state === "running"} />
           </div>
 
           {lastCall ? (

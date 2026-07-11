@@ -494,6 +494,66 @@ def exec_sandbox(sid: str, cmd: str, caller_tenant: str | None = None) -> tuple[
     }
 
 
+# ---------- 文件上传/下载(#2)----------
+# 走 exec 通道(base64 传输落 guest 文件系统):node-agent 在 microVM 外,访问 guest 文件
+# 只能经 exec。base64 避二进制在 shell/JSON 里的转义问题。适合中小文件(demo/代码/产物);
+# 大文件应走端口暴露 + guest 内 http。
+
+import base64 as _b64
+import shlex as _shlex
+
+# 单文件大小上限(base64 over exec,过大易超时/占内存)。可用 env 调整。
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(10 * 1024 * 1024)))  # 10MB
+
+
+def upload_file(sid: str, path: str, content_b64: str,
+                caller_tenant: str | None = None) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
+    try:
+        raw = _b64.b64decode(content_b64, validate=True)
+    except Exception:
+        return 400, {"error": "content_b64 not valid base64"}
+    if len(raw) > MAX_FILE_BYTES:
+        return 413, {"error": f"file too large (> {MAX_FILE_BYTES} bytes)"}
+    # 在 guest 内:建父目录 + base64 解码写入。path 用 shlex 防注入。
+    qpath = _shlex.quote(path)
+    cmd = (f"mkdir -p \"$(dirname {qpath})\" && "
+           f"printf %s {_shlex.quote(content_b64)} | base64 -d > {qpath} && "
+           f"echo OK $(wc -c < {qpath})")
+    rc, stdout, stderr = _driver.exec(sid, record, cmd)
+    if rc != 0:
+        return 500, {"error": "write failed", "stderr": stderr}
+    return 200, {"id": sid, "path": path, "bytes": len(raw), "result": stdout.strip()}
+
+
+def download_file(sid: str, path: str,
+                  caller_tenant: str | None = None) -> tuple[int, dict]:
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
+    qpath = _shlex.quote(path)
+    # 先校验存在 + 大小,再 base64 输出(避免把超大文件读进内存)
+    cmd = (f"test -f {qpath} || {{ echo __NOFILE__; exit 3; }}; "
+           f"sz=$(wc -c < {qpath}); "
+           f"if [ \"$sz\" -gt {MAX_FILE_BYTES} ]; then echo __TOOBIG__; exit 4; fi; "
+           f"base64 {qpath}")
+    rc, stdout, stderr = _driver.exec(sid, record, cmd)
+    if "__NOFILE__" in stdout:
+        return 404, {"error": "file not found in sandbox", "path": path}
+    if "__TOOBIG__" in stdout:
+        return 413, {"error": f"file too large (> {MAX_FILE_BYTES} bytes)"}
+    if rc != 0:
+        return 500, {"error": "read failed", "stderr": stderr}
+    # stdout 是 base64(可能含换行),原样回;前端解码。
+    return 200, {"id": sid, "path": path, "content_b64": stdout.strip()}
+
+
 def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, dict]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -672,13 +732,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(500, {"error": str(e)})
 
+    def do_PUT(self):
+        # /s/ 反代优先;否则走鉴权 + PUT 业务(文件上传)
+        if self._maybe_proxy():
+            return
+        if not _check_auth(self):
+            return
+        try:
+            self._handle_put()
+        except Exception as e:
+            self._send(500, {"error": str(e)})
+
     # web 应用常用的其余 method —— 仅服务 /s/ 反代
     def _proxy_only(self):
         if self._maybe_proxy():
             return
         self._send(404, {"error": "not found"})
 
-    do_PUT     = _proxy_only
     do_PATCH   = _proxy_only
     do_OPTIONS = _proxy_only
     do_HEAD    = _proxy_only
@@ -745,6 +815,14 @@ class Handler(BaseHTTPRequestHandler):
                 state = _driver.get_runtime_state(sid, record)
                 return self._send(200, {**record, "runtime_state": state})
 
+            # GET /sandboxes/{id}/files?path=/abs/path  下载(返回 content_b64)
+            if len(p) == 3 and p[2] == "files":
+                path = (self._qs().get("path") or [""])[0]
+                if not path:
+                    return self._send(400, {"error": "missing ?path="})
+                code, result = download_file(sid, path, _get_caller_tenant(self))
+                return self._send(code, result)
+
             # GET /sandboxes/{id}
             record = db.get(sid)
             if record:
@@ -772,6 +850,8 @@ class Handler(BaseHTTPRequestHandler):
                 "GET    /admin/events?id=&limit=",
                 "GET    /admin/cluster",
                 "ANY    /s/{id}/{port}/{path}  (sandbox port proxy)",
+                "PUT    /sandboxes/{id}/files?path=  (upload, body: content_b64)",
+                "GET    /sandboxes/{id}/files?path=  (download → content_b64)",
             ],
         })
 
@@ -809,6 +889,21 @@ class Handler(BaseHTTPRequestHandler):
         if len(p) == 2 and p[0] == "sandboxes":
             ct = _get_caller_tenant(self)
             code, result = destroy_sandbox(p[1], ct)
+            return self._send(code, result)
+        self._send(404, {"error": "not found"})
+
+    def _handle_put(self):
+        p = self._parts()
+        # PUT /sandboxes/{id}/files?path=/abs/path  body: {content_b64}  上传
+        if len(p) == 3 and p[0] == "sandboxes" and p[2] == "files":
+            path = (self._qs().get("path") or [""])[0]
+            if not path:
+                return self._send(400, {"error": "missing ?path="})
+            body = self._body()
+            content_b64 = body.get("content_b64", "")
+            if not content_b64:
+                return self._send(400, {"error": "missing content_b64"})
+            code, result = upload_file(p[1], path, content_b64, _get_caller_tenant(self))
             return self._send(code, result)
         self._send(404, {"error": "not found"})
 

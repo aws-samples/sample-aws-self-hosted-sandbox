@@ -200,12 +200,19 @@ curl -s -X POST $BASE_URL/sandboxes/{id}/resume
 # Destroy
 curl -s -X DELETE $BASE_URL/sandboxes/{id}
 
-# Port exposure (vibe coding / web preview): declare services on create, reach the in-VM service via proxy
-curl -s -X POST $BASE_URL/sandboxes -d '{"cpu":1,"mem_mib":512,"services":[{"port":8080}]}'
+# Port exposure (vibe coding / web preview): ANY port, reach the in-VM service via proxy
 # ANY /s/{id}/{port}/{path}  → proxied into the guest. Path-based routing, so multiple
 # sandboxes can expose the SAME internal port (two sandboxes on :80 never collide).
+# Any port works by default (ALLOW_ALL_PORTS); WebSocket tunneling supported (Vite HMR / terminal).
 # Chain: NLB → ingress-nginx → control-plane proxy → node-agent → guest. Uses the NLB's
 # own hostname (no custom DNS). Enable it in docs/deploy.md Step 6.5.
+# Optional auth: set EXPOSE_TOKEN → access needs ?token=.
+
+# Interactive Web Terminal: Portal detail page "打开终端" starts a PTY-over-WebSocket term in-guest (xterm.js).
+
+# File upload / download (base64 over exec, small files ≤10MB)
+curl -s -X PUT "$BASE_URL/sandboxes/{id}/files?path=/root/app.py" -d '{"content_b64":"..."}'
+curl -s "$BASE_URL/sandboxes/{id}/files?path=/root/out.txt"   # → {"content_b64":"..."}
 
 [Cleanup]
 ACCT=$(aws sts get-caller-identity --query Account --output text)
