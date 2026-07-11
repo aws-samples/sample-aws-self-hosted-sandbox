@@ -6,18 +6,30 @@ import Link from "next/link";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Timeline } from "@/components/Timeline";
 import { ApiResponseViewer } from "@/components/ApiResponseViewer";
+import { ExposedServices } from "@/components/ExposedServices";
 import { fmtBytes, fmtMib, fmtSecs, fmtTime } from "@/lib/format";
-import type { ApiCallResult, Sandbox, SandboxEvent } from "@/lib/types";
+import type { ApiCallResult, ClusterInfo, Sandbox, SandboxEvent } from "@/lib/types";
 
 export default function SandboxDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const [sb, setSb] = useState<Sandbox | null>(null);
   const [events, setEvents] = useState<SandboxEvent[]>([]);
+  const [proxyBase, setProxyBase] = useState("");
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [lastCall, setLastCall] = useState<ApiCallResult | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+
+  // 集群信息(NLB hostname)只取一次,用于拼接端口暴露 URL。
+  useEffect(() => {
+    fetch("/api/cluster", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (j?.ok && j.body) setProxyBase((j.body as ClusterInfo).proxy_base || "");
+      })
+      .catch(() => {});
+  }, []);
 
   const refresh = useCallback(async () => {
     const [r1, r2] = await Promise.all([
@@ -165,6 +177,18 @@ export default function SandboxDetailPage() {
               <dt>快照耗时</dt>
               <dd>{fmtSecs(sb?.snapshot_create_time_s)}</dd>
             </dl>
+          </div>
+
+          <div className="card" style={{ marginTop: 14 }}>
+            <div className="section-title" style={{ marginTop: 0 }}>
+              公开服务(端口暴露)
+            </div>
+            <ExposedServices
+              sid={id}
+              services={sb?.services}
+              proxyBase={proxyBase}
+              running={sb?.state === "running"}
+            />
           </div>
 
           {lastCall ? (

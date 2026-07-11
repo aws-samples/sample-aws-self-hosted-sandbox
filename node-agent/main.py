@@ -1089,6 +1089,22 @@ def start_reclaim_watch_loop() -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
+# ---------- 入站反代(端口暴露)----------
+# guest IP(172.18.{tap_idx}.2)只在本 metal 节点本地可达(tap /30 子网),集群其它 pod
+# 路由不到。故由控制面 sandbox-proxy 把请求先转到本节点 node-agent(hostNetwork,能访问
+# 本机 tap 网段),再由这里应用层反代进 guest 的目标端口。
+# 用应用层反代而非 iptables DNAT:无需管理宿主端口分配 → 天然支持"多沙盒同一内部端口"
+# (两个 guest 各自 172.18.A.2:80 / 172.18.B.2:80,靠 sid 区分,不抢宿主端口)。
+
+def _guest_ip_for(sid: str) -> str | None:
+    """查本节点 running 沙盒的 guest IP;不存在/非 running 返回 None。"""
+    with _LOCK:
+        vm = _VMS.get(sid)
+        if vm and vm.get("state") == "running":
+            return vm.get("ip")
+    return None
+
+
 # ---------- HTTP handler ----------
 
 def _check_caller_allowed(client_ip: str) -> bool:
@@ -1132,8 +1148,69 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    # ---------- 入站反代:/proxy/{sid}/{port}/{rest...} → guest {ip}:{port}/{rest} ----------
+    def _maybe_proxy(self) -> bool:
+        """若 path 命中 /proxy/{sid}/{port}/...,反代到 guest 并返回 True;否则返回 False。"""
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 3 or parts[0] != "proxy":
+            return False
+        sid, port_s = parts[1], parts[2]
+        rest = "/".join(parts[3:])
+        qs = f"?{parsed.query}" if parsed.query else ""
+        upstream_path = f"/{rest}{qs}"
+
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._send(400, {"error": "bad port"}); return True
+
+        guest_ip = _guest_ip_for(sid)
+        if not guest_ip:
+            self._send(404, {"error": "sandbox not running on this node", "id": sid}); return True
+
+        # 读请求体(若有)
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = 0
+        req_body = self.rfile.read(n) if n else None
+
+        # 透传除 hop-by-hop 外的请求头
+        hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+               "te", "trailers", "transfer-encoding", "upgrade", "host"}
+        fwd_headers = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+        fwd_headers["Host"] = f"{guest_ip}:{port}"
+
+        try:
+            conn = http.client.HTTPConnection(guest_ip, port, timeout=30)
+            conn.request(self.command, upstream_path, body=req_body, headers=fwd_headers)
+            resp = conn.getresponse()
+            data = resp.read()
+        except Exception as e:
+            self._send(502, {"error": "upstream unreachable",
+                             "hint": f"guest {guest_ip}:{port} — {e}"})
+            return True
+
+        # 回写上游响应(状态码 + 头 + body),跳过会导致长度冲突的 hop-by-hop 头
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() in hop or k.lower() == "content-length":
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        conn.close()
+        return True
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/proxy/"):
+            if not self._check_access():
+                return
+            if self._maybe_proxy():
+                return
         # /health 对所有来源开放（存活探针）
         if path != "/health" and not self._check_access():
             return
@@ -1155,6 +1232,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_access():
             return
         path = urlparse(self.path).path
+        if path.startswith("/proxy/"):
+            if self._maybe_proxy():
+                return
         body = self._body()
         try:
             if path == "/vm/create":
@@ -1187,6 +1267,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
         except Exception as e:
             self._send(500, {"error": str(e)})
+
+    # 反代需要覆盖 web 常用的其余 method(PUT/DELETE/PATCH/HEAD/OPTIONS)。
+    # 这些仅用于 /proxy/,非 proxy 路径返回 404。
+    def _proxy_only(self):
+        if not self._check_access():
+            return
+        if urlparse(self.path).path.startswith("/proxy/") and self._maybe_proxy():
+            return
+        self._send(404, {"error": "not found"})
+
+    do_PUT     = _proxy_only
+    do_DELETE  = _proxy_only
+    do_PATCH   = _proxy_only
+    do_OPTIONS = _proxy_only
+    do_HEAD    = _proxy_only
 
 
 if __name__ == "__main__":

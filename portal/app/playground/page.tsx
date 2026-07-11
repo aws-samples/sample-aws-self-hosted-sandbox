@@ -22,6 +22,7 @@ export default function PlaygroundPage() {
   const [image, setImage] = useState("");
   const [cpu, setCpu] = useState(2);
   const [memMib, setMemMib] = useState(4096);
+  const [ports, setPorts] = useState(""); // 逗号分隔的暴露端口,如 "8080,3000"
   const [cmd, setCmd] = useState("echo hello from sandbox");
   const [result, setResult] = useState<ApiCallResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -33,7 +34,13 @@ export default function PlaygroundPage() {
     try {
       let res: Response;
       switch (op) {
-        case "create":
+        case "create": {
+          const services = ports
+            .split(",")
+            .map((p) => p.trim())
+            .filter(Boolean)
+            .map((p) => ({ port: Number(p) }))
+            .filter((s) => Number.isFinite(s.port) && s.port > 0);
           res = await fetch("/api/sandboxes", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -41,9 +48,11 @@ export default function PlaygroundPage() {
               image: image || undefined,
               cpu,
               mem_mib: memMib,
+              services: services.length ? services : undefined,
             }),
           });
           break;
+        }
         case "get":
           res = await fetch(`/api/sandboxes/${id}`, { cache: "no-store" });
           break;
@@ -143,6 +152,14 @@ export default function PlaygroundPage() {
                   />
                 </label>
               </div>
+              <label className="field">
+                <span className="field-label">暴露端口(逗号分隔,可选)</span>
+                <input
+                  value={ports}
+                  onChange={(e) => setPorts(e.target.value)}
+                  placeholder="例如 8080,3000 — 创建后详情页给出可点击 URL"
+                />
+              </label>
             </>
           ) : null}
 
