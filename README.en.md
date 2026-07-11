@@ -200,6 +200,13 @@ curl -s -X POST $BASE_URL/sandboxes/{id}/resume
 # Destroy
 curl -s -X DELETE $BASE_URL/sandboxes/{id}
 
+# Port exposure (vibe coding / web preview): declare services on create, reach the in-VM service via proxy
+curl -s -X POST $BASE_URL/sandboxes -d '{"cpu":1,"mem_mib":512,"services":[{"port":8080}]}'
+# ANY /s/{id}/{port}/{path}  → proxied into the guest. Path-based routing, so multiple
+# sandboxes can expose the SAME internal port (two sandboxes on :80 never collide).
+# Chain: NLB → ingress-nginx → control-plane proxy → node-agent → guest. Uses the NLB's
+# own hostname (no custom DNS). Enable it in docs/deploy.md Step 6.5.
+
 [Cleanup]
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"

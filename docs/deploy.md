@@ -182,6 +182,71 @@ terraform apply -auto-approve \
 
 ---
 
+## Step 6.5: 启用沙盒端口暴露（可选，vibe coding / web 预览需要）
+
+让沙盒内的 web 服务（如 :80 / :3000）能从集群外访问。链路：
+`用户 → NLB → ingress-nginx → 控制面 /s/{id}/{port}/ → node-agent /proxy → guest`。
+用**路径**（非子域名）路由，天然支持**多个沙盒暴露同一内部端口**（如两个沙盒都开 80）。
+
+> 不需要端口暴露（只用 exec/API）可**跳过本步**，Step 6 已足够。
+
+```bash
+cd terraform/stage2-control-plane
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+S3_BUCKET="my-sandbox-snapshots-${ACCT}"
+FC_NODES="<Step 6 用的稳定节点 IP>"
+API_KEY="<Step 6 生成的 API_KEY>"
+LITELLM_KEY="<Step 6 生成的 LITELLM_KEY>"
+
+# 1) 重新 apply，打开 create_ingress_nginx（拉起共享 NLB）。其余 var 与 Step 6 保持一致。
+terraform apply -auto-approve \
+  -var="fc_nodes=${FC_NODES}" \
+  -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
+  -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
+  -var="snapshot_s3_bucket=${S3_BUCKET}" \
+  -var="enable_fargate=false" \
+  -var="create_ingress_nginx=true" \
+  -var="sandbox_domain=sbx.example.com" \
+  -var="api_keys=${API_KEY}" \
+  -var="litellm_master_key=${LITELLM_KEY}"
+
+# 2) 等 NLB 就绪，取它的自带域名（约 2-3 分钟才会 provision 出 hostname）
+NLB_HOST=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "NLB_HOST=$NLB_HOST"   # 形如 xxxx.elb.us-east-1.amazonaws.com
+
+# 3) 把 NLB 域名回填给控制面（Portal 用它拼可点击 URL）。二选一：
+#    a) 快速热更新（不改 terraform state）：
+kubectl set env deployment/sandbox-control-plane -n sandbox-system NLB_HOSTNAME="$NLB_HOST"
+#    b) 或重新 apply 固化：上面命令再加 -var="nlb_hostname=${NLB_HOST}"
+
+# 4) 加一条 Ingress，把 /s 路径路由到控制面（sandbox-proxy）。NLB 自带域名无证书，走 HTTP。
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sandbox-proxy
+  namespace: sandbox-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /s
+        pathType: Prefix
+        backend: { service: { name: sandbox-control-plane, port: { number: 80 } } }
+EOF
+```
+
+> ⚠️ **安全**：`/s/{id}/{port}` 默认**公网可达、无鉴权**（浏览器打开 web 预览不带 API key）。
+> demo 可接受；生产应在控制面 `_maybe_proxy` 加 token/租户校验，并上自定义域名 + TLS。
+> 仅 create 时 `services` 声明过的端口可被暴露（控制面 `resolve_proxy_target` 校验）。
+
+---
+
 
 ## Step 8: 配置 DNS（可选，POC 跳过）
 
@@ -222,6 +287,27 @@ curl -s -X POST $BASE/sandboxes/$SID/exec -H "Authorization: Bearer $API_KEY" \
 # 期望 rc=0, stdout="sandbox-ok\n5.10.223\n1"
 #   5.10.223 = guest kernel（≠ 宿主 6.1.x）→ 确在 microVM 内；nproc=1 = guest 配额
 # 走的是 vsock 通道的证据：node-agent 上 /var/lib/sbx/<id>/v.sock 存在（PUT /vsock 生效）
+```
+
+**验证端口暴露**（若做了 Step 6.5）—— 含"两个沙盒同开一个端口"：
+
+```bash
+# 建两个都暴露 80 的沙盒
+SA=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
+  -d '{"cpu":1,"mem_mib":512,"tenant_id":"a","services":[{"port":80}]}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+SB=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
+  -d '{"cpu":1,"mem_mib":512,"tenant_id":"b","services":[{"port":80}]}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+# 各自在 guest 里起一个内容不同的 web(注意用绝对路径 /usr/local/bin/python3)
+PY=/usr/local/bin/python3
+for pair in "$SA:AAA" "$SB:BBB"; do sid=${pair%:*}; msg=${pair#*:}; \
+  curl -s -X POST $BASE/sandboxes/$sid/exec -H "Authorization: Bearer $API_KEY" \
+    -d "{\"cmd\":\"mkdir -p /web && echo $msg>/web/index.html && cd /web && (setsid $PY -m http.server 80 >/tmp/w.log 2>&1 &); sleep 1; echo ok\"}" >/dev/null; done
+
+# 经反代访问 —— 本地(port-forward)用 localhost:18000;若配了 NLB 用 http://$NLB_HOST
+curl -s $BASE/s/$SA/80/    # → AAA
+curl -s $BASE/s/$SB/80/    # → BBB   ← 两个都开 80、可能同一 metal，靠 sid 区分不串
+curl -s $BASE/s/$SA/3000/  # → 403 port not exposed(仅 services 声明的端口可暴露)
 ```
 
 **验证 P0 高可用编排能力**（reconcile / 心跳 / leader / S3 强一致）：
@@ -320,6 +406,12 @@ curl -s -X DELETE -H "Authorization: Bearer ${API_KEY}" \
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
+
+# 0. 若做过 Step 6.5（端口暴露）：先删 sandbox-proxy Ingress + ingress-nginx（NLB），
+#    否则残留 NLB 占 ENI 会让后面 VPC destroy 卡住。
+kubectl delete ingress sandbox-proxy -n sandbox-system --ignore-not-found
+helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
+#    （下面 stage2 destroy 传 create_ingress_nginx=false，terraform 里本就无此 NLB 记录，故手动删）
 
 # 1. 删 stage2（var 要与 apply 时一致，含 fc_nodes）
 cd terraform/stage2-control-plane && terraform destroy -auto-approve \

@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import time
@@ -54,6 +55,11 @@ _warm_pool.start_replenish_loop(is_leader=lambda: _reconciler.is_leader)
 
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
+
+# 端口暴露:node-agent 端口 + 对外访问前缀(NLB 自带域名,由部署注入)。
+# NLB_HOSTNAME 供 Portal 拼接可点击 URL(如 http://<nlb>/s/<sid>/<port>/);未配置则前端回退相对路径。
+NODE_AGENT_PORT = int(os.environ.get("NODE_AGENT_PORT", "8002"))
+NLB_HOSTNAME    = os.environ.get("NLB_HOSTNAME", "")
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -147,6 +153,10 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         "created_at":       db._utcnow(),
         "updated_at":       db._utcnow(),
         "meta":             spec.meta,
+        # 声明要暴露的服务端口 —— 供端口暴露反代(/s/{id}/{port})校验"该端口是否允许对外"。
+        "services":         [{"port": s.port, "protocol": s.protocol,
+                             "autostop": s.autostop, "autostart": s.autostart}
+                            for s in spec.services],
     }
     if idem_key:
         record["idempotency_key"] = idem_key
@@ -263,6 +273,15 @@ def admin_events(sandbox_id: str | None, limit: int) -> tuple[int, dict]:
     return 200, {"events": db.list_events(sandbox_id, limit)}
 
 
+def admin_cluster() -> tuple[int, dict]:
+    """集群级信息,供 Portal 拼接端口暴露 URL。"""
+    return 200, {
+        "nlb_hostname": NLB_HOSTNAME,
+        # 端口暴露访问前缀:{prefix}/s/{sid}/{port}/;NLB 未配置时前端用相对路径。
+        "proxy_base": f"http://{NLB_HOSTNAME}" if NLB_HOSTNAME else "",
+    }
+
+
 def admin_stats() -> tuple[int, dict]:
     """汇总卡片:各 state 计数、节点数、集群总/空闲内存、暖池水位。"""
     sandboxes = db.list_by_states(_ALL_STATES)
@@ -282,6 +301,36 @@ def admin_stats() -> tuple[int, dict]:
         "warm_pool":       db.count_warm(_DRIVER_NAME),
         "driver":          _DRIVER_NAME,
     }
+
+
+# ---------- 端口暴露反代(sandbox-proxy)----------
+# 路径路由 /s/{sid}/{port}/{rest} —— 用路径(而非 Host 子域名)定位沙盒,因为:
+#   1) 先用 NLB 自带域名,挂不了通配符子域名,Host 头无法区分沙盒;
+#   2) 需支持"多沙盒暴露同一内部端口"——路由键是 sid,与宿主端口/Host 解耦。
+# 解析出 (sid, port) → 查 DynamoDB 拿沙盒所在 node → 转发到该 node-agent 的
+# /proxy/{sid}/{port}/{rest}(node-agent 再转进 guest 172.18.x.2:port)。
+
+def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, str, str]:
+    """
+    校验并解析反代目标。
+    成功 → (200, node_host, upstream_path_prefix);失败 → (code, {error}).
+    """
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "sandbox not found", "id": sid}
+    if record.get("state") != "running":
+        return 409, {"error": "sandbox not running", "state": record.get("state")}
+
+    # 仅允许 create 时声明过的端口,避免把 guest 任意内部端口暴露出去
+    declared = {int(s.get("port")) for s in record.get("services", []) if s.get("port") is not None}
+    if declared and port not in declared:
+        return 403, {"error": "port not exposed", "hint": f"declare it in services: {sorted(declared)}"}
+
+    node = record.get("node")
+    if not node:
+        return 503, {"error": "sandbox has no node yet"}
+    host = node if ":" in node else f"{node}:{NODE_AGENT_PORT}"
+    return 200, host, f"/proxy/{sid}/{port}"
 
 
 def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
@@ -436,7 +485,62 @@ class Handler(BaseHTTPRequestHandler):
     def _qs(self) -> dict:
         return parse_qs(urlparse(self.path).query)
 
+    # ---------- 端口暴露反代 /s/{sid}/{port}/{rest} ----------
+    # 命中则透传到沙盒服务并返回 True。**不走 Bearer 鉴权** —— 浏览器打开 web 预览
+    # 不会带 API key(demo:公开可达;生产应在此加 token/租户校验,见设计文档 §6)。
+    def _maybe_proxy(self) -> bool:
+        parsed = urlparse(self.path)
+        parts  = parsed.path.strip("/").split("/")
+        if len(parts) < 3 or parts[0] != "s":
+            return False
+        sid, port_s = parts[1], parts[2]
+        rest = "/".join(parts[3:])
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._send(400, {"error": "bad port"}); return True
+
+        target = resolve_proxy_target(sid, port)
+        if target[0] != 200:
+            self._send(target[0], target[1]); return True
+        _, node_host, up_prefix = target
+
+        qs = f"?{parsed.query}" if parsed.query else ""
+        upstream_path = f"{up_prefix}/{rest}{qs}"
+
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = 0
+        req_body = self.rfile.read(n) if n else None
+
+        hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+               "te", "trailers", "transfer-encoding", "upgrade", "host"}
+        fwd = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+
+        try:
+            conn = http.client.HTTPConnection(node_host, timeout=30)
+            conn.request(self.command, upstream_path, body=req_body, headers=fwd)
+            resp = conn.getresponse()
+            data = resp.read()
+        except Exception as e:
+            self._send(502, {"error": "node-agent unreachable", "hint": str(e)})
+            return True
+
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() in hop or k.lower() == "content-length":
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        conn.close()
+        return True
+
     def do_GET(self):
+        if self._maybe_proxy():
+            return
         if not _check_auth(self):
             return
         try:
@@ -445,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
+        if self._maybe_proxy():
+            return
         if not _check_auth(self):
             return
         try:
@@ -453,12 +559,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
     def do_DELETE(self):
+        if self._maybe_proxy():
+            return
         if not _check_auth(self):
             return
         try:
             self._handle_delete()
         except Exception as e:
             self._send(500, {"error": str(e)})
+
+    # web 应用常用的其余 method —— 仅服务 /s/ 反代
+    def _proxy_only(self):
+        if self._maybe_proxy():
+            return
+        self._send(404, {"error": "not found"})
+
+    do_PUT     = _proxy_only
+    do_PATCH   = _proxy_only
+    do_OPTIONS = _proxy_only
+    do_HEAD    = _proxy_only
 
     def _handle_get(self):
         p = self._parts()
@@ -491,6 +610,9 @@ class Handler(BaseHTTPRequestHandler):
                 sid   = (qs.get("id") or [None])[0]
                 limit = int((qs.get("limit") or ["100"])[0])
                 code, result = admin_events(sid, limit)
+                return self._send(code, result)
+            if p == ["admin", "cluster"]:
+                code, result = admin_cluster()
                 return self._send(code, result)
             return self._send(404, {"error": "not found"})
 
@@ -544,6 +666,8 @@ class Handler(BaseHTTPRequestHandler):
                 "GET    /admin/nodes",
                 "GET    /admin/stats",
                 "GET    /admin/events?id=&limit=",
+                "GET    /admin/cluster",
+                "ANY    /s/{id}/{port}/{path}  (sandbox port proxy)",
             ],
         })
 

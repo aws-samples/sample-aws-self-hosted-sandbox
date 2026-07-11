@@ -13,6 +13,13 @@ export type SandboxState =
   | "orphaned"
   | "needs_reschedule";
 
+export interface ServiceSpec {
+  port: number;
+  protocol?: string;
+  autostop?: boolean;
+  autostart?: boolean;
+}
+
 export interface Sandbox {
   id: string;
   tenant_id?: string;
@@ -24,6 +31,7 @@ export interface Sandbox {
   created_at?: string;
   updated_at?: string;
   meta?: Record<string, unknown>;
+  services?: ServiceSpec[];
   // driver 运行时增补
   node?: string;
   guest_ip?: string;
@@ -67,6 +75,11 @@ export interface Stats {
   running_vm_count: number;
   warm_pool: number;
   driver: string;
+}
+
+export interface ClusterInfo {
+  nlb_hostname: string;
+  proxy_base: string; // 端口暴露 URL 前缀,如 http://<nlb>;为空则用相对路径
 }
 
 // BFF 统一响应封装:把上游 API 的 status/耗时/body 一起回给前端,

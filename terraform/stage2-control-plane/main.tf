@@ -68,6 +68,12 @@ variable "fc_nodes" {
   default     = ""
 }
 
+variable "nlb_hostname" {
+  type        = string
+  description = "端口暴露对外前缀(共享 NLB 的域名,如 xxx.elb.us-east-1.amazonaws.com)。Portal 用它拼 http://<nlb>/s/<id>/<port>/。留空则前端回退相对路径(仅本地 port-forward 可访问)。部署完 ingress-nginx 后用 kubectl 取 NLB hostname 再回填。"
+  default     = ""
+}
+
 variable "litellm_url" {
   type    = string
   default = "http://litellm.litellm.svc.cluster.local:4000"
@@ -482,6 +488,9 @@ resource "kubernetes_config_map" "control_plane" {
     LISTEN_PORT           = "8000"
     LISTEN_HOST           = "0.0.0.0"
     NODE_AGENT_PORT       = "8002"
+    # 端口暴露:对外访问前缀(NLB 自带域名)。供控制面 /admin/cluster 返回给 Portal 拼
+    # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
+    NLB_HOSTNAME = var.nlb_hostname
     # B2(FirecrackerDriver): 控制面靠 FC_NODES(逗号分隔的节点内网 IP)找 node-agent
     FC_NODES       = var.fc_nodes
     FC_KERNEL_PATH = "/opt/sbx/vmlinux"

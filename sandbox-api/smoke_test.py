@@ -607,6 +607,23 @@ class TestAdminAggregates(unittest.TestCase):
             srv.shutdown()
 
     @mock_aws
+    def test_admin_cluster(self):
+        _create_tables()
+        import sandbox_api.app as app_module
+        app_module.NLB_HOSTNAME = "test-nlb.elb.amazonaws.com"
+        try:
+            srv, port = self._start_api()
+            try:
+                code, body = self._call(port, "GET", "/admin/cluster")
+                self.assertEqual(code, 200)
+                self.assertEqual(body["nlb_hostname"], "test-nlb.elb.amazonaws.com")
+                self.assertEqual(body["proxy_base"], "http://test-nlb.elb.amazonaws.com")
+            finally:
+                srv.shutdown()
+        finally:
+            app_module.NLB_HOSTNAME = ""
+
+    @mock_aws
     def test_admin_requires_admin_key(self):
         _create_tables()
         import sandbox_api.app as app_module
@@ -625,6 +642,66 @@ class TestAdminAggregates(unittest.TestCase):
             app_module._API_KEYS = set()
             app_module._KEY_TENANT = {}
             app_module._ALLOW_UNAUTH = True
+
+
+class TestPortExposure(unittest.TestCase):
+    """端口暴露反代解析 resolve_proxy_target(含多沙盒同端口)。"""
+
+    @mock_aws
+    def test_resolve_running_declared_port(self):
+        _create_tables()
+        from sandbox_api import db, app
+        db.put({"id": "px1", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 8080}], "updated_at": db._utcnow()})
+        code, host, prefix = app.resolve_proxy_target("px1", 8080)
+        self.assertEqual(code, 200)
+        # 自动补 NODE_AGENT_PORT(测试环境该值被设为 stub agent 端口)
+        self.assertEqual(host, f"10.0.1.5:{app.NODE_AGENT_PORT}")
+        self.assertEqual(prefix, "/proxy/px1/8080")
+
+    @mock_aws
+    def test_resolve_undeclared_port_forbidden(self):
+        _create_tables()
+        from sandbox_api import db, app
+        db.put({"id": "px2", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 8080}], "updated_at": db._utcnow()})
+        code, body = app.resolve_proxy_target("px2", 9999)   # 未声明
+        self.assertEqual(code, 403)
+
+    @mock_aws
+    def test_resolve_not_running(self):
+        _create_tables()
+        from sandbox_api import db, app
+        db.put({"id": "px3", "tenant_id": "t", "state": "suspended",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 80}], "updated_at": db._utcnow()})
+        code, body = app.resolve_proxy_target("px3", 80)
+        self.assertEqual(code, 409)
+
+    @mock_aws
+    def test_resolve_missing(self):
+        _create_tables()
+        from sandbox_api import app
+        code, body = app.resolve_proxy_target("nope", 80)
+        self.assertEqual(code, 404)
+
+    @mock_aws
+    def test_two_sandboxes_same_port(self):
+        """两个沙盒同开 80,且在同一 node —— 路由键是 sid,互不冲突(核心诉求)。"""
+        _create_tables()
+        from sandbox_api import db, app
+        for sid in ("sameA", "sameB"):
+            db.put({"id": sid, "tenant_id": "t", "state": "running",
+                    "driver": "firecracker", "node": "10.0.1.5",   # 同一台 metal
+                    "services": [{"port": 80}], "updated_at": db._utcnow()})
+        ca = app.resolve_proxy_target("sameA", 80)
+        cb = app.resolve_proxy_target("sameB", 80)
+        self.assertEqual((ca[0], cb[0]), (200, 200))
+        self.assertEqual(ca[2], "/proxy/sameA/80")
+        self.assertEqual(cb[2], "/proxy/sameB/80")
+        self.assertNotEqual(ca[2], cb[2])   # 同 node 同端口,靠 sid 区分
 
 
 class TestWarmPool(unittest.TestCase):
@@ -899,7 +976,8 @@ if __name__ == "__main__":
     suite  = unittest.TestSuite()
 
     for cls in [TestDB, TestFirecrackerDriver,
-                TestAPIEndToEnd, TestAdminAggregates, TestWarmPool, TestAPIAuth,
+                TestAPIEndToEnd, TestAdminAggregates, TestPortExposure,
+                TestWarmPool, TestAPIAuth,
                 TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
