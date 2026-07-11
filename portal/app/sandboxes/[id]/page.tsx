@@ -8,6 +8,7 @@ import { Timeline } from "@/components/Timeline";
 import { ApiResponseViewer } from "@/components/ApiResponseViewer";
 import { ExposedServices } from "@/components/ExposedServices";
 import { fmtBytes, fmtMib, fmtSecs, fmtTime } from "@/lib/format";
+import { demoWebCommand } from "@/lib/demoWeb";
 import type { ApiCallResult, ClusterInfo, Sandbox, SandboxEvent } from "@/lib/types";
 
 export default function SandboxDetailPage() {
@@ -16,6 +17,7 @@ export default function SandboxDetailPage() {
   const [sb, setSb] = useState<Sandbox | null>(null);
   const [events, setEvents] = useState<SandboxEvent[]>([]);
   const [proxyBase, setProxyBase] = useState("");
+  const [allowAllPorts, setAllowAllPorts] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [lastCall, setLastCall] = useState<ApiCallResult | null>(null);
@@ -26,7 +28,11 @@ export default function SandboxDetailPage() {
     fetch("/api/cluster", { cache: "no-store" })
       .then((r) => r.json())
       .then((j) => {
-        if (j?.ok && j.body) setProxyBase((j.body as ClusterInfo).proxy_base || "");
+        if (j?.ok && j.body) {
+          const c = j.body as ClusterInfo;
+          setProxyBase(c.proxy_base || "");
+          setAllowAllPorts(!!c.allow_all_ports);
+        }
       })
       .catch(() => {});
   }, []);
@@ -52,7 +58,7 @@ export default function SandboxDetailPage() {
     return () => clearInterval(t);
   }, [refresh]);
 
-  const act = async (action: "suspend" | "resume" | "destroy" | "exec") => {
+  const act = async (action: "suspend" | "resume" | "destroy" | "exec" | "demoweb") => {
     setBusy(action);
     try {
       let res: Response;
@@ -68,6 +74,15 @@ export default function SandboxDetailPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ cmd }),
+        });
+      } else if (action === "demoweb") {
+        // 在 guest 里一键起一个好看的演示页,让暴露端口有内容可看。
+        // 默认用第一个声明的端口,没声明则默认 8080。
+        const port = sb?.services?.[0]?.port ?? 8080;
+        res = await fetch(`/api/sandboxes/${id}/exec`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cmd: demoWebCommand(id, port) }),
         });
       } else {
         res = await fetch(`/api/sandboxes/${id}/${action}`, { method: "POST" });
@@ -107,6 +122,14 @@ export default function SandboxDetailPage() {
           {sb ? <StatusBadge state={sb.state} /> : null}
         </div>
         <div className="btn-row">
+          <button
+            className="btn btn-sm btn-primary"
+            disabled={!!busy || sb?.state !== "running"}
+            title="在沙盒内一键起一个演示 web 页,便于展示端口暴露效果"
+            onClick={() => act("demoweb")}
+          >
+            {busy === "demoweb" ? "…" : "启动 Demo Web"}
+          </button>
           <button className="btn btn-sm" disabled={!!busy} onClick={() => act("exec")}>
             {busy === "exec" ? "…" : "Exec"}
           </button>
@@ -188,6 +211,7 @@ export default function SandboxDetailPage() {
               services={sb?.services}
               proxyBase={proxyBase}
               running={sb?.state === "running"}
+              allowAllPorts={allowAllPorts}
             />
           </div>
 
