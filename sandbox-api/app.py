@@ -60,6 +60,10 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
 # NLB_HOSTNAME 供 Portal 拼接可点击 URL(如 http://<nlb>/s/<sid>/<port>/);未配置则前端回退相对路径。
 NODE_AGENT_PORT = int(os.environ.get("NODE_AGENT_PORT", "8002"))
 NLB_HOSTNAME    = os.environ.get("NLB_HOSTNAME", "")
+# 任意端口暴露:默认 True —— 用户在沙盒内起在任何端口的服务都可经 /s/{id}/{port}/ 访问,
+# 无需 create 时预先声明(对齐 E2B/Fly"想暴露什么端口都行"的体验)。
+# 设为 0/false 则退回"仅 services 声明端口可暴露"的白名单模式(更安全,适合多租户生产)。
+ALLOW_ALL_PORTS = os.environ.get("ALLOW_ALL_PORTS", "1").lower() in ("1", "true")
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -279,6 +283,8 @@ def admin_cluster() -> tuple[int, dict]:
         "nlb_hostname": NLB_HOSTNAME,
         # 端口暴露访问前缀:{prefix}/s/{sid}/{port}/;NLB 未配置时前端用相对路径。
         "proxy_base": f"http://{NLB_HOSTNAME}" if NLB_HOSTNAME else "",
+        # 任意端口模式:前端据此提供"输入任意端口打开"的入口,而非只列 declared 端口。
+        "allow_all_ports": ALLOW_ALL_PORTS,
     }
 
 
@@ -321,10 +327,19 @@ def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, s
     if record.get("state") != "running":
         return 409, {"error": "sandbox not running", "state": record.get("state")}
 
-    # 仅允许 create 时声明过的端口,避免把 guest 任意内部端口暴露出去
-    declared = {int(s.get("port")) for s in record.get("services", []) if s.get("port") is not None}
-    if declared and port not in declared:
-        return 403, {"error": "port not exposed", "hint": f"declare it in services: {sorted(declared)}"}
+    # 端口白名单校验:
+    #   ALLOW_ALL_PORTS(默认开)→ 任意端口都放行,用户在 guest 内起在哪个端口都能访问,
+    #     无需 create 时预声明(E2B/Fly 式"想暴露什么端口都行")。
+    #   关闭 → 仅放行 services 声明过的端口(白名单,更适合多租户生产)。
+    if not ALLOW_ALL_PORTS:
+        declared = {int(s.get("port")) for s in record.get("services", []) if s.get("port") is not None}
+        if declared and port not in declared:
+            return 403, {"error": "port not exposed",
+                         "hint": f"declare it in services: {sorted(declared)} (or enable ALLOW_ALL_PORTS)"}
+
+    # 基本端口范围校验(防明显非法值)
+    if port < 1 or port > 65535:
+        return 400, {"error": "port out of range (1-65535)"}
 
     node = record.get("node")
     if not node:

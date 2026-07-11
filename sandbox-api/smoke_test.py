@@ -661,14 +661,37 @@ class TestPortExposure(unittest.TestCase):
         self.assertEqual(prefix, "/proxy/px1/8080")
 
     @mock_aws
-    def test_resolve_undeclared_port_forbidden(self):
+    def test_resolve_any_port_when_allow_all(self):
+        """ALLOW_ALL_PORTS(默认)→ 未声明端口也放行。"""
         _create_tables()
         from sandbox_api import db, app
         db.put({"id": "px2", "tenant_id": "t", "state": "running",
                 "driver": "firecracker", "node": "10.0.1.5",
                 "services": [{"port": 8080}], "updated_at": db._utcnow()})
-        code, body = app.resolve_proxy_target("px2", 9999)   # 未声明
-        self.assertEqual(code, 403)
+        old = app.ALLOW_ALL_PORTS
+        app.ALLOW_ALL_PORTS = True
+        try:
+            code, host, prefix = app.resolve_proxy_target("px2", 9999)   # 未声明也放行
+            self.assertEqual(code, 200)
+            self.assertEqual(prefix, "/proxy/px2/9999")
+        finally:
+            app.ALLOW_ALL_PORTS = old
+
+    @mock_aws
+    def test_resolve_undeclared_port_forbidden_when_whitelist(self):
+        """关闭 ALLOW_ALL_PORTS → 白名单模式,未声明端口 403。"""
+        _create_tables()
+        from sandbox_api import db, app
+        db.put({"id": "px2b", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 8080}], "updated_at": db._utcnow()})
+        old = app.ALLOW_ALL_PORTS
+        app.ALLOW_ALL_PORTS = False
+        try:
+            code, body = app.resolve_proxy_target("px2b", 9999)
+            self.assertEqual(code, 403)
+        finally:
+            app.ALLOW_ALL_PORTS = old
 
     @mock_aws
     def test_resolve_not_running(self):
