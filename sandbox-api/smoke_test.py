@@ -676,6 +676,42 @@ class TestAdminAggregates(unittest.TestCase):
             app_module._ALLOW_UNAUTH = True
 
 
+class TestCustomImage(unittest.TestCase):
+    """自定义镜像:image → rootfs 模板名归一化 + /admin/images。"""
+
+    def test_normalize_image(self):
+        from sandbox_api.drivers.firecracker import normalize_image
+        self.assertEqual(normalize_image(""), "min")
+        self.assertEqual(normalize_image("default"), "min")
+        self.assertEqual(normalize_image("min"), "min")
+        self.assertEqual(normalize_image("web"), "web")
+        self.assertEqual(normalize_image("web:latest"), "web")
+        # 带 registry 前缀 + tag → 取末段去 tag
+        self.assertEqual(normalize_image("123.dkr.ecr.us-east-1.amazonaws.com/sbx-web:v2"), "sbx-web")
+        # 非法字符(空格/分号/斜杠残留)→ 回退 min(安全:结果会拼进文件路径)
+        self.assertEqual(normalize_image("a b"), "min")
+        self.assertEqual(normalize_image("a;b"), "min")
+        self.assertEqual(normalize_image("a/b c"), "min")      # 末段 "b c" 含空格非法
+        # 只取末段:末段合法即返回该名(不存在的模板 node-agent 会回退 min);
+        # 关键:末段永远不含 / . 等路径字符(正则限定 [A-Za-z0-9_-]),故无路径注入。
+        self.assertEqual(normalize_image("../../etc/passwd"), "passwd")
+        self.assertEqual(normalize_image("web/../x"), "x")
+
+    @mock_aws
+    def test_admin_images(self):
+        _create_tables()
+        import sandbox_api.app as app_module
+        srv, port = TestAdminAggregates()._start_api()
+        try:
+            code, body = TestAdminAggregates()._call(port, "GET", "/admin/images")
+            self.assertEqual(code, 200)
+            names = [i["name"] for i in body["images"]]
+            self.assertIn("min", names)
+            self.assertIn("web", names)   # 默认 SANDBOX_IMAGES=min,web
+        finally:
+            srv.shutdown()
+
+
 class TestPortExposure(unittest.TestCase):
     """端口暴露反代解析 resolve_proxy_target(含多沙盒同端口)。"""
 
@@ -1102,7 +1138,7 @@ if __name__ == "__main__":
     suite  = unittest.TestSuite()
 
     for cls in [TestDB, TestFirecrackerDriver,
-                TestAPIEndToEnd, TestAdminAggregates, TestPortExposure,
+                TestAPIEndToEnd, TestAdminAggregates, TestCustomImage, TestPortExposure,
                 TestFileTransfer, TestWarmPool, TestAPIAuth,
                 TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))

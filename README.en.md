@@ -48,7 +48,7 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 |---|---|---|---|---|
 | **Isolation** | Firecracker microVM | Firecracker microVM | Firecracker microVM | Container (shared kernel) |
 | **Bare-metal fidelity** | ✅ Highest | ✅ High | ✅ High | ❌ Container behavior gaps |
-| **Custom images** | ✅ Any ECR image | ✅ | ✅ | ❌ Restricted |
+| **Custom images** | ✅ Named rootfs templates (prebuilt) | ✅ | ✅ | ❌ Restricted |
 | **Arbitrary ports** | ✅ Wildcard subdomain + NLB | ✅ | ✅ | ❌ |
 | **24×7 persistent** | ✅ | ✅ | ✅ | ❌ TTL enforced |
 | **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |

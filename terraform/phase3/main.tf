@@ -94,6 +94,15 @@ variable "rootfs_s3_uri" {
   default     = ""
 }
 
+# 自定义镜像:额外的命名 rootfs 模板(逗号分隔 name 列表)。节点从 rootfs_s3_uri 同目录拉
+# rootfs-{name}.tar.gz 造 /opt/sbx/rootfs-{name}.ext4。用 build-rootfs-image.sh <name> 构建上传。
+# 默认含 web(自带 demo 站点)。min 无需列出(即默认 rootfs)。
+variable "rootfs_images" {
+  type        = string
+  default     = "web"
+  description = "逗号分隔的命名 rootfs 模板列表(除 min 外),节点会各拉一份造 ext4 模板。"
+}
+
 # ---------- 方案C:持久状态 EBS(挂 /var/lib/sbx,存快照+rootfs,spot 幸存) ----------
 variable "state_ebs_size_gb" {
   type        = number
@@ -279,6 +288,21 @@ module "eks" {
         tar -xzf /tmp/rootfs.tar.gz -C /tmp/rootfs_mount 2>/dev/null && \
         umount /tmp/rootfs_mount 2>/dev/null && \
         echo "[pre-bootstrap] rootfs OK" || echo "[pre-bootstrap] rootfs setup failed (non-fatal)"
+
+        # 命名 rootfs 模板(自定义镜像):从 min-rootfs 同目录拉 rootfs-{name}.tar.gz,
+        # 造 /opt/sbx/rootfs-{name}.ext4。node-agent 按沙盒 image 选模板(见 _rootfs_template_path)。
+        # 由 build-rootfs-image.sh 构建上传;未列出的 name 沙盒会回退默认 min,不影响启动。
+        ROOTFS_PREFIX=$(dirname ${var.rootfs_s3_uri})   # s3://bucket/rootfs
+        for IMG in $(echo "${var.rootfs_images}" | tr ',' ' '); do
+          [ "$IMG" = "min" ] && continue   # min 即默认,上面已造
+          aws s3 cp "$ROOTFS_PREFIX/rootfs-$IMG.tar.gz" /tmp/rootfs-$IMG.tar.gz --region ${var.region} 2>/dev/null && \
+          dd if=/dev/zero of=/opt/sbx/rootfs-$IMG.ext4 bs=1M count=2048 status=none 2>/dev/null && \
+          mkfs.ext4 /opt/sbx/rootfs-$IMG.ext4 -q 2>/dev/null && \
+          mkdir -p /tmp/rmnt-$IMG && mount /opt/sbx/rootfs-$IMG.ext4 /tmp/rmnt-$IMG 2>/dev/null && \
+          tar -xzf /tmp/rootfs-$IMG.tar.gz -C /tmp/rmnt-$IMG 2>/dev/null && \
+          umount /tmp/rmnt-$IMG 2>/dev/null && \
+          echo "[pre-bootstrap] rootfs template '$IMG' OK" || echo "[pre-bootstrap] rootfs template '$IMG' skipped (non-fatal)"
+        done
 
         # Redis + JuiceFS 클라이언트 (설치 실패해도 계속)
         dnf install -y redis6 fuse3 2>/dev/null || true

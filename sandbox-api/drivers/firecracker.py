@@ -24,6 +24,38 @@ from sandbox_api.driver import Capabilities, SandboxSpec, UnsupportedOperation
 NODE_AGENT_PORT = int(os.environ.get("NODE_AGENT_PORT", "8002"))
 KERNEL_PATH     = os.environ.get("FC_KERNEL_PATH", "/opt/sbx/vmlinux")
 S3_BUCKET       = os.environ.get("SNAPSHOT_S3_BUCKET", "")
+
+# 自定义镜像 / rootfs 模板:控制面把 image 字段归一化成模板名,node-agent 据此选
+# /opt/sbx/rootfs-{name}.ext4。可用模板名由 SANDBOX_IMAGES(逗号分隔)声明,供 Portal 下拉;
+# 节点未构建对应模板时 node-agent 会回退默认 min(不报错)。
+SANDBOX_IMAGES = [
+    s.strip() for s in os.environ.get("SANDBOX_IMAGES", "min,web").split(",") if s.strip()
+]
+
+
+import re as _re
+_IMAGE_NAME_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def normalize_image(image: str) -> str:
+    """把用户传的 image 归一化成 rootfs 模板名。
+    - 空/default/min → "min"
+    - 命中已知模板名(SANDBOX_IMAGES,或形如 ".../web:tag" 取末段去 tag) → 该名
+    - 含非法字符(路径注入等)或空 → "min"
+    安全:结果会被 node-agent 拼进文件路径,严格限制 [A-Za-z0-9_-];node-agent 侧另有校验(纵深防御)。"""
+    img = (image or "").strip()
+    if not img or img in ("min", "default"):
+        return "min"
+    # 允许传 "web"、"web:latest"、"123.dkr.ecr.../sbx-web:tag" 之类,取末段去 tag
+    last = img.rsplit("/", 1)[-1].split(":", 1)[0]
+    if not last or not _IMAGE_NAME_RE.match(last):
+        return "min"
+    return last
+
+
+def available_images() -> list[str]:
+    """可用镜像模板名列表(供 Portal 创建表单下拉)。"""
+    return SANDBOX_IMAGES
 # 统一路径约定:所有节点把沙盒文件放同一前缀(跨机 resume 必须)
 SBX_BASE        = "/var/lib/sbx"
 
@@ -50,6 +82,8 @@ class FirecrackerDriver:
             "mem_mib":     spec.mem_mib,
             "kernel":      KERNEL_PATH,
             "env":         spec.env,
+            # 自定义镜像:image 归一化后的模板名 → node-agent 选 /opt/sbx/rootfs-{name}.ext4
+            "rootfs_template": normalize_image(spec.image),
         })
         # agent 回包含 guest_ip
         info = self._agent(node_id, "GET", f"/vm/{sandbox_id}")
@@ -137,6 +171,8 @@ class FirecrackerDriver:
             # snap_s3 恒为空(方案C 从不上传 S3)→ 这条"本地无缓存则从 S3 拉"的
             # 兜底路径当前不会触发,为未来可选的 S3 归档预留,不代表现在有 S3 副本。
             "s3_prefix":           snap_s3,
+            # rootfs 缺失时的兜底模板(与 create 一致);正常路径 rootfs 已随卷在,不用它。
+            "rootfs_template":     normalize_image(record.get("image", "")),
         }, timeout=180)
         info = self._agent(node, "GET", f"/vm/{sandbox_id}")
         return {

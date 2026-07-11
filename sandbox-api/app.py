@@ -175,8 +175,12 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
     db.put(record)
 
     try:
-        # 先尝试从暖池 resume(FC 模式 ~7ms);失败或不支持则冷建
-        claimed = _warm_pool.claim(sid, spec)
+        # 先尝试从暖池 resume(FC 模式 ~7ms);失败或不支持则冷建。
+        # 暖池预热的是默认(min)rootfs;若请求了非默认 image,暖池的快照不匹配 →
+        # 跳过暖池直接冷建,才会走 op_create 的模板选择(CoW 对应 rootfs-{name}.ext4)。
+        from sandbox_api.drivers.firecracker import normalize_image
+        wants_default = normalize_image(spec.image) == "min"
+        claimed = _warm_pool.claim(sid, spec) if wants_default else False
         if not claimed:
             driver_fields = _driver.create(sid, spec)
             db.force_update(sid, {**driver_fields, "state": "running"})
@@ -282,6 +286,18 @@ def admin_nodes() -> tuple[int, dict]:
 def admin_events(sandbox_id: str | None, limit: int) -> tuple[int, dict]:
     """事件时间线;sandbox_id 为空则返回全局时间线。"""
     return 200, {"events": db.list_events(sandbox_id, limit)}
+
+
+def admin_images() -> tuple[int, dict]:
+    """可用镜像/rootfs 模板列表(供 Portal 创建表单下拉)。"""
+    from sandbox_api.drivers.firecracker import available_images
+    imgs = available_images()
+    # 附带简短说明,web 预设自带站点
+    desc = {
+        "min": "基础镜像(python + sshd + exec agent),无预置服务",
+        "web": "自带 demo 站点,开机自起 :80 —— 端口暴露打开即见页面",
+    }
+    return 200, {"images": [{"name": n, "desc": desc.get(n, "")} for n in imgs]}
 
 
 def admin_cluster() -> tuple[int, dict]:
@@ -788,6 +804,9 @@ class Handler(BaseHTTPRequestHandler):
             if p == ["admin", "cluster"]:
                 code, result = admin_cluster()
                 return self._send(code, result)
+            if p == ["admin", "images"]:
+                code, result = admin_images()
+                return self._send(code, result)
             return self._send(404, {"error": "not found"})
 
         # GET /sandboxes
@@ -849,6 +868,7 @@ class Handler(BaseHTTPRequestHandler):
                 "GET    /admin/stats",
                 "GET    /admin/events?id=&limit=",
                 "GET    /admin/cluster",
+                "GET    /admin/images",
                 "ANY    /s/{id}/{port}/{path}  (sandbox port proxy)",
                 "PUT    /sandboxes/{id}/files?path=  (upload, body: content_b64)",
                 "GET    /sandboxes/{id}/files?path=  (download → content_b64)",
