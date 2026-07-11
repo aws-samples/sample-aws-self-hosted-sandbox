@@ -227,6 +227,63 @@ def _check_tenant_access(record: dict, caller_tenant: str | None) -> tuple[int, 
     return None
 
 
+# ---------- 只读聚合视图(portal Dashboard 用)----------
+# 现有对外 API 只能按单租户列表,SaaS 全局总览拿不到跨租户聚合视图。
+# 这些数据都在 DynamoDB 里(db.py 已有 list_by_states / list_active_nodes / count_warm),
+# 这里仅把它们暴露成只读 GET。均要求 admin(default)key,不改任何写路径。
+# 覆盖沙盒的全部生命周期状态(含暖池/对账态),供总览表格与计数卡片。
+_ALL_STATES = [
+    "creating", "running", "suspending", "suspended", "resuming",
+    "destroying", "failed", "warm", "orphaned", "needs_reschedule",
+]
+
+
+def _require_admin(handler: "Handler") -> bool:
+    """聚合视图仅限 admin(default key)。返回 True 放行;False 表示已发送 403。
+    无鉴权开发模式(caller_tenant=None)下放行,便于本地 portal 联调。"""
+    caller = _get_caller_tenant(handler)
+    if caller is None or caller == "default":
+        return True
+    handler._send(403, {"error": "forbidden", "hint": "admin (default) API key required"})
+    return False
+
+
+def admin_sandboxes() -> tuple[int, dict]:
+    """全租户沙盒列表(供总览表格)。"""
+    return 200, {"sandboxes": db.list_by_states(_ALL_STATES)}
+
+
+def admin_nodes() -> tuple[int, dict]:
+    """当前活节点(free_mem_mib / vm_count / last_seen / labels)。"""
+    return 200, {"nodes": db.list_active_nodes()}
+
+
+def admin_events(sandbox_id: str | None, limit: int) -> tuple[int, dict]:
+    """事件时间线;sandbox_id 为空则返回全局时间线。"""
+    return 200, {"events": db.list_events(sandbox_id, limit)}
+
+
+def admin_stats() -> tuple[int, dict]:
+    """汇总卡片:各 state 计数、节点数、集群总/空闲内存、暖池水位。"""
+    sandboxes = db.list_by_states(_ALL_STATES)
+    nodes     = db.list_active_nodes()
+    by_state: dict[str, int] = {}
+    for s in sandboxes:
+        st = s.get("state", "unknown")
+        by_state[st] = by_state.get(st, 0) + 1
+    free_mem_mib = sum(int(n.get("free_mem_mib", 0)) for n in nodes)
+    vm_count     = sum(int(n.get("vm_count", 0)) for n in nodes)
+    return 200, {
+        "total_sandboxes": len(sandboxes),
+        "by_state":        by_state,
+        "node_count":      len(nodes),
+        "cluster_free_mem_mib": free_mem_mib,
+        "running_vm_count": vm_count,
+        "warm_pool":       db.count_warm(_DRIVER_NAME),
+        "driver":          _DRIVER_NAME,
+    }
+
+
 def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -416,6 +473,27 @@ class Handler(BaseHTTPRequestHandler):
                 "migrate": caps.migrate,
             })
 
+        # GET /admin/* — 只读聚合视图(portal Dashboard),仅限 admin key
+        if p and p[0] == "admin":
+            if not _require_admin(self):
+                return
+            if p == ["admin", "sandboxes"]:
+                code, result = admin_sandboxes()
+                return self._send(code, result)
+            if p == ["admin", "nodes"]:
+                code, result = admin_nodes()
+                return self._send(code, result)
+            if p == ["admin", "stats"]:
+                code, result = admin_stats()
+                return self._send(code, result)
+            if p == ["admin", "events"]:
+                qs    = self._qs()
+                sid   = (qs.get("id") or [None])[0]
+                limit = int((qs.get("limit") or ["100"])[0])
+                code, result = admin_events(sid, limit)
+                return self._send(code, result)
+            return self._send(404, {"error": "not found"})
+
         # GET /sandboxes
         if p == ["sandboxes"]:
             qs = self._qs()
@@ -462,6 +540,10 @@ class Handler(BaseHTTPRequestHandler):
                 "POST   /sandboxes/{id}/exec",
                 "GET    /sandboxes/{id}/locate",
                 "GET    /capabilities",
+                "GET    /admin/sandboxes",
+                "GET    /admin/nodes",
+                "GET    /admin/stats",
+                "GET    /admin/events?id=&limit=",
             ],
         })
 

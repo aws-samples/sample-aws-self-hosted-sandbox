@@ -11,8 +11,8 @@
 A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and native Kubernetes integration.
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
-- **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first, with cross-node snapshot recovery
-- **Snapshot-driven cost control**: Idle sandboxes snapshot to S3, resume in ~1.2s
+- **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
+- **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
 
@@ -26,6 +26,21 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 | **Long-horizon Agentic Tasks** | Pause/resume workflows, snapshot session state mid-task |
 | **SaaS Sandbox Service** | Expose isolated execution to end users, multi-tenant, usage-based billing |
 | **CI/CD Sandboxes** | Isolated build/test environments with full OS access |
+
+### Portal (Demo Dashboard)
+
+A lightweight E2B / Fly.io-style console ([`portal/`](portal/)) for demoing and observing the platform:
+a global overview of all sandboxes, node capacity, warm-pool level and an event timeline, plus an API
+Playground to run create / suspend / resume / exec / destroy and see each call's response and latency live.
+**Runs locally** (`npm run dev` + `kubectl port-forward`); see [portal/README.md](portal/README.md).
+
+| Dashboard Overview | Sandbox Detail + Metrics |
+|---|---|
+| ![Portal Dashboard](docs/portal/portal-dashboard.png) | ![Sandbox Detail](docs/portal/portal-detail.png) |
+
+> Screenshots from a live deployment (EKS + c6g.metal): summary cards, sandbox table with status badges,
+> node capacity, event timeline; the detail page shows the full record plus snapshot/resume performance
+> metrics (e.g. a diff snapshot writing only 5.35 MB, resume in 408 ms).
 
 ### Comparison with Alternatives
 
@@ -300,6 +315,29 @@ Monitoring:
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
 | Smoke tests | **26/26 PASS** | moto mock, `sandbox-api/smoke_test.py` |
+
+#### Snapshot persistence & cross-node recovery (current state — please read)
+
+To avoid misunderstanding vs. the implementation, the current boundaries:
+
+- **Snapshots only land on the node's local persistent state EBS (`/var/lib/sbx/{id}/snap`), never S3.**
+  Neither suspend nor spot evacuation uploads to S3; the `snapshot_s3` field is always empty. Cross-node
+  recovery relies on that `DeleteOnTermination=false` state volume surviving and being attached to a new
+  node — **not on downloading snapshots from S3**.
+- **The S3 fallback path in code is currently dormant**: resume/`op_resume` still keeps a "pull from
+  `s3_prefix` if no local snapshot" branch, but since nothing ever writes snapshots to S3 (`upload_s3` is
+  never set true, `snapshot_s3` is always empty), that branch is never triggered. It's a reserved hook for a
+  future optional S3 archive — **it does not mean an S3 copy exists today**.
+- **Cross-node recovery is not yet fully automated**: node-agent's spot-reclaim auto-evacuation defaults to
+  **DRY-RUN** (records a plan only, takes no snapshot); set `RECLAIM_AUTO_EVACUATE=1` to actually snapshot to
+  EBS. The "on node death, auto-detach volume → attach to new node → batch resume" step (Block 2 cross-node
+  orchestration) is **not implemented yet**. In the 50-sandbox test, the volume detach/attach and batch
+  resume were **triggered manually / semi-automatically** to validate the capability — not an automatic
+  production flow.
+
+> In one line: **same-node suspend/resume is fully automatic and never touches S3; the primitives for
+> cross-node recovery (EBS volume survival + exact memory resume) are proven, but the "auto-detect spot
+> reclaim → auto-migrate volume → auto-resume" orchestration loop is not finished.**
 
 ### Local Smoke Test (No AWS Required)
 

@@ -134,7 +134,9 @@ class FirecrackerDriver:
             "snapshot_local_path": snap_local,
             "rootfs_path":         rootfs,        # 路径约定,跨机一致
             "tap_idx":             record["tap_idx"],
-            "s3_prefix":           snap_s3,       # node-agent 若本地无缓存则从 S3 拉
+            # snap_s3 恒为空(方案C 从不上传 S3)→ 这条"本地无缓存则从 S3 拉"的
+            # 兜底路径当前不会触发,为未来可选的 S3 归档预留,不代表现在有 S3 副本。
+            "s3_prefix":           snap_s3,
         }, timeout=180)
         info = self._agent(node, "GET", f"/vm/{sandbox_id}")
         return {
