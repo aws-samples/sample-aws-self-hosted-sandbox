@@ -14,6 +14,8 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 - **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
+- **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
+- **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
 
 ### Use Cases
@@ -49,7 +51,8 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 | **Isolation** | Firecracker microVM | Firecracker microVM | Firecracker microVM | Container (shared kernel) |
 | **Bare-metal fidelity** | ✅ Highest | ✅ High | ✅ High | ❌ Container behavior gaps |
 | **Custom images** | ✅ Named rootfs templates (prebuilt) | ✅ | ✅ | ❌ Restricted |
-| **Arbitrary ports** | ✅ Wildcard subdomain + NLB | ✅ | ✅ | ❌ |
+| **Arbitrary port exposure** | ✅ Path routing `/s/{id}/{port}` + shared NLB (WebSocket supported) | ✅ | ✅ | ❌ |
+| **Interactive web terminal / file transfer** | ✅ Built into Portal (PTY-over-WS + base64 over exec) | ✅ | Partial | ❌ |
 | **24×7 persistent** | ✅ | ✅ | ✅ | ❌ TTL enforced |
 | **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |
 | **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
@@ -208,11 +211,16 @@ curl -s -X DELETE $BASE_URL/sandboxes/{id}
 # own hostname (no custom DNS). Enable it in docs/deploy.md Step 6.5.
 # Optional auth: set EXPOSE_TOKEN → access needs ?token=.
 
-# Interactive Web Terminal: Portal detail page "打开终端" starts a PTY-over-WebSocket term in-guest (xterm.js).
+# Interactive Web Terminal: Portal detail page "Open Terminal" button starts a
+# PTY-over-WebSocket terminal in-guest (xterm.js) — no rootfs rebuild needed.
 
 # File upload / download (base64 over exec, small files ≤10MB)
 curl -s -X PUT "$BASE_URL/sandboxes/{id}/files?path=/root/app.py" -d '{"content_b64":"..."}'
 curl -s "$BASE_URL/sandboxes/{id}/files?path=/root/out.txt"   # → {"content_b64":"..."}
+
+# Custom image / rootfs template — pick a different root filesystem per sandbox
+curl -s $BASE_URL/sandboxes -X POST -d '{"image":"web","cpu":1,"mem_mib":512}'  # web preset: demo site auto-served on :80
+curl -s $BASE_URL/admin/images   # list available images (for Portal dropdown)
 
 [Cleanup]
 ACCT=$(aws sts get-caller-identity --query Account --output text)
