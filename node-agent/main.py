@@ -55,22 +55,32 @@ ROOTFS_DIR   = os.environ.get("FC_ROOTFS_DIR", "/opt/sbx")      # 命名 rootfs 
 _ROOTFS_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+def _available_rootfs_templates() -> dict[str, str]:
+    """扫 ROOTFS_DIR,枚举已存在的 rootfs-{name}.ext4 → {name: 绝对路径}。
+    路径全部来自 os.listdir 的可信结果,不含任何用户输入拼接。"""
+    out: dict[str, str] = {}
+    try:
+        for fn in os.listdir(ROOTFS_DIR):
+            if fn.startswith("rootfs-") and fn.endswith(".ext4"):
+                nm = fn[len("rootfs-"):-len(".ext4")]
+                if nm:
+                    out[nm] = os.path.join(ROOTFS_DIR, fn)
+    except OSError:
+        pass
+    return out
+
+
 def _rootfs_template_path(name: str) -> str:
     """按镜像模板名返回 rootfs.ext4 路径。
-    name 为空/"min"/"default" → 默认 ROOTFS;否则找 /opt/sbx/rootfs-{name}.ext4,
-    不存在则回退默认(保证任何 image 都能起,不因未构建模板而失败)。
+    name 为空/"min"/"default" → 默认 ROOTFS;否则在【已枚举的模板字典】里查该 name。
+    查不到(未构建 / 非法名)一律回退默认,保证任何 image 都能起。
 
-    安全:name 来自用户 image 字段,严格限制为 [A-Za-z0-9_-](禁 / . 等),
-    杜绝路径注入(如 ../、绝对路径);不合法直接回退默认。"""
+    安全:用户输入 name 仅作 dict 键查找,返回的路径来自 os.listdir 结果,
+    绝不拼接用户输入到路径 → 无路径注入可能。额外用正则先挡非法名。"""
     name = (name or "").strip()
     if not name or name in ("min", "default") or not _ROOTFS_NAME_RE.match(name):
         return ROOTFS
-    # 二次防御:basename 后再拼,确保结果落在 ROOTFS_DIR 内
-    fname = os.path.basename(f"rootfs-{name}.ext4")
-    cand  = os.path.join(ROOTFS_DIR, fname)
-    if os.path.dirname(os.path.realpath(cand)) != os.path.realpath(ROOTFS_DIR):
-        return ROOTFS
-    return cand if os.path.exists(cand) else ROOTFS
+    return _available_rootfs_templates().get(name, ROOTFS)
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
 HOST_IFACE   = os.environ.get("HOST_IFACE", "")                 # 空则自动探测
