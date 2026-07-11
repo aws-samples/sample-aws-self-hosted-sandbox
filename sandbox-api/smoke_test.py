@@ -611,6 +611,7 @@ class TestAdminAggregates(unittest.TestCase):
         _create_tables()
         import sandbox_api.app as app_module
         app_module.NLB_HOSTNAME = "test-nlb.elb.amazonaws.com"
+        app_module.EXPOSE_TOKEN = "sekret"
         try:
             srv, port = self._start_api()
             try:
@@ -618,10 +619,41 @@ class TestAdminAggregates(unittest.TestCase):
                 self.assertEqual(code, 200)
                 self.assertEqual(body["nlb_hostname"], "test-nlb.elb.amazonaws.com")
                 self.assertEqual(body["proxy_base"], "http://test-nlb.elb.amazonaws.com")
+                # 新增字段:任意端口模式 + 端口暴露 token
+                self.assertIn("allow_all_ports", body)
+                self.assertEqual(body["expose_token"], "sekret")
             finally:
                 srv.shutdown()
         finally:
             app_module.NLB_HOSTNAME = ""
+            app_module.EXPOSE_TOKEN = ""
+
+    @mock_aws
+    def test_proxy_requires_token_when_set(self):
+        """EXPOSE_TOKEN 非空 → 无 token 访问 /s/ 返回 401;带正确 token 放行(到 resolve 阶段)。"""
+        _create_tables()
+        import sandbox_api.app as app_module
+        from sandbox_api import db
+        db.put({"id": "tk1", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "127.0.0.1",
+                "services": [{"port": 9}], "updated_at": db._utcnow()})
+        app_module.EXPOSE_TOKEN = "sekret"
+        try:
+            srv, port = self._start_api()
+            try:
+                # 无 token → 401
+                code, _ = self._call(port, "GET", "/s/tk1/9/")
+                self.assertEqual(code, 401)
+                # 错 token → 401
+                code, _ = self._call(port, "GET", "/s/tk1/9/?token=wrong")
+                self.assertEqual(code, 401)
+                # 对 token → 通过鉴权(上游 discard:9 连不上,得到 502,但已过鉴权关)
+                code, _ = self._call(port, "GET", "/s/tk1/9/?token=sekret")
+                self.assertNotEqual(code, 401)
+            finally:
+                srv.shutdown()
+        finally:
+            app_module.EXPOSE_TOKEN = ""
 
     @mock_aws
     def test_admin_requires_admin_key(self):

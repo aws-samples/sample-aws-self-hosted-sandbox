@@ -25,6 +25,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,6 +65,12 @@ NLB_HOSTNAME    = os.environ.get("NLB_HOSTNAME", "")
 # 无需 create 时预先声明(对齐 E2B/Fly"想暴露什么端口都行"的体验)。
 # 设为 0/false 则退回"仅 services 声明端口可暴露"的白名单模式(更安全,适合多租户生产)。
 ALLOW_ALL_PORTS = os.environ.get("ALLOW_ALL_PORTS", "1").lower() in ("1", "true")
+
+# 端口暴露鉴权(#5):EXPOSE_TOKEN 非空时,访问 /s/{id}/{port}/ 必须带该 token
+# (query ?token=xxx 或 Cookie sbx_token=xxx 或 Header X-Sbx-Token)。首次带 query token
+# 访问会种 Cookie,之后浏览器内的子请求(JS/CSS/API)自动带 Cookie 免重复。
+# 留空(默认)= 公开可达(demo)。生产多租户应设置它,给每个 demo 链接附 ?token=。
+EXPOSE_TOKEN = os.environ.get("EXPOSE_TOKEN", "")
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -285,6 +292,9 @@ def admin_cluster() -> tuple[int, dict]:
         "proxy_base": f"http://{NLB_HOSTNAME}" if NLB_HOSTNAME else "",
         # 任意端口模式:前端据此提供"输入任意端口打开"的入口,而非只列 declared 端口。
         "allow_all_ports": ALLOW_ALL_PORTS,
+        # 端口暴露鉴权:非空则访问 URL 需附 ?token=。此接口本身要求 admin key,
+        # 返回 token 供 Portal 拼接可点击链接(admin 视角,可接受)。
+        "expose_token": EXPOSE_TOKEN,
     }
 
 
@@ -315,6 +325,31 @@ def admin_stats() -> tuple[int, dict]:
 #   2) 需支持"多沙盒暴露同一内部端口"——路由键是 sid,与宿主端口/Host 解耦。
 # 解析出 (sid, port) → 查 DynamoDB 拿沙盒所在 node → 转发到该 node-agent 的
 # /proxy/{sid}/{port}/{rest}(node-agent 再转进 guest 172.18.x.2:port)。
+
+def _raw_tunnel(a, b) -> None:
+    """两个已连接 socket 间双向透传字节,任一方关闭即结束(WebSocket 隧道用)。"""
+    import select
+    socks = [a, b]
+    try:
+        while True:
+            r, _, x = select.select(socks, [], socks, 300)
+            if x or not r:
+                break
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                (b if s is a else a).sendall(data)
+    finally:
+        for s in socks:
+            try:
+                s.shutdown(2)  # SHUT_RDWR
+            except OSError:
+                pass
+
 
 def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, str, str]:
     """
@@ -500,9 +535,31 @@ class Handler(BaseHTTPRequestHandler):
     def _qs(self) -> dict:
         return parse_qs(urlparse(self.path).query)
 
+    # 端口暴露鉴权(#5):EXPOSE_TOKEN 非空时校验 token。
+    # 来源优先级:query ?token= > Cookie sbx_token= > Header X-Sbx-Token。
+    # 返回 (ok, set_cookie_token)。set_cookie_token 非空表示应把它种进 Cookie。
+    def _check_expose_token(self, parsed) -> tuple[bool, str]:
+        if not EXPOSE_TOKEN:
+            return True, ""  # 未启用 → 公开
+        q = parse_qs(parsed.query)
+        qtok = (q.get("token") or [""])[0]
+        if qtok:
+            return (qtok == EXPOSE_TOKEN), (qtok if qtok == EXPOSE_TOKEN else "")
+        # Cookie
+        cookie = self.headers.get("Cookie", "")
+        for kv in cookie.split(";"):
+            if "=" in kv:
+                k, v = kv.strip().split("=", 1)
+                if k == "sbx_token" and v == EXPOSE_TOKEN:
+                    return True, ""
+        # Header
+        if self.headers.get("X-Sbx-Token", "") == EXPOSE_TOKEN:
+            return True, ""
+        return False, ""
+
     # ---------- 端口暴露反代 /s/{sid}/{port}/{rest} ----------
-    # 命中则透传到沙盒服务并返回 True。**不走 Bearer 鉴权** —— 浏览器打开 web 预览
-    # 不会带 API key(demo:公开可达;生产应在此加 token/租户校验,见设计文档 §6)。
+    # 命中则透传到沙盒服务并返回 True。**不走 Bearer 鉴权**(浏览器打开 web 预览不带 API key);
+    # 改由 EXPOSE_TOKEN 可选把关(见 _check_expose_token):留空=公开(demo),设置=需 token。
     def _maybe_proxy(self) -> bool:
         parsed = urlparse(self.path)
         parts  = parsed.path.strip("/").split("/")
@@ -515,6 +572,12 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send(400, {"error": "bad port"}); return True
 
+        ok, set_cookie = self._check_expose_token(parsed)
+        if not ok:
+            self._send(401, {"error": "unauthorized",
+                             "hint": "append ?token=<EXPOSE_TOKEN> to the URL"})
+            return True
+
         target = resolve_proxy_target(sid, port)
         if target[0] != 200:
             self._send(target[0], target[1]); return True
@@ -522,6 +585,11 @@ class Handler(BaseHTTPRequestHandler):
 
         qs = f"?{parsed.query}" if parsed.query else ""
         upstream_path = f"{up_prefix}/{rest}{qs}"
+
+        # WebSocket / Upgrade:开原始 socket 到 node-agent,重放请求后双向透传。
+        if "upgrade" in self.headers.get("Connection", "").lower() and \
+           self.headers.get("Upgrade", "").lower() == "websocket":
+            return self._tunnel_ws(node_host, upstream_path)
 
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -548,9 +616,30 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(data)))
+        # 首次用 ?token= 通过校验 → 种 Cookie,后续子请求(JS/CSS/XHR)自动带,免重复带 token。
+        if set_cookie:
+            self.send_header("Set-Cookie", f"sbx_token={set_cookie}; Path=/s/{sid}/; HttpOnly")
         self.end_headers()
         self.wfile.write(data)
         conn.close()
+        return True
+
+    def _tunnel_ws(self, node_host: str, upstream_path: str) -> bool:
+        """WebSocket 反代:向 node-agent 建原始 TCP,重放请求(含 Upgrade 头),再双向透传。"""
+        host, _, port_s = node_host.partition(":")
+        try:
+            up = socket.create_connection((host, int(port_s or NODE_AGENT_PORT)), timeout=10)
+        except OSError as e:
+            self._send(502, {"error": "ws node-agent unreachable", "hint": str(e)})
+            return True
+        lines = [f"{self.command} {upstream_path} HTTP/1.1"]
+        for k, v in self.headers.items():
+            if k.lower() == "host":
+                continue
+            lines.append(f"{k}: {v}")
+        lines.append(f"Host: {node_host}")
+        up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        _raw_tunnel(self.connection, up)
         return True
 
     def do_GET(self):

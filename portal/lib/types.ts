@@ -81,6 +81,7 @@ export interface ClusterInfo {
   nlb_hostname: string;
   proxy_base: string; // 端口暴露 URL 前缀,如 http://<nlb>;为空则用相对路径
   allow_all_ports: boolean; // 任意端口模式:true 则可打开任意端口,无需预声明
+  expose_token: string; // 端口暴露鉴权 token;非空则访问 URL 需附 ?token=
 }
 
 // BFF 统一响应封装:把上游 API 的 status/耗时/body 一起回给前端,

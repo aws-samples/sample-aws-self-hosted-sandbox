@@ -241,9 +241,18 @@ spec:
 EOF
 ```
 
-> ⚠️ **安全**：`/s/{id}/{port}` 默认**公网可达、无鉴权**（浏览器打开 web 预览不带 API key）。
-> demo 可接受；生产应在控制面 `_maybe_proxy` 加 token/租户校验，并上自定义域名 + TLS。
-> 仅 create 时 `services` 声明过的端口可被暴露（控制面 `resolve_proxy_target` 校验）。
+> ⚠️ **安全与开关**（控制面 env，均可 `kubectl set env deployment/sandbox-control-plane -n sandbox-system ...` 热更新）：
+> - **`ALLOW_ALL_PORTS`**（默认 `1`）：任意端口都可暴露,用户 guest 内起在任何端口都能经 `/s/{id}/{port}/` 访问,无需 create 时声明。设 `0` 退回"仅 `services` 声明端口"白名单模式(多租户生产更安全)。
+> - **`EXPOSE_TOKEN`**（默认空=公开）：设置后访问 `/s/` 必须带 token（`?token=xxx` / Cookie `sbx_token` / Header `X-Sbx-Token`）。生产多租户建议开启。
+> - **WebSocket** 已支持透传（Vite HMR / SSE / Web Terminal 均可）。
+> - **交互式终端 / Demo Web**：Portal 详情页"打开终端""启动 Demo Web"按钮,一键在 guest 内起服务(无需重建 rootfs)。
+> - 生产进一步建议：自定义域名 + TLS（当前 NLB 自带域名走 HTTP）。
+
+**验证任意端口 + WebSocket 终端**：
+```bash
+# 起一个终端服务(经 Portal 一键更方便;这里演示命令行)。任意端口无需声明。
+# 打开浏览器访问 http://<nlb 或 localhost:18000>/s/<id>/7681/ 即得交互式终端。
+```
 
 ---
 
