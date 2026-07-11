@@ -183,7 +183,8 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 | **隔离层** | Firecracker microVM | Firecracker microVM | Firecracker microVM | 容器（共享内核）|
 | **裸机保真度** | ✅ 最高 | ✅ 高 | ✅ 高 | ❌ 容器行为偏差 |
 | **自定义镜像** | ✅ 命名 rootfs 模板(预构建) | ✅ | ✅ | ❌ 受限 |
-| **任意端口** | ✅ 通配符子域名 + 共享 NLB | ✅ | ✅ | ❌ |
+| **任意端口暴露** | ✅ 路径路由 `/s/{id}/{port}` + 共享 NLB（支持 WebSocket）| ✅ | ✅ | ❌ |
+| **交互式 Web 终端 / 文件传输** | ✅ Portal 内置(PTY-over-WS + base64 over exec) | ✅ | 部分 | ❌ |
 | **24×7 长驻** | ✅ | ✅ | ✅ | ❌ 有 TTL |
 | **快照 suspend/resume** | ✅ 实测 1.2s | ✅ | ✅ | ❌ |
 | **凭据隔离** | ✅ LiteLLM IRSA（已落地）| ✅ | ✅ | N/A |
