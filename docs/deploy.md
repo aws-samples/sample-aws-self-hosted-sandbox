@@ -90,6 +90,24 @@ tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
 
 ---
 
+## Step 1.6: 构建自定义镜像 / rootfs 模板（可选，vibe coding / web demo 用）
+
+让 `image` 字段生效——沙盒按 image 选不同 rootfs 模板。`build-rootfs-image.sh <name> <bucket>`
+产出 `rootfs-{name}.tar.gz`,节点会造成 `/opt/sbx/rootfs-{name}.ext4`,create `image={name}` 时 CoW 它。
+内置 **`web`** 预设:自带 demo 首页 + 开机自起 :80 → 端口暴露打开即见站点。
+
+```bash
+# 构建 web 模板(与 min 同基底,叠加 demo 站点 + 开机自起 :80)
+bash scripts/build-rootfs-image.sh web "${BUCKET}"
+# → 上传到 s3://<bucket>/rootfs/rootfs-web.tar.gz
+```
+
+> 节点在 Step 2 apply 时按 `rootfs_images`(默认含 `web`)拉取这些模板造 ext4。
+> **本步须在 Step 2 之前完成**(节点 userData 启动时拉);漏了则 create `image=web` 会回退默认 min(不报错)。
+> 未列出的 image → 同样回退 min。控制面 `SANDBOX_IMAGES`(默认 `min,web`)决定 Portal 下拉列表。
+
+---
+
 ## Step 2: 创建 EKS 集群 + .metal 节点组（传 rootfs_s3_uri）
 
 ```bash
@@ -101,7 +119,10 @@ BUCKET="my-sandbox-snapshots-${ACCT}"
 terraform init && terraform apply -auto-approve \
   -var="node_arch=arm64" \
   -var="rootfs_s3_uri=s3://${BUCKET}/rootfs/min-rootfs.tar.gz" \
+  -var="rootfs_images=web" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
+# rootfs_images(默认 web):节点额外拉 rootfs-{name}.tar.gz 造 /opt/sbx/rootfs-{name}.ext4 模板;
+#   须在 Step 1.6 先构建上传对应模板。不需要自定义镜像可传 -var="rootfs_images="。
 # EKS 控制面约 10-12 分钟，加 .metal 节点组冷启动整体约 15 分钟
 # 默认起 2 台 c6g.metal（跨机快照演示需 2 台；只测 exec 可改 min/max/desired=1）
 aws eks update-kubeconfig --name claude-sbx --region us-east-1

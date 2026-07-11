@@ -1,9 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ApiResponseViewer } from "@/components/ApiResponseViewer";
 import type { ApiCallResult } from "@/lib/types";
+
+interface ImageOption {
+  name: string;
+  desc: string;
+}
 
 type Op = "create" | "get" | "suspend" | "resume" | "exec" | "destroy";
 
@@ -20,12 +25,23 @@ export default function PlaygroundPage() {
   const [op, setOp] = useState<Op>("create");
   const [id, setId] = useState("");
   const [image, setImage] = useState("");
+  const [images, setImages] = useState<ImageOption[]>([]);
   const [cpu, setCpu] = useState(2);
   const [memMib, setMemMib] = useState(4096);
   const [ports, setPorts] = useState(""); // 逗号分隔的暴露端口,如 "8080,3000"
   const [cmd, setCmd] = useState("echo hello from sandbox");
   const [result, setResult] = useState<ApiCallResult | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // 拉可用镜像/rootfs 模板列表(供下拉)
+  useEffect(() => {
+    fetch("/api/images", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => {
+        if (j?.ok && j.body?.images) setImages(j.body.images as ImageOption[]);
+      })
+      .catch(() => {});
+  }, []);
 
   const current = OPS.find((o) => o.value === op)!;
 
@@ -124,12 +140,24 @@ export default function PlaygroundPage() {
           {op === "create" ? (
             <>
               <label className="field">
-                <span className="field-label">镜像(留空用服务端默认)</span>
-                <input
-                  value={image}
-                  onChange={(e) => setImage(e.target.value)}
-                  placeholder="留空使用 SANDBOX_IMAGE 默认"
-                />
+                <span className="field-label">镜像 / rootfs 模板</span>
+                {images.length ? (
+                  <select value={image} onChange={(e) => setImage(e.target.value)}>
+                    <option value="">默认(min)</option>
+                    {images.map((im) => (
+                      <option key={im.name} value={im.name}>
+                        {im.name}
+                        {im.desc ? ` — ${im.desc}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    value={image}
+                    onChange={(e) => setImage(e.target.value)}
+                    placeholder="如 web / min(留空用默认)"
+                  />
+                )}
               </label>
               <div className="row">
                 <label className="field" style={{ flex: 1 }}>
