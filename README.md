@@ -128,15 +128,19 @@ POST /sandboxes/{id}/resume
 POST /sandboxes/{id}/exec
 {"cmd": "npm test"}
 
-# 端口暴露（vibe coding / web 预览）—— 创建时声明 services，经反代访问沙盒内服务
-POST /sandboxes  {"cpu":1,"mem_mib":512,"services":[{"port":8080}]}
-ANY  /s/{id}/{port}/{path}   # → 反代进 guest;用路径路由,支持多沙盒暴露同一端口
+# 端口暴露（vibe coding / web 预览）—— 任意端口,经反代访问沙盒内服务
+ANY  /s/{id}/{port}/{path}   # → 反代进 guest;路径路由,支持多沙盒暴露同一端口;支持 WebSocket
 ```
 
 > **端口暴露**：`/s/{id}/{port}/` 用**路径**（非子域名）定位沙盒 → 天然支持多个沙盒暴露同一内部端口
 > （两个沙盒都开 80 互不冲突）。链路 `NLB → ingress-nginx → 控制面反代 → node-agent → guest`，
-> 先用 NLB 自带域名、零自定义 DNS。启用见 [docs/deploy.md](docs/deploy.md) Step 6.5，设计见
-> [docs/端口暴露设计-firecracker.md](docs/端口暴露设计-firecracker.md)。
+> 先用 NLB 自带域名、零自定义 DNS。
+> - **任意端口**（`ALLOW_ALL_PORTS`,默认开）：用户在 guest 内起在任何端口都能访问,无需预声明。
+> - **WebSocket 透传**：Vite HMR / SSE / 交互式终端均可。
+> - **交互式 Web Terminal**：Portal 详情页"打开终端"一键在 guest 内起 PTY-over-WebSocket 终端(xterm.js),无需重建 rootfs。
+> - **可选鉴权**（`EXPOSE_TOKEN`）：设置后访问需带 `?token=`。
+>
+> 启用见 [docs/deploy.md](docs/deploy.md) Step 6.5，设计见 [docs/端口暴露设计-firecracker.md](docs/端口暴露设计-firecracker.md)。
 
 #### 5. 安全性
 - VM 级隔离：每沙盒独立 guest 内核，无共享宿主内核泄漏

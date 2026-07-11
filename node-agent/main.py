@@ -1105,6 +1105,32 @@ def _guest_ip_for(sid: str) -> str | None:
     return None
 
 
+def _raw_tunnel(a: socket.socket, b: socket.socket) -> None:
+    """在两个已连接 socket 间双向透传字节,任一方关闭即结束。
+    用于 WebSocket 等 Upgrade 连接:101 切换后是二进制帧流,代理无需理解帧,只转发字节。"""
+    import select
+    socks = [a, b]
+    try:
+        while True:
+            r, _, x = select.select(socks, [], socks, 300)
+            if x or not r:
+                break
+            for s in r:
+                try:
+                    data = s.recv(65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                (b if s is a else a).sendall(data)
+    finally:
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
 # ---------- HTTP handler ----------
 
 def _check_caller_allowed(client_ip: str) -> bool:
@@ -1169,6 +1195,11 @@ class Handler(BaseHTTPRequestHandler):
         if not guest_ip:
             self._send(404, {"error": "sandbox not running on this node", "id": sid}); return True
 
+        # WebSocket / Upgrade:开原始 socket 到 guest,原样重放请求行+头,之后双向透传字节。
+        if "upgrade" in self.headers.get("Connection", "").lower() and \
+           self.headers.get("Upgrade", "").lower() == "websocket":
+            return self._tunnel_ws(guest_ip, port, upstream_path)
+
         # 读请求体(若有)
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -1202,6 +1233,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
         conn.close()
+        return True
+
+    def _tunnel_ws(self, guest_ip: str, port: int, upstream_path: str) -> bool:
+        """WebSocket 反代:向 guest 建原始 TCP,重放本请求(含 Upgrade 头),
+        然后在 client<->guest 间双向透传字节。"""
+        try:
+            up = socket.create_connection((guest_ip, port), timeout=10)
+        except OSError as e:
+            self._send(502, {"error": "ws upstream unreachable", "hint": f"{guest_ip}:{port} — {e}"})
+            return True
+        # 重放请求行 + 原始头(WS 握手头如 Sec-WebSocket-Key 必须原样带上;Host 改成 guest)
+        lines = [f"{self.command} {upstream_path} HTTP/1.1"]
+        for k, v in self.headers.items():
+            if k.lower() == "host":
+                continue
+            lines.append(f"{k}: {v}")
+        lines.append(f"Host: {guest_ip}:{port}")
+        up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        # 交出底层 socket,双向透传(guest 的 101 响应也会原样回给 client)
+        _raw_tunnel(self.connection, up)
         return True
 
     def do_GET(self):

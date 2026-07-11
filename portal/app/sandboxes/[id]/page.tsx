@@ -9,6 +9,7 @@ import { ApiResponseViewer } from "@/components/ApiResponseViewer";
 import { ExposedServices } from "@/components/ExposedServices";
 import { fmtBytes, fmtMib, fmtSecs, fmtTime } from "@/lib/format";
 import { demoWebCommand } from "@/lib/demoWeb";
+import { termServerCommand, TERMINAL_PORT } from "@/lib/termServer";
 import type { ApiCallResult, ClusterInfo, Sandbox, SandboxEvent } from "@/lib/types";
 
 export default function SandboxDetailPage() {
@@ -18,6 +19,7 @@ export default function SandboxDetailPage() {
   const [events, setEvents] = useState<SandboxEvent[]>([]);
   const [proxyBase, setProxyBase] = useState("");
   const [allowAllPorts, setAllowAllPorts] = useState(false);
+  const [exposeToken, setExposeToken] = useState("");
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [lastCall, setLastCall] = useState<ApiCallResult | null>(null);
@@ -32,6 +34,7 @@ export default function SandboxDetailPage() {
           const c = j.body as ClusterInfo;
           setProxyBase(c.proxy_base || "");
           setAllowAllPorts(!!c.allow_all_ports);
+          setExposeToken(c.expose_token || "");
         }
       })
       .catch(() => {});
@@ -58,7 +61,13 @@ export default function SandboxDetailPage() {
     return () => clearInterval(t);
   }, [refresh]);
 
-  const act = async (action: "suspend" | "resume" | "destroy" | "exec" | "demoweb") => {
+  const proxyUrl = (port: number) => {
+    const path = `/s/${id}/${port}/`;
+    const base = proxyBase ? `${proxyBase}${path}` : path;
+    return exposeToken ? `${base}?token=${encodeURIComponent(exposeToken)}` : base;
+  };
+
+  const act = async (action: "suspend" | "resume" | "destroy" | "exec" | "demoweb" | "terminal") => {
     setBusy(action);
     try {
       let res: Response;
@@ -84,6 +93,18 @@ export default function SandboxDetailPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ cmd: demoWebCommand(id, port) }),
         });
+      } else if (action === "terminal") {
+        // 在 guest 内起 PTY-over-WebSocket 终端服务,起好后新标签打开(经端口暴露反代 + WS 透传)。
+        res = await fetch(`/api/sandboxes/${id}/exec`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cmd: termServerCommand(TERMINAL_PORT) }),
+        });
+        const j = (await res.json()) as ApiCallResult;
+        setLastCall(j);
+        if (j.ok) window.open(proxyUrl(TERMINAL_PORT), "_blank", "noreferrer");
+        setBusy(null);
+        return;
       } else {
         res = await fetch(`/api/sandboxes/${id}/${action}`, { method: "POST" });
       }
@@ -122,6 +143,14 @@ export default function SandboxDetailPage() {
           {sb ? <StatusBadge state={sb.state} /> : null}
         </div>
         <div className="btn-row">
+          <button
+            className="btn btn-sm btn-primary"
+            disabled={!!busy || sb?.state !== "running"}
+            title="在沙盒内起交互式终端并在新标签打开"
+            onClick={() => act("terminal")}
+          >
+            {busy === "terminal" ? "…" : "打开终端"}
+          </button>
           <button
             className="btn btn-sm btn-primary"
             disabled={!!busy || sb?.state !== "running"}
@@ -212,6 +241,7 @@ export default function SandboxDetailPage() {
               proxyBase={proxyBase}
               running={sb?.state === "running"}
               allowAllPorts={allowAllPorts}
+              exposeToken={exposeToken}
             />
           </div>
 

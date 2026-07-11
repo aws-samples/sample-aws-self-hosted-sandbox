@@ -15,18 +15,22 @@ export function ExposedServices({
   proxyBase,
   running,
   allowAllPorts,
+  exposeToken,
 }: {
   sid: string;
   services?: ServiceSpec[];
   proxyBase: string;
   running: boolean;
   allowAllPorts: boolean;
+  exposeToken: string;
 }) {
   const [customPort, setCustomPort] = useState("");
 
   const urlFor = (port: number | string) => {
     const path = `/s/${sid}/${port}/`;
-    return proxyBase ? `${proxyBase}${path}` : path;
+    const base = proxyBase ? `${proxyBase}${path}` : path;
+    // 鉴权开启时附 ?token=,首次访问会种 Cookie,后续子请求免带。
+    return exposeToken ? `${base}?token=${encodeURIComponent(exposeToken)}` : base;
   };
 
   const declared = services ?? [];

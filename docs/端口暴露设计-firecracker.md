@@ -163,3 +163,35 @@ tap 网段），再由它转进 guest。
 | 域名/证书 | 需通配符 DNS + 证书 | 先用 NLB 自带域名，HTTP，零 DNS |
 | 多沙盒同端口 | 靠不同子域名区分 | 靠不同 sid 路径区分（天然支持） |
 | 自动化 | create 时建 Pod/Svc/Ingress | create 无需建 K8s 对象，proxy 运行时动态路由 |
+
+---
+
+## 9. 已实现增强(2026-07 真机验证)
+
+在第 3-8 节的路径反代基础上,后续增强均已实现并在 EKS + c6g.metal 真机验证通过:
+
+### 任意端口暴露(`ALLOW_ALL_PORTS`,默认开)
+- 控制面 `resolve_proxy_target` 默认放行**任意端口**,用户在 guest 内起在任何端口的服务
+  都可经 `/s/{id}/{port}/` 访问,**无需 create 时预声明**(对齐 E2B/Fly)。
+- 设 `ALLOW_ALL_PORTS=0` 退回"仅 services 声明端口"的白名单模式(多租户生产更安全)。
+
+### WebSocket 透传
+- 控制面 `/s/` 与 node-agent `/proxy/` 均检测 `Upgrade: websocket`,命中则**原始 socket 双向隧道**
+  (101 切换后是二进制帧流,代理不解析帧只转发字节)。支持 Vite HMR、SSE、以及下面的 Web Terminal。
+- 实现:`_raw_tunnel()` + `_tunnel_ws()`(app.py / node-agent 各一份)。
+
+### 端口暴露鉴权(`EXPOSE_TOKEN`,默认关)
+- 留空 = 公开可达(demo)。设置后访问 `/s/` 必须带 token:
+  `?token=` > Cookie `sbx_token` > Header `X-Sbx-Token`。首次用 `?token=` 通过会种 Cookie,
+  之后浏览器内子请求(JS/CSS/XHR)自动带,免重复。
+- `/admin/cluster` 返回 `expose_token` 供 Portal 拼可点击链接。
+
+### 交互式 Web Terminal
+- **不改 node-agent、不重建 rootfs**:Portal 一键 exec 一段自包含的 PTY-over-WebSocket
+  python 服务(`portal/lib/termServer.ts`,guest 自带 python3 + pty + 完整 stdlib,自己做 WS 帧编解码
+  驱动 bash PTY),起在某端口,浏览器经端口暴露反代(已支持 WS)连上 → 得真实交互终端(xterm.js)。
+- 详情页"打开终端"按钮:exec 起服务 + 新标签打开。
+- 真机验证:浏览器内 `uname` → `Linux`,PTY 双向交互经两层代理正常。
+
+> Portal 本地运行(无 NLB)时,`/api/cluster` 的 BFF 把空 `proxy_base` 回退为控制面地址
+> (`SANDBOX_API_URL`,port-forward 的 `http://localhost:18000`),使终端/Web 链接指向控制面而非 Portal 自身。
