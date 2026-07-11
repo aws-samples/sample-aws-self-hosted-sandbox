@@ -688,6 +688,14 @@ class TestCustomImage(unittest.TestCase):
         self.assertEqual(normalize_image("web:latest"), "web")
         # 带 registry 前缀 + tag → 取末段去 tag
         self.assertEqual(normalize_image("123.dkr.ecr.us-east-1.amazonaws.com/sbx-web:v2"), "sbx-web")
+        # 非法字符(空格/分号/斜杠残留)→ 回退 min(安全:结果会拼进文件路径)
+        self.assertEqual(normalize_image("a b"), "min")
+        self.assertEqual(normalize_image("a;b"), "min")
+        self.assertEqual(normalize_image("a/b c"), "min")      # 末段 "b c" 含空格非法
+        # 只取末段:末段合法即返回该名(不存在的模板 node-agent 会回退 min);
+        # 关键:末段永远不含 / . 等路径字符(正则限定 [A-Za-z0-9_-]),故无路径注入。
+        self.assertEqual(normalize_image("../../etc/passwd"), "passwd")
+        self.assertEqual(normalize_image("web/../x"), "x")
 
     @mock_aws
     def test_admin_images(self):

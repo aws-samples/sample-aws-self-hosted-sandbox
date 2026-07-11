@@ -33,17 +33,24 @@ SANDBOX_IMAGES = [
 ]
 
 
+import re as _re
+_IMAGE_NAME_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
 def normalize_image(image: str) -> str:
     """把用户传的 image 归一化成 rootfs 模板名。
     - 空/default/min → "min"
     - 命中已知模板名(SANDBOX_IMAGES,或形如 ".../web:tag" 取末段去 tag) → 该名
-    - 其它 → 原样返回(node-agent 找不到模板会回退 min)"""
+    - 含非法字符(路径注入等)或空 → "min"
+    安全:结果会被 node-agent 拼进文件路径,严格限制 [A-Za-z0-9_-];node-agent 侧另有校验(纵深防御)。"""
     img = (image or "").strip()
     if not img or img in ("min", "default"):
         return "min"
     # 允许传 "web"、"web:latest"、"123.dkr.ecr.../sbx-web:tag" 之类,取末段去 tag
     last = img.rsplit("/", 1)[-1].split(":", 1)[0]
-    return last or "min"
+    if not last or not _IMAGE_NAME_RE.match(last):
+        return "min"
+    return last
 
 
 def available_images() -> list[str]:

@@ -52,14 +52,24 @@ ROOTFS       = os.environ.get("FC_ROOTFS",  "/opt/sbx/rootfs.ext4")  # 基础(�
 ROOTFS_DIR   = os.environ.get("FC_ROOTFS_DIR", "/opt/sbx")      # 命名 rootfs 模板目录
 
 
+_ROOTFS_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
 def _rootfs_template_path(name: str) -> str:
     """按镜像模板名返回 rootfs.ext4 路径。
     name 为空/"min"/"default" → 默认 ROOTFS;否则找 /opt/sbx/rootfs-{name}.ext4,
-    不存在则回退默认(保证任何 image 都能起,不因未构建模板而失败)。"""
+    不存在则回退默认(保证任何 image 都能起,不因未构建模板而失败)。
+
+    安全:name 来自用户 image 字段,严格限制为 [A-Za-z0-9_-](禁 / . 等),
+    杜绝路径注入(如 ../、绝对路径);不合法直接回退默认。"""
     name = (name or "").strip()
-    if not name or name in ("min", "default"):
+    if not name or name in ("min", "default") or not _ROOTFS_NAME_RE.match(name):
         return ROOTFS
-    cand = os.path.join(ROOTFS_DIR, f"rootfs-{name}.ext4")
+    # 二次防御:basename 后再拼,确保结果落在 ROOTFS_DIR 内
+    fname = os.path.basename(f"rootfs-{name}.ext4")
+    cand  = os.path.join(ROOTFS_DIR, fname)
+    if os.path.dirname(os.path.realpath(cand)) != os.path.realpath(ROOTFS_DIR):
+        return ROOTFS
     return cand if os.path.exists(cand) else ROOTFS
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
