@@ -246,12 +246,18 @@ EOF
 > - **`EXPOSE_TOKEN`**（默认空=公开）：设置后访问 `/s/` 必须带 token（`?token=xxx` / Cookie `sbx_token` / Header `X-Sbx-Token`）。生产多租户建议开启。
 > - **WebSocket** 已支持透传（Vite HMR / SSE / Web Terminal 均可）。
 > - **交互式终端 / Demo Web**：Portal 详情页"打开终端""启动 Demo Web"按钮,一键在 guest 内起服务(无需重建 rootfs)。
+> - **文件上传/下载**：`PUT/GET /sandboxes/{id}/files?path=`(base64 over exec,`MAX_FILE_BYTES` 默认 10MB);Portal 详情页有"文件传输"卡片。
 > - 生产进一步建议：自定义域名 + TLS（当前 NLB 自带域名走 HTTP）。
 
-**验证任意端口 + WebSocket 终端**：
+**验证任意端口 + WebSocket 终端 + 文件传输**：
 ```bash
-# 起一个终端服务(经 Portal 一键更方便;这里演示命令行)。任意端口无需声明。
-# 打开浏览器访问 http://<nlb 或 localhost:18000>/s/<id>/7681/ 即得交互式终端。
+# 终端:经 Portal "打开终端" 一键更方便;或浏览器访问 http://<nlb 或 localhost:18000>/s/<id>/7681/。
+# 文件:上传后下载校验往返
+B64=$(printf 'hello file' | base64)
+curl -s -X PUT "$BASE/sandboxes/$SID/files?path=/root/t.txt" -H "Authorization: Bearer $API_KEY" \
+  -d "{\"content_b64\":\"$B64\"}"                                    # → {"bytes":10,...}
+curl -s "$BASE/sandboxes/$SID/files?path=/root/t.txt" -H "Authorization: Bearer $API_KEY" \
+  | python3 -c "import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)['content_b64']))"  # → b'hello file'
 ```
 
 ---

@@ -759,6 +759,77 @@ class TestPortExposure(unittest.TestCase):
         self.assertNotEqual(ca[2], cb[2])   # 同 node 同端口,靠 sid 区分
 
 
+class TestFileTransfer(unittest.TestCase):
+    """文件上传/下载(base64 over exec)。用 fake exec 模拟 guest 文件系统。"""
+
+    @mock_aws
+    def test_upload_download_roundtrip(self):
+        _create_tables()
+        from sandbox_api import db, app
+        import base64
+        db.put({"id": "f1", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5", "updated_at": db._utcnow()})
+
+        # fake guest 文件系统:exec 命令里含 base64 -d > path 视为写;base64 path 视为读
+        store = {}
+        orig = app._driver
+
+        class _FakeDrv:
+            def exec(self, sid, record, cmd):
+                import re, shlex
+                if "base64 -d >" in cmd:
+                    # printf %s <b64> | base64 -d > <path>  (shlex.quote 对纯 b64 不加引号)
+                    m = re.search(r"printf %s (\S+) \| base64 -d > (\S+)", cmd)
+                    if m:
+                        b64s = shlex.split(m.group(1))[0]
+                        path = shlex.split(m.group(2))[0]
+                        store[path] = base64.b64decode(b64s)
+                        return 0, f"OK {len(store[path])}", ""
+                    return 1, "", "parse fail"
+                if cmd.strip().startswith("test -f") or "base64 " in cmd:
+                    # 读:命令含 base64 <path>;取 test -f 后的路径
+                    m = re.search(r"test -f (\S+)", cmd)
+                    path = shlex.split(m.group(1))[0] if m else ""
+                    if path not in store:
+                        return 3, "__NOFILE__", ""
+                    return 0, base64.b64encode(store[path]).decode(), ""
+                return 0, "", ""
+
+        app._driver = _FakeDrv()
+        try:
+            payload = b"hello \x00\x01 binary \xff world"
+            b64 = base64.b64encode(payload).decode()
+            code, res = app.upload_file("f1", "/tmp/x.bin", b64)
+            self.assertEqual(code, 200)
+            self.assertEqual(res["bytes"], len(payload))
+
+            code, res = app.download_file("f1", "/tmp/x.bin")
+            self.assertEqual(code, 200)
+            self.assertEqual(base64.b64decode(res["content_b64"]), payload)
+
+            # 下载不存在的文件 → 404
+            code, res = app.download_file("f1", "/tmp/nope")
+            self.assertEqual(code, 404)
+        finally:
+            app._driver = orig
+
+    @mock_aws
+    def test_upload_bad_base64(self):
+        _create_tables()
+        from sandbox_api import db, app
+        db.put({"id": "f2", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": "10.0.1.5", "updated_at": db._utcnow()})
+        code, res = app.upload_file("f2", "/tmp/x", "!!!not-base64!!!")
+        self.assertEqual(code, 400)
+
+    @mock_aws
+    def test_file_missing_sandbox(self):
+        _create_tables()
+        from sandbox_api import app
+        code, res = app.download_file("nope", "/tmp/x")
+        self.assertEqual(code, 404)
+
+
 class TestWarmPool(unittest.TestCase):
     """WarmPool replenish + claim 路径。"""
 
@@ -1032,7 +1103,7 @@ if __name__ == "__main__":
 
     for cls in [TestDB, TestFirecrackerDriver,
                 TestAPIEndToEnd, TestAdminAggregates, TestPortExposure,
-                TestWarmPool, TestAPIAuth,
+                TestFileTransfer, TestWarmPool, TestAPIAuth,
                 TestNodeRegistry, TestLeaderLock, TestReconcile]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
