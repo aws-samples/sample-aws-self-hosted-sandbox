@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 const NAV = [
   { href: "/", label: "Dashboard" },
   { href: "/playground", label: "API Playground" },
+  { href: "/deck", label: "方案讲解 (PPT)" },
 ];
 
 export function Sidebar() {
