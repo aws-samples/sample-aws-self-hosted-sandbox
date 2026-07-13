@@ -348,7 +348,7 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
             <span className="dc-icon">☁️</span>
             <h3>AWS 托管</h3>
             <p>
-              <b>Bedrock AgentCore</b> —— 每会话独立 microVM,分钟级上手;但有 8 小时运行时上限。
+              <b>Bedrock AgentCore</b> · <b>Lambda MicroVMs</b>(2026 新品)—— 每会话独立 microVM,免运维;但都有 8 小时运行时上限。
             </p>
           </div>
           <div className="deck-card">
@@ -412,6 +412,60 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
           定位:快速验证与标准 Agent 的绝佳起点。 但 8h 硬顶直接违反「24×7 常驻」、无快照违反「全生命周期」——
           <b>长驻 / 高密度 / 深度自控的场景需要自建。</b> ·{" "}
           <span className="pill">出处:AWS devguide runtime-how-it-works</span>
+        </div>
+      </div>
+    ),
+  },
+
+  // ============ 8b. AWS Lambda MicroVMs(2026 新品) ============
+  {
+    id: "lambda-microvm",
+    render: () => (
+      <div className="slide">
+        <span className="slide-kicker">④ 方案对比 · 托管路线</span>
+        <h2 className="slide-h">AWS Lambda MicroVMs:官方也认同这条路线</h2>
+        <p className="slide-lead">
+          2026-06-22 正式 GA —— AWS 首次把底层 Firecracker microVM 作为<b>用户可直接创建、连接、暂停/恢复</b>的一等资源,
+          官方场景直接点名 "AI coding assistant 与 agent 沙箱"。这恰恰印证了我们方案的技术路线是对的。
+        </p>
+        <div className="deck-split">
+          <div className="deck-card good">
+            <h3>✓ 与我们同源的能力</h3>
+            <p>
+              VM 级 Firecracker 隔离(每会话独立内核)· 原生 <b>suspend/resume 快照</b> · 跑任意容器代码与常驻进程 ·
+              每 microVM 专属 URL 直发 HTTPS · 免运维、深度嵌 AWS(IAM/S3/区域数据驻留)。
+            </p>
+          </div>
+          <div className="deck-card bad">
+            <h3>✗ 三条关键约束</h3>
+            <p>
+              <b>8 小时运行硬上限</b> —— 适合"长会话",不能真 24×7 常驻;<b>无用户可见的超卖</b>能力(密度成本不可控);
+              <b>仅 ARM64、仅 5 个区域、无中国区</b>,主权/选址受限。
+            </p>
+          </div>
+        </div>
+        <div className="deck-metrics" style={{ marginTop: 14 }}>
+          <div className="deck-metric">
+            <div className="m-val">8h</div>
+            <div className="m-lab">会话运行硬上限</div>
+          </div>
+          <div className="deck-metric">
+            <div className="m-val">16 vCPU</div>
+            <div className="m-lab">峰值上限 / 32 GB 内存</div>
+          </div>
+          <div className="deck-metric">
+            <div className="m-val">5 区</div>
+            <div className="m-lab">可用区域 · 无中国区</div>
+          </div>
+          <div className="deck-metric">
+            <div className="m-val">按秒</div>
+            <div className="m-lab">compute + 快照存储 + 流量</div>
+          </div>
+        </div>
+        <div className="slide-foot">
+          战略含义:AWS 亲自下场做 microVM 沙箱 —— <b>验证了"Firecracker 是 Agent 沙箱理想底座"这一判断</b>。
+          但它仍是托管黑盒(8h 上限 / 不可超卖 / 区域受限),<b>需要 24×7 常驻、极致密度超卖、数据落任意自有 VPC 的场景,自建仍是唯一解。</b> ·{" "}
+          <span className="pill">出处:aws.amazon.com/lambda/lambda-microvms · News Blog 2026-06-22</span>
         </div>
       </div>
     ),
@@ -567,9 +621,10 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
     render: () => (
       <div className="slide">
         <span className="slide-kicker">④ 方案对比</span>
-        <h2 className="slide-h">五种沙箱方案,一张表看清</h2>
+        <h2 className="slide-h">六种沙箱方案,一张表看清</h2>
         <p className="slide-lead">
-          把启动、隔离、暂停恢复、成本、时长上限拉平了比 —— 只有自建沙盒兼具低成本、可超卖与快照,控制力最强。
+          把启动、隔离、暂停恢复、成本、时长上限拉平了比 —— 即便算上 AWS 官方新品 Lambda MicroVMs,
+          也只有自建沙盒同时兼具低成本、可超卖、快照与真 24×7 常驻。
         </p>
         <div className="deck-table-wrap">
           <table className="deck-table">
@@ -586,13 +641,22 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
             </thead>
             <tbody>
               <tr>
-                <td>AWS Lambda</td>
+                <td>AWS Lambda(函数)</td>
                 <td>非冷启 10ms 级</td>
                 <td><span className="tick">高</span></td>
                 <td><span className="cross">不支持</span></td>
                 <td><span className="tick">低</span></td>
                 <td><span className="warn">15 分钟</span></td>
                 <td>请求数 + 执行时间</td>
+              </tr>
+              <tr>
+                <td>Lambda MicroVMs<span className="dim" style={{ fontSize: 11 }}> · 2026 新品</span></td>
+                <td>快照 resume 近瞬时</td>
+                <td><span className="tick">高</span></td>
+                <td><span className="tick">支持(快照)</span></td>
+                <td><span className="tick">低</span></td>
+                <td><span className="warn">8 小时</span></td>
+                <td>按秒 + 快照存储</td>
               </tr>
               <tr>
                 <td>容器 EKS / ECS</td>
@@ -634,8 +698,9 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
           </table>
         </div>
         <div className="slide-foot">
-          关键洞察:容器成本灵活但隔离最弱;microVM 方案(AgentCore / E2B / 自建)兼顾强隔离与快启动;
-          <b>只有自建沙盒同时拿下低成本、超卖与暂停/恢复。</b> 代价是要自研编排/rootfs/网络 —— 下面展示我们已建好这套底座。
+          关键洞察:容器成本灵活但隔离最弱;microVM 方案(AgentCore / Lambda MicroVMs / E2B / 自建)兼顾强隔离与快启动;
+          但托管方案都有时长上限(8h/15min)且不可超卖 —— <b>只有自建沙盒同时拿下低成本、超卖、快照与真 24×7 常驻。</b>
+          代价是要自研编排/rootfs/网络 —— 下面展示我们已建好这套底座。
         </div>
       </div>
     ),
@@ -775,7 +840,7 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
           </div>
         </div>
         <div className="slide-foot">
-          外加第七块 —— <b>Fly Machines 风格 REST API</b>:一套幂等 API 覆盖创建/exec/快照/文件/端口的完整生命周期(第 17 页)。
+          外加第七块 —— <b>Fly Machines 风格 REST API</b>:一套幂等 API 覆盖创建/exec/快照/文件/端口的完整生命周期(见后页)。
         </div>
       </div>
     ),
