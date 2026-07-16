@@ -108,6 +108,26 @@ create 请求 ──► 原子 claim 一个 warm ──► resume(~0.13s) ──
 > 暖池依赖 suspend/resume 快照能力。`GET /capabilities` 的 `warm_pool` 字段反映是否启用。
 > 暖池已于 2026-07-07 真机 e2e 验证通过（含 resume 落原节点、vsock exec、池空降级），过程修复 4 个真机 bug，详见 **[docs/暖池-真机测试报告-2026-07-07.md](docs/暖池-真机测试报告-2026-07-07.md)**。
 
+#### 3.5 自动休眠 / 唤醒（auto-sleep / auto-wake）：没流量自己睡，来请求自动醒，对齐 fly.io
+
+暖池解决"创建快"，自动休眠解决"没人用时别烧钱"。**沙盒空闲一段时间就自动打快照休眠释放 RAM；下次请求打到网关层，透明 resume 唤醒，用户无感**——这正是 fly.io Machines 的 `auto_stop` / `auto_start` 体验。
+
+```
+running ──(空闲超 idle 阈值, 后台扫描)──► 自动 sleep ──► slept  ← 释放 RAM,快照落持久 EBS
+   ▲                                                       │
+   └────(请求打到网关 /s/{id}/{port}/, 透明 resume ~0.13s)──┘   ← 首请求略慢,之后无感
+```
+
+- **opt-in，默认关**：复用 Fly 语义的 `services[].autostop` / `autostart` 字段。create 时声明 `{"port":80,"autostop":true,"autostart":true}` 才启用（或用 `meta.auto_sleep` / `meta.auto_wake`）。不声明的沙盒行为完全不变。
+- **自动休眠(`slept`)与手动挂起(`suspended`)严格区分**：这是关键设计。手动 `POST /suspend` 标 `suspended`，网关**不会**自动唤醒它；只有空闲自动休眠的 `slept` 会被请求唤醒。状态一眼可辨（Portal 徽章:`slept`=靛蓝、`suspended`=灰）。
+- **活跃信号**：经网关的 HTTP 流量（`/s/{id}/{port}/`）与 `exec` 都刷新"最后活跃时间"`last_active_at`；热路径内存节流（默认 15s 内不重复写 DynamoDB），避免写放大。
+- **网关透明唤醒**：`/s/` 反代遇到 `slept` 沙盒 → 触发 resume 并等其回 running 再转发（首请求阻塞 ~秒级,与 fly 一致）；并发请求靠 lease 条件写互斥，只有一个真正 resume。
+- **后台扫描**：leader 门控的周期 loop（复用 reconcile/暖池同一 leader 锁，多副本不重复触发）；拿 lease 后**二次校验仍空闲**，防"扫描判定→加锁"之间刚来请求被误睡。
+- **复用现有并发保护**：自动休眠走与手动 suspend 同一套 `lease + prev_state 条件写 + 失败回滚`，快照失败回滚 `running` 绝不静默丢数据。
+- 可调 env：`AUTO_SLEEP_ENABLED`（默认 1）/ `AUTO_SLEEP_IDLE_S`（默认 300s）/ `AUTO_SLEEP_SCAN_S`（默认 30s）/ `AUTO_WAKE_TIMEOUT_S`（默认 30s）/ `ACTIVITY_TOUCH_MIN_S`（默认 15s）。实现见 `sandbox-api/autosleep.py`。
+
+> 依赖 suspend/resume 快照能力（同暖池）。已于 2026-07-16 真机 e2e 验证通过（A0~A5，含自动/手动区分、网关透明唤醒 ~2.1s），详见 **[docs/自动休眠-真机测试报告-2026-07-16.md](docs/自动休眠-真机测试报告-2026-07-16.md)**；脚本 `scripts/autosleep_e2e.sh`。
+
 #### 4. API 开发者友好性
 
 ```bash

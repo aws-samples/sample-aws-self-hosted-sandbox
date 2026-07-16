@@ -268,6 +268,14 @@ EOF
 > - **WebSocket** 已支持透传（Vite HMR / SSE / Web Terminal 均可）。
 > - **交互式终端 / Demo Web**：Portal 详情页"打开终端""启动 Demo Web"按钮,一键在 guest 内起服务(无需重建 rootfs)。
 > - **文件上传/下载**：`PUT/GET /sandboxes/{id}/files?path=`(base64 over exec,`MAX_FILE_BYTES` 默认 10MB);Portal 详情页有"文件传输"卡片。
+> - **自动休眠 / 唤醒(auto-sleep / auto-wake)**：空闲沙盒自动打快照进 `slept` 状态释放 RAM,请求打到网关 `/s/` 透明 resume 唤醒(对齐 fly.io)。**opt-in,默认关**:仅对创建时声明了 `services[].autostop/autostart`(或 `meta.auto_sleep/auto_wake`)的沙盒生效。控制面 env(可 `kubectl set env` 热更新):
+>   - `AUTO_SLEEP_ENABLED`(默认 `1`):总开关(仅作用于 opt-in 沙盒;`0` 整体关闭扫描)。
+>   - `AUTO_SLEEP_IDLE_S`(默认 `300`):空闲多久(秒)后自动休眠。**实际入睡 = 该值 + 最多一个扫描周期**。演示可临时设小(如 `30`)。
+>   - `AUTO_SLEEP_SCAN_S`(默认 `30`):后台扫描间隔;leader 门控,多副本只有 leader 扫描。
+>   - `AUTO_WAKE_TIMEOUT_S`(默认 `30`):网关触发 resume 后等其回 running 的超时。
+>   - `ACTIVITY_TOUCH_MIN_S`(默认 `15`):活跃时间写节流下限,防热路径写放大。
+>   - **自动休眠(`slept`)与手动挂起(`suspended`)严格区分**:只有 `slept` 会被网关请求唤醒;手动 `POST /suspend` 的 `suspended` 网关不唤醒(维持 409)。Portal 徽章 `slept`=靛蓝、`suspended`=灰。
+>   - Portal API Playground 创建表单有"自动休眠 / 唤醒"复选框,勾选即带上 opt-in 字段,便于测试。验证脚本:`scripts/autosleep_e2e.sh`(A0~A5)。
 > - 生产进一步建议：自定义域名 + TLS（当前 NLB 自带域名走 HTTP）。
 
 **验证任意端口 + WebSocket 终端 + 文件传输**：
@@ -345,6 +353,30 @@ curl -s $BASE/s/$SA/80/    # → AAA
 curl -s $BASE/s/$SB/80/    # → BBB   ← 两个都开 80、可能同一 metal，靠 sid 区分不串
 curl -s $BASE/s/$SA/3000/  # → 403 port not exposed(仅 services 声明的端口可暴露)
 ```
+
+**验证自动休眠 / 唤醒**（auto-sleep / auto-wake）—— 一键 e2e(A0~A5,含自动/手动区分):
+
+```bash
+# 建议先把 idle 阈值临时调小便于观察(演示用;生产保持 300+)
+kubectl set env deployment/sandbox-control-plane -n sandbox-system \
+  AUTO_SLEEP_IDLE_S=30 AUTO_SLEEP_SCAN_S=15
+kubectl rollout status deployment/sandbox-control-plane -n sandbox-system
+
+# 自动 port-forward + 全流程验证(ALLOW_UNAUTHENTICATED 时可省 --api-key)
+bash scripts/autosleep_e2e.sh --idle 30 --api-key "$API_KEY"
+# 预期:A2 自动进 slept(≠ suspended)、A3 网关 /s/ 首请求透明唤醒回 running、
+#       A4 保活不误睡、A5 手动 suspended 网关不唤醒(409)
+```
+
+> 手工快速验证:创建带 opt-in 的沙盒 → 静置 → 观察状态变 `slept`(非 `suspended`)→ `curl $BASE/s/<id>/80/` 透明唤醒。
+> ```bash
+> SID=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
+>   -d '{"image":"web","cpu":2,"mem_mib":2048,"services":[{"port":80,"autostop":true,"autostart":true}],"meta":{"auto_sleep":true,"auto_wake":true}}' \
+>   | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+> # 等 idle+扫描周期后:
+> curl -s $BASE/sandboxes/$SID | python3 -c "import sys,json;print(json.load(sys.stdin)['state'])"  # → slept
+> curl -s $BASE/s/$SID/80/ >/dev/null; curl -s $BASE/sandboxes/$SID | python3 -c "import sys,json;print(json.load(sys.stdin)['state'])"  # → running(被唤醒)
+> ```
 
 **验证 P0 高可用编排能力**（reconcile / 心跳 / leader / S3 强一致）：
 

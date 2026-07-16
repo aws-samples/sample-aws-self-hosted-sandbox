@@ -99,6 +99,39 @@ variable "control_plane_replicas" {
   default = 2
 }
 
+# ---------- 自动休眠 / 唤醒(auto-sleep / auto-wake,对齐 fly.io)----------
+# 空闲沙盒自动打快照进 slept 状态释放 RAM;请求打到网关透明 resume。opt-in:仅对声明了
+# autostop/autostart(或 meta.auto_sleep/auto_wake)的沙盒生效,默认关。这里是【全局阈值】。
+variable "auto_sleep_enabled" {
+  type        = string
+  default     = "1"
+  description = "自动休眠总开关(1=开,仅作用于 opt-in 沙盒;0=整体关闭自动休眠扫描)。"
+}
+
+variable "auto_sleep_idle_s" {
+  type        = number
+  default     = 300
+  description = "沙盒空闲多久(秒)后自动休眠。实际入睡 = 该值 + 最多一个扫描周期。生产建议 300+。"
+}
+
+variable "auto_sleep_scan_s" {
+  type        = number
+  default     = 30
+  description = "自动休眠后台扫描间隔(秒)。leader 门控,多副本只有 leader 扫描。"
+}
+
+variable "auto_wake_timeout_s" {
+  type        = number
+  default     = 30
+  description = "网关透明唤醒等待上限(秒):slept 沙盒被请求触发 resume 后,网关等其回 running 的超时。"
+}
+
+variable "activity_touch_min_s" {
+  type        = number
+  default     = 15
+  description = "活跃时间(last_active_at)写节流下限(秒):热路径(proxy/exec)最多每这么久写一次 DynamoDB,防写放大。"
+}
+
 variable "node_arch" {
   type        = string
   default     = "arm64"
@@ -485,9 +518,15 @@ resource "kubernetes_config_map" "control_plane" {
     SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
     WARM_POOL_SIZE        = tostring(var.warm_pool_size)
     WARM_POOL_REFILL_S    = "60"
-    LISTEN_PORT           = "8000"
-    LISTEN_HOST           = "0.0.0.0"
-    NODE_AGENT_PORT       = "8002"
+    # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。
+    AUTO_SLEEP_ENABLED   = var.auto_sleep_enabled
+    AUTO_SLEEP_IDLE_S    = tostring(var.auto_sleep_idle_s)
+    AUTO_SLEEP_SCAN_S    = tostring(var.auto_sleep_scan_s)
+    AUTO_WAKE_TIMEOUT_S  = tostring(var.auto_wake_timeout_s)
+    ACTIVITY_TOUCH_MIN_S = tostring(var.activity_touch_min_s)
+    LISTEN_PORT          = "8000"
+    LISTEN_HOST          = "0.0.0.0"
+    NODE_AGENT_PORT      = "8002"
     # 端口暴露:对外访问前缀(NLB 自带域名)。供控制面 /admin/cluster 返回给 Portal 拼
     # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
     NLB_HOSTNAME = var.nlb_hostname
