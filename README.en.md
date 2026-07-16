@@ -55,10 +55,21 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 | **Interactive web terminal / file transfer** | ✅ Built into Portal (PTY-over-WS + base64 over exec) | ✅ | Partial | ❌ |
 | **24×7 persistent** | ✅ | ✅ | ✅ | ❌ TTL enforced |
 | **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |
+| **Auto-sleep / auto-wake** | ✅ Idle → `slept`; gateway request transparently resumes (opt-in via `autostop`/`autostart`) | ✅ | ✅ auto_stop/auto_start | ❌ |
 | **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
 | **Data sovereignty** | ✅ Stays in your AWS account | ❌ 3rd party | ❌ 3rd party | ✅ |
 | **K8s ecosystem** | ✅ Native | ❌ | ❌ | ❌ |
 | **Min. monthly cost (1 machine)** | **~$632/mo** (spot + snapshot recovery) | Managed pricing | Managed pricing | Per-call |
+
+#### Auto-sleep / auto-wake (fly.io-style)
+
+Idle sandboxes snapshot themselves to a distinct `slept` state (freeing RAM); the next request hitting the gateway `/s/{id}/{port}/` transparently resumes them (~0.13s) — no user action needed.
+
+- **Opt-in, off by default** — reuses Fly's `services[].autostop` / `autostart` fields (or `meta.auto_sleep` / `auto_wake`). Sandboxes that don't declare them are unaffected.
+- **Auto-sleep (`slept`) vs manual suspend (`suspended`) are strictly separated** — only `slept` is auto-woken by the gateway; a manually `suspended` sandbox is never resumed by a request.
+- **Activity signals**: gateway HTTP traffic and `exec` refresh `last_active_at` (in-memory throttled to avoid write amplification).
+- Reuses the same `lease + conditional-write + rollback` concurrency guard as manual suspend; scan loop is leader-gated (shares the reconcile/warm-pool leader lock) and re-checks idleness after acquiring the lease to avoid racing a fresh request.
+- Tunables: `AUTO_SLEEP_ENABLED` / `AUTO_SLEEP_IDLE_S` (default 300s) / `AUTO_SLEEP_SCAN_S` / `AUTO_WAKE_TIMEOUT_S` / `ACTIVITY_TOUCH_MIN_S`. Implementation in `sandbox-api/autosleep.py`; e2e in `scripts/autosleep_e2e.sh`. Real-machine verified 2026-07-16 (see `docs/自动休眠-真机测试报告-2026-07-16.md`).
 
 ### Architecture
 

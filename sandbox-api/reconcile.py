@@ -26,7 +26,8 @@ import uuid
 from sandbox_api import db
 
 # 对账关注的"活跃"状态(终态 destroying/failed/orphaned/needs_reschedule 不管)
-_ACTIVE_STATES = ["running", "suspended", "suspending", "resuming"]
+# slept = 自动休眠(与手动 suspended 同样有 S3/EBS 快照),对账时按同等方式处理。
+_ACTIVE_STATES = ["running", "suspended", "suspending", "resuming", "slept"]
 
 RECONCILE_EVERY   = int(os.environ.get("RECONCILE_EVERY_S", "20"))
 LEADER_LOCK_ID    = os.environ.get("LEADER_LOCK_ID", "reconciler")
@@ -102,8 +103,8 @@ class Reconciler:
             node_alive = node in active or _host_of(node) in active
 
             if not node_alive:
-                # 死节点:suspended 快照在 S3 → 可留待重调度;其他态无法恢复 → orphaned
-                if state == "suspended":
+                # 死节点:suspended/slept 快照已持久(S3/EBS)→ 可留待重调度;其他态无法恢复 → orphaned
+                if state in ("suspended", "slept"):
                     self._mark(sid, "needs_reschedule", state,
                                reason="node_down", node=node)
                     stats["needs_reschedule"] += 1

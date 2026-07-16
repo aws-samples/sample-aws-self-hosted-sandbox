@@ -1130,6 +1130,164 @@ class TestReconcile(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────
+# 自动休眠 / 唤醒(auto-sleep / auto-wake)
+# ────────────────────────────────────────────────
+
+class TestAutoSleep(unittest.TestCase):
+    """空闲自动休眠(slept)+ 网关透明唤醒 + 手动/自动区分。"""
+
+    def _mk_running(self, sid, *, autostop=False, autostart=False,
+                    idle_s=0.0, tenant="t1", pool=False):
+        """造一条 running 记录,last_active_at 设为 idle_s 秒前。"""
+        from sandbox_api import db
+        rec = {
+            "id": sid, "tenant_id": ("__pool__" if pool else tenant),
+            "state": "running", "driver": "firecracker", "node": "10.0.1.5",
+            "tap_idx": 1, "updated_at": db._utcnow(),
+            "last_active_at": db._utcnow_minus(int(idle_s)) if idle_s else db._utcnow(),
+            "services": [{"port": 80, "autostop": autostop, "autostart": autostart}],
+        }
+        if pool:
+            rec["pool_state"] = "warm"
+        db.put(rec)
+        return rec
+
+    @mock_aws
+    def test_idle_seconds_and_optin(self):
+        _create_tables()
+        from sandbox_api import app, db
+        # opt-in 判定
+        self.assertTrue(app._autostop_enabled({"services": [{"port": 80, "autostop": True}]}))
+        self.assertFalse(app._autostop_enabled({"services": [{"port": 80}]}))
+        self.assertTrue(app._autostop_enabled({"meta": {"auto_sleep": True}}))
+        self.assertTrue(app._autostart_enabled({"services": [{"port": 80, "autostart": True}]}))
+        self.assertFalse(app._autostart_enabled({"services": []}))
+        # idle 计算
+        rec = {"last_active_at": db._utcnow_minus(120)}
+        self.assertGreaterEqual(app._idle_seconds(rec), 119)
+        self.assertIsNone(app._idle_seconds({}))
+
+    @mock_aws
+    def test_scan_selects_idle_optin_only(self):
+        _create_tables()
+        from sandbox_api import app, db
+        from sandbox_api.autosleep import AutoSleeper
+        # 造 4 个:①空闲+opt-in(应睡)②空闲但未 opt-in(不睡)③opt-in 但活跃(不睡)④暖池(不睡)
+        self._mk_running("idle-optin",   autostop=True,  idle_s=999)
+        self._mk_running("idle-noopt",   autostop=False, idle_s=999)
+        self._mk_running("active-optin", autostop=True,  idle_s=0)
+        self._mk_running("pool-optin",   autostop=True,  idle_s=999, pool=True)
+
+        slept_ids = []
+        def _fake_sleep(sid):
+            db.force_update(sid, {"state": "slept"})
+            slept_ids.append(sid)
+            return 200, {"state": "slept"}
+
+        sleeper = AutoSleeper(sleep_fn=_fake_sleep,
+                              idle_seconds_fn=app._idle_seconds,
+                              autostop_fn=app._autostop_enabled)
+        # IDLE_S 用模块默认 300;idle_s=999 超过,idle_s=0 不超过
+        stats = sleeper.scan_once()
+        self.assertEqual(slept_ids, ["idle-optin"])
+        self.assertEqual(stats["slept"], 1)
+
+    @mock_aws
+    def test_auto_sleep_marks_slept_not_suspended(self):
+        """auto_sleep_sandbox 把空闲沙盒标 slept(非 suspended),并写 idle 事件。"""
+        _create_tables()
+        from sandbox_api import app, db
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        app._driver = FirecrackerDriver()
+        # 用极小 idle 阈值,造一个空闲 5s 的沙盒
+        old_idle = app.AUTO_SLEEP_IDLE_S
+        app.AUTO_SLEEP_IDLE_S = 1
+        try:
+            cf = app._driver.create("as1", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
+            db.put({"id": "as1", "tenant_id": "t1", "state": "running",
+                    "driver": "firecracker", **cf,
+                    "last_active_at": db._utcnow_minus(60),
+                    "services": [{"port": 80, "autostop": True, "autostart": True}],
+                    "updated_at": db._utcnow()})
+            code, body = app.auto_sleep_sandbox("as1")
+            self.assertEqual(code, 200)
+            self.assertEqual(db.get("as1")["state"], "slept")   # 关键:slept 而非 suspended
+            evs = db.list_events("as1")
+            self.assertTrue(any(e["event"] == "slept" and e.get("detail", {}).get("reason") == "idle" for e in evs))
+        finally:
+            app.AUTO_SLEEP_IDLE_S = old_idle
+
+    @mock_aws
+    def test_auto_sleep_skips_recently_active(self):
+        """二次校验:加锁后发现不再空闲 → 放弃,不误睡。"""
+        _create_tables()
+        from sandbox_api import app, db
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        app._driver = FirecrackerDriver()
+        cf = app._driver.create("as2", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
+        db.put({"id": "as2", "tenant_id": "t1", "state": "running",
+                "driver": "firecracker", **cf,
+                "last_active_at": db._utcnow(),   # 刚活跃
+                "services": [{"port": 80, "autostop": True}],
+                "updated_at": db._utcnow()})
+        code, body = app.auto_sleep_sandbox("as2")
+        self.assertEqual(code, 200)
+        self.assertIn("skipped", body)
+        self.assertEqual(db.get("as2")["state"], "running")  # 未被睡
+
+    @mock_aws
+    def test_resume_accepts_slept(self):
+        """resume_sandbox 能从 slept 恢复(网关唤醒共用此路径)。"""
+        _create_tables()
+        from sandbox_api import app, db
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        app._driver = FirecrackerDriver()
+        cf = app._driver.create("as3", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
+        db.put({"id": "as3", "tenant_id": "t1", "state": "slept",
+                "driver": "firecracker", **cf,
+                "services": [{"port": 80, "autostart": True}],
+                "updated_at": db._utcnow()})
+        code, body = app.resume_sandbox("as3")
+        self.assertEqual(code, 200)
+        self.assertEqual(db.get("as3")["state"], "running")
+
+    @mock_aws
+    def test_gateway_wakes_slept_not_suspended(self):
+        """网关:slept+autostart 透明唤醒;手动 suspended 不唤醒(维持 409)。核心区分验证。"""
+        _create_tables()
+        from sandbox_api import app, db
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        app._driver = FirecrackerDriver()
+
+        # ① slept + autostart → 网关解析时被唤醒,返回 200 转发目标
+        cf = app._driver.create("wk1", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
+        db.put({"id": "wk1", "tenant_id": "t1", "state": "slept",
+                "driver": "firecracker", **cf,
+                "services": [{"port": 80, "autostart": True}],
+                "updated_at": db._utcnow()})
+        res = app.resolve_proxy_target("wk1", 80)
+        self.assertEqual(res[0], 200)                      # 唤醒成功 → 可转发
+        self.assertEqual(db.get("wk1")["state"], "running")
+
+        # ② 手动 suspended → 网关不唤醒,维持 409
+        db.put({"id": "wk2", "tenant_id": "t1", "state": "suspended",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 80, "autostart": True}],  # 即使声明 autostart,手动挂起也不被唤醒
+                "updated_at": db._utcnow()})
+        res2 = app.resolve_proxy_target("wk2", 80)
+        self.assertEqual(res2[0], 409)
+        self.assertEqual(db.get("wk2")["state"], "suspended")  # 未被唤醒
+
+        # ③ slept 但未 opt-in autostart → 不唤醒,409
+        db.put({"id": "wk3", "tenant_id": "t1", "state": "slept",
+                "driver": "firecracker", "node": "10.0.1.5",
+                "services": [{"port": 80}],   # 无 autostart
+                "updated_at": db._utcnow()})
+        res3 = app.resolve_proxy_target("wk3", 80)
+        self.assertEqual(res3[0], 409)
+
+
+# ────────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────────
 
@@ -1140,7 +1298,7 @@ if __name__ == "__main__":
     for cls in [TestDB, TestFirecrackerDriver,
                 TestAPIEndToEnd, TestAdminAggregates, TestCustomImage, TestPortExposure,
                 TestFileTransfer, TestWarmPool, TestAPIAuth,
-                TestNodeRegistry, TestLeaderLock, TestReconcile]:
+                TestNodeRegistry, TestLeaderLock, TestReconcile, TestAutoSleep]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

@@ -29,6 +29,7 @@ export default function PlaygroundPage() {
   const [cpu, setCpu] = useState(2);
   const [memMib, setMemMib] = useState(4096);
   const [ports, setPorts] = useState(""); // 逗号分隔的暴露端口,如 "8080,3000"
+  const [autoSleep, setAutoSleep] = useState(false); // 自动休眠/唤醒(默认关,opt-in)
   const [cmd, setCmd] = useState("echo hello from sandbox");
   const [result, setResult] = useState<ApiCallResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,7 +56,11 @@ export default function PlaygroundPage() {
             .split(",")
             .map((p) => p.trim())
             .filter(Boolean)
-            .map((p) => ({ port: Number(p) }))
+            .map((p) => ({
+              port: Number(p),
+              // 自动休眠开启时,给每个声明端口也带上 autostop/autostart(Fly 语义)
+              ...(autoSleep ? { autostop: true, autostart: true } : {}),
+            }))
             .filter((s) => Number.isFinite(s.port) && s.port > 0);
           res = await fetch("/api/sandboxes", {
             method: "POST",
@@ -65,6 +70,8 @@ export default function PlaygroundPage() {
               cpu,
               mem_mib: memMib,
               services: services.length ? services : undefined,
+              // meta 开关:不依赖端口声明也能启用自动休眠/唤醒(后端 _autostop/_autostart_enabled 认它)
+              ...(autoSleep ? { meta: { auto_sleep: true, auto_wake: true } } : {}),
             }),
           });
           break;
@@ -187,6 +194,20 @@ export default function PlaygroundPage() {
                   onChange={(e) => setPorts(e.target.value)}
                   placeholder="例如 8080,3000 — 创建后详情页给出可点击 URL"
                 />
+              </label>
+              <label
+                className="field"
+                style={{ flexDirection: "row", alignItems: "center", gap: 8, cursor: "pointer" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={autoSleep}
+                  onChange={(e) => setAutoSleep(e.target.checked)}
+                  style={{ width: "auto", margin: 0 }}
+                />
+                <span className="field-label" style={{ margin: 0 }}>
+                  自动休眠 / 唤醒(空闲自动 sleep,来请求自动醒)
+                </span>
               </label>
             </>
           ) : null}

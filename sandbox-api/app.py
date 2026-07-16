@@ -35,6 +35,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from sandbox_api import db
+from sandbox_api.autosleep import AutoSleeper
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.reconcile import Reconciler
 from sandbox_api.warm_pool import WarmPool
@@ -71,6 +72,22 @@ ALLOW_ALL_PORTS = os.environ.get("ALLOW_ALL_PORTS", "1").lower() in ("1", "true"
 # 访问会种 Cookie,之后浏览器内的子请求(JS/CSS/API)自动带 Cookie 免重复。
 # 留空(默认)= 公开可达(demo)。生产多租户应设置它,给每个 demo 链接附 ?token=。
 EXPOSE_TOKEN = os.environ.get("EXPOSE_TOKEN", "")
+
+# ---------- 自动休眠 / 唤醒(auto-sleep / auto-wake,对齐 fly.io)----------
+# 没流量 → 自动 sleep(打快照释放 RAM,进独立状态 slept);来请求 → 网关层透明 resume。
+# 与手动 /suspend 严格区分:手动挂起标 suspended,网关【不会】自动唤醒它;只有自动休眠
+# 的 slept 会被 /s/{id}/{port}/ 请求触发唤醒。opt-in:仅对声明了 autostop/autostart 的
+# 沙盒生效(见 _autostop_enabled / _autostart_enabled),默认关,符合"显式开"。
+AUTO_SLEEP_ENABLED   = os.environ.get("AUTO_SLEEP_ENABLED", "1").lower() in ("1", "true")
+AUTO_SLEEP_IDLE_S    = int(os.environ.get("AUTO_SLEEP_IDLE_S", "300"))   # 空闲多久自动 sleep
+AUTO_WAKE_TIMEOUT_S  = int(os.environ.get("AUTO_WAKE_TIMEOUT_S", "30"))  # 网关唤醒等待上限
+# 活跃时间写节流:热路径(每次 proxy/exec)都写 DynamoDB 会放大写量,故内存里记上次写入
+# 时刻,距上次 < ACTIVITY_TOUCH_MIN_S 则跳过写。多副本各自节流,写放大上界 = 副本数 ×
+# (1/间隔),可接受。
+ACTIVITY_TOUCH_MIN_S = int(os.environ.get("ACTIVITY_TOUCH_MIN_S", "15"))
+import threading as _th_activity
+_ACTIVITY_LAST: dict[str, float] = {}   # sid → 上次写 last_active_at 的 monotonic 时刻
+_ACTIVITY_LOCK = _th_activity.Lock()
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -133,6 +150,39 @@ def _check_auth(handler: "Handler") -> bool:
     return False
 
 
+# ---------- 自动休眠 / 唤醒 辅助 ----------
+
+def _touch_activity(sid: str) -> None:
+    """刷新沙盒最后活跃时间(last_active_at)。热路径调用,内存节流避免每请求都写 DynamoDB:
+    距上次写 < ACTIVITY_TOUCH_MIN_S 则跳过。失败静默(活跃时间尽力而为,不阻断请求)。"""
+    now_mono = time.monotonic()
+    with _ACTIVITY_LOCK:
+        last = _ACTIVITY_LAST.get(sid, 0.0)
+        if now_mono - last < ACTIVITY_TOUCH_MIN_S:
+            return
+        _ACTIVITY_LAST[sid] = now_mono
+    try:
+        db.force_update(sid, {"last_active_at": db._utcnow()})
+    except Exception:
+        pass
+
+
+def _autostop_enabled(record: dict) -> bool:
+    """该沙盒是否开启自动休眠(Fly 语义)。任一 service.autostop 为真,或 meta.auto_sleep 为真。
+    默认关(opt-in):无声明则不自动休眠。"""
+    if any(s.get("autostop") for s in record.get("services", [])):
+        return True
+    return bool((record.get("meta") or {}).get("auto_sleep"))
+
+
+def _autostart_enabled(record: dict) -> bool:
+    """该沙盒是否允许网关透明唤醒(Fly 语义)。任一 service.autostart 为真,或 meta.auto_wake 为真。
+    默认关(opt-in):无声明则网关不自动唤醒(维持 409)。"""
+    if any(s.get("autostart") for s in record.get("services", [])):
+        return True
+    return bool((record.get("meta") or {}).get("auto_wake"))
+
+
 # ---------- 业务逻辑 ----------
 
 def create_sandbox(body: dict) -> tuple[int, dict]:
@@ -163,6 +213,8 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         "mem_mib":          spec.mem_mib,
         "created_at":       db._utcnow(),
         "updated_at":       db._utcnow(),
+        # 自动休眠用:最后活跃时刻。初始 = 创建时刻;之后由 proxy/exec 热路径 _touch_activity 刷新。
+        "last_active_at":   db._utcnow(),
         "meta":             spec.meta,
         # 声明要暴露的服务端口 —— 供端口暴露反代(/s/{id}/{port})校验"该端口是否允许对外"。
         "services":         [{"port": s.port, "protocol": s.protocol,
@@ -258,7 +310,7 @@ def _check_tenant_access(record: dict, caller_tenant: str | None) -> tuple[int, 
 # 这里仅把它们暴露成只读 GET。均要求 admin(default)key,不改任何写路径。
 # 覆盖沙盒的全部生命周期状态(含暖池/对账态),供总览表格与计数卡片。
 _ALL_STATES = [
-    "creating", "running", "suspending", "suspended", "resuming",
+    "creating", "running", "suspending", "suspended", "slept", "resuming",
     "destroying", "failed", "warm", "orphaned", "needs_reschedule",
 ]
 
@@ -367,6 +419,43 @@ def _raw_tunnel(a, b) -> None:
                 pass
 
 
+def _ensure_awake(sid: str, record: dict) -> dict:
+    """
+    网关透明唤醒(fly.io 式):请求打到网关时,若沙盒是自动休眠(slept)且允许 autostart,
+    则触发 resume 并等待其回到 running,返回最新 record;否则原样返回(由调用方走既有 409)。
+
+    - running          → 原样返回。
+    - slept + autostart → 触发 resume(并发请求靠 lease 条件写天然互斥,只有一个真正 resume,
+      其余落到轮询等待);轮询 db.get 直到 running 或 AUTO_WAKE_TIMEOUT_S 超时。
+    - 手动 suspended / 其他态 → 不唤醒,原样返回(维持既有行为,手动挂起不被请求唤醒)。
+    """
+    if record.get("state") == "running":
+        return record
+    if record.get("state") != "slept" or not _autostart_enabled(record):
+        return record
+
+    # 触发唤醒。resume_sandbox 内部用 lease,并发请求只有一个抢到锁真正 resume;
+    # 抢不到的直接进下面的轮询,等 leader/first 请求把它拉起来。
+    try:
+        resume_sandbox(sid)
+    except Exception:
+        pass  # 唤醒失败(如锁被占)不抛;交给下面轮询看最终态
+
+    deadline = time.monotonic() + AUTO_WAKE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        cur = db.get(sid)
+        if not cur:
+            return record
+        state = cur.get("state")
+        if state == "running":
+            return cur
+        if state == "failed":
+            return cur  # resume 失败,不再干等
+        # resuming(本请求或并发请求正在拉起)→ 继续轮询;slept/其他态短暂窗口也再看一眼
+        time.sleep(0.3)  # nosemgrep: arbitrary-sleep -- 轮询唤醒收敛
+    return db.get(sid) or record
+
+
 def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, str, str]:
     """
     校验并解析反代目标。
@@ -375,6 +464,10 @@ def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, s
     record = db.get(sid)
     if not record:
         return 404, {"error": "sandbox not found", "id": sid}
+    # 自动休眠(slept)+ autostart:网关透明唤醒后继续用新 record 转发(首请求秒级阻塞,后续无感)。
+    # 手动 suspended 不会被唤醒 → 仍走下面的 409。
+    if record.get("state") != "running":
+        record = _ensure_awake(sid, record)
     if record.get("state") != "running":
         return 409, {"error": "sandbox not running", "state": record.get("state")}
 
@@ -395,6 +488,7 @@ def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, s
     node = record.get("node")
     if not node:
         return 503, {"error": "sandbox has no node yet"}
+    _touch_activity(sid)  # 经网关的 HTTP 流量算活跃 —— 刷新最后活跃时间(内存节流)
     host = node if ":" in node else f"{node}:{NODE_AGENT_PORT}"
     return 200, host, f"/proxy/{sid}/{port}"
 
@@ -456,6 +550,69 @@ def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
             db.release_lease(sid, lease_id)
 
 
+def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
+    """
+    自动休眠:把空闲的 running 沙盒打快照进 slept 状态(区别于手动 suspend 的 suspended)。
+    镜像 suspend_sandbox 的 lease + prev_state 条件写 + 失败回滚,复用同一套并发保护;
+    差别仅在目标状态标 slept(供网关识别"可自动唤醒")+ 事件带 idle 原因。
+
+    被 AutoSleeper 扫描 loop 注入调用。拿到 lease 后【二次校验仍空闲】——防扫描判定与加锁
+    之间刚来请求的竞态(不空闲则放弃本次,下轮再看)。
+    """
+    record = db.get(sid)
+    if not record or record.get("state") != "running":
+        return 409, {"error": "not running"}
+
+    lease_id = None
+    try:
+        lease_id = db.acquire_lease(sid)
+        # 二次校验:重读 record,确认仍 running 且确实空闲(last_active_at 超过 idle 阈值)。
+        fresh = db.get(sid)
+        if not fresh or fresh.get("state") != "running":
+            return 409, {"error": "state changed"}
+        idle_s = _idle_seconds(fresh)
+        if idle_s is None or idle_s < AUTO_SLEEP_IDLE_S:
+            return 200, {"skipped": "no longer idle", "idle_s": idle_s}
+
+        db.update_state(sid, "suspending", "running")
+        snap_info = _driver.suspend(sid, fresh)
+        db.update_state(sid, "slept", "suspending", snap_info)
+        db.write_event(sid, "slept", "running",
+                       {**snap_info, "reason": "idle", "idle_s": round(idle_s, 1)})
+        # 休眠后从活跃节流缓存移除(已不在 running,无需再节流)
+        with _ACTIVITY_LOCK:
+            _ACTIVITY_LAST.pop(sid, None)
+        return 200, db.get(sid)
+    except UnsupportedOperation as e:
+        return 501, {"error": str(e)}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return 409, {"error": "sandbox is not in running state or is locked"}
+        return 500, {"error": str(e)}
+    except Exception as e:
+        # 快照失败:node-agent 已尽力把 VM 恢复运行,内存未释放 → 回滚 running(同 suspend)。
+        db.force_update(sid, {"state": "running", "error": str(e)})
+        return 500, {"error": str(e)}
+    finally:
+        if lease_id:
+            db.release_lease(sid, lease_id)
+
+
+def _idle_seconds(record: dict) -> float | None:
+    """沙盒距今空闲秒数(now - last_active_at)。无 last_active_at 回退 created_at;都无返回 None。"""
+    from datetime import datetime, timezone
+    ts = record.get("last_active_at") or record.get("created_at")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
 def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -466,7 +623,12 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
     lease_id = None
     try:
         lease_id = db.acquire_lease(sid)
-        db.update_state(sid, "resuming", "suspended")
+        # prev 允许 suspended(手动挂起)或 slept(自动休眠)——两者底层同一套快照,resume 共用。
+        # 用当前 record.state 作为条件写的期望值(而非写死 suspended),网关自动唤醒 slept 也走这里。
+        prev = record["state"]
+        if prev not in ("suspended", "slept"):
+            return 409, {"error": "sandbox is not in a resumable state", "state": prev}
+        db.update_state(sid, "resuming", prev)
         # 限流:同时最多 _RESUME_CONCURRENCY 个 resume 走 driver(合并+load 的 EBS I/O 重)。
         # 排队期间沙盒停在 resuming(可观测),不额外占资源。t0 只计真正 resume 不含排队。
         if _RESUME_SEM is not None:
@@ -478,9 +640,14 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         finally:
             if _RESUME_SEM is not None:
                 _RESUME_SEM.release()
+        # resume 成功即回到活跃 —— 刷新 last_active_at 并清节流缓存,给刚唤醒的沙盒一个完整
+        # idle 周期,避免扫描 loop 因 last_active_at 仍停在休眠前而立刻又把它睡回去。
+        with _ACTIVITY_LOCK:
+            _ACTIVITY_LAST[sid] = time.monotonic()
         db.update_state(sid, "running", "resuming",
-                        {**driver_fields, "restore_time_s": str(restore_time)})
-        db.write_event(sid, "resumed", "suspended",
+                        {**driver_fields, "restore_time_s": str(restore_time),
+                         "last_active_at": db._utcnow()})
+        db.write_event(sid, "resumed", prev,
                        {"restore_time_s": restore_time})
         return 200, db.get(sid)
     except UnsupportedOperation as e:
@@ -503,6 +670,7 @@ def exec_sandbox(sid: str, cmd: str, caller_tenant: str | None = None) -> tuple[
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
+    _touch_activity(sid)  # exec 算活跃 —— 刷新最后活跃时间,避免正在用的沙盒被自动休眠
     rc, stdout, stderr = _driver.exec(sid, record, cmd)
     return (200 if rc == 0 else 500), {
         "id": sid, "cmd": cmd, "rc": rc,
@@ -581,6 +749,19 @@ def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, d
         time.sleep(1)  # nosemgrep: arbitrary-sleep -- 轮询 DynamoDB 状态变更的间隔
     record = db.get(sid) or {}
     return 408, {"error": "timeout", "current_state": record.get("state")}
+
+
+# ---------- 自动休眠扫描 loop 接线 ----------
+# 放在这里(而非 import 顶部)是因为需要引用后面定义的 auto_sleep_sandbox / _idle_seconds /
+# _autostop_enabled。与 reconcile / 暖池共用同一 leader 门控:多副本下只有 leader 扫描。
+# AUTO_SLEEP_ENABLED=0 可整体关闭(仍不影响手动 suspend/resume 与网关唤醒逻辑)。
+if AUTO_SLEEP_ENABLED:
+    _autosleeper = AutoSleeper(
+        sleep_fn        = auto_sleep_sandbox,
+        idle_seconds_fn = _idle_seconds,
+        autostop_fn     = _autostop_enabled,
+    )
+    _autosleeper.start_loop(is_leader=lambda: _reconciler.is_leader)
 
 
 # ---------- HTTP handler ----------

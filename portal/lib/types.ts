@@ -6,6 +6,7 @@ export type SandboxState =
   | "running"
   | "suspending"
   | "suspended"
+  | "slept" // 自动休眠(空闲触发),区别于手动 suspended;网关请求会透明唤醒它
   | "resuming"
   | "destroying"
   | "failed"
@@ -30,6 +31,7 @@ export interface Sandbox {
   mem_mib?: number;
   created_at?: string;
   updated_at?: string;
+  last_active_at?: string; // 最后活跃时刻(proxy/exec 刷新),自动休眠据此判空闲
   meta?: Record<string, unknown>;
   services?: ServiceSpec[];
   // driver 运行时增补
