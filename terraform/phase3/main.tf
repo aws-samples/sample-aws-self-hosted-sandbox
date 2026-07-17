@@ -28,6 +28,12 @@ terraform {
 
 provider "aws" {
   region = var.region
+  default_tags {
+    tags = {
+      Project   = "claude-sbx-poc"
+      ManagedBy = "terraform"
+    }
+  }
 }
 
 variable "region" {
@@ -361,8 +367,7 @@ resource "aws_ecr_repository" "sbx" {
   name                 = "claude-sbx"
   image_tag_mutability = "MUTABLE"
   force_delete         = true
-
-  tags = { Project = "claude-sbx-poc" }
+  # Project/ManagedBy 由 provider default_tags 统一注入
 }
 
 data "aws_ecr_repository" "sbx" {

@@ -234,6 +234,11 @@ curl -s $BASE_URL/sandboxes -X POST -d '{"image":"web","cpu":1,"mem_mib":512}'  
 curl -s $BASE_URL/admin/images   # list available images (for Portal dropdown)
 
 [Cleanup]
+# NOTE: this account is shared with other projects — never delete AWS resources by a broad
+# filter (e.g. just status=available or just Name). Always filter by this project's tag first,
+# print the list, and eyeball it before deleting. All terraform-managed resources here carry
+# Project=claude-sbx-poc (injected via provider default_tags); EKS-managed resources carry
+# eks:cluster-name=claude-sbx. Audit against those two tags.
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 cd terraform/stage2-control-plane && terraform destroy -auto-approve \
@@ -248,15 +253,23 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="litellm_master_key=placeholder"
 
 # Delete orphaned pod ENIs left by terminated nodes (VPC CNI creates them; they are NOT
-# cleaned up when the node terminates and will stall the phase3 destroy on subnet/SG deletion):
+# cleaned up when the node terminates and will stall the phase3 destroy on subnet/SG deletion).
+# Filtered by this project's VPC (safe — an ENI belongs to one specific VPC), but still list
+# before deleting.
 VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
   --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
 if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
-  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
-      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
-      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
-  done
+  aws ec2 describe-network-interfaces --region us-east-1 \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+    --query 'NetworkInterfaces[].{id:NetworkInterfaceId,desc:Description}' --output table
+  read -p "Confirm all of the above belong to this project and delete? (yes/no) " ok
+  if [ "$ok" = "yes" ]; then
+    for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
+        --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+        --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+      aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
+    done
+  fi
 fi
 
 MY_IP=$(curl -s https://checkip.amazonaws.com)
@@ -266,6 +279,28 @@ cd ../phase3 && terraform destroy -auto-approve \
 #   SG=$(aws ec2 describe-security-groups --region us-east-1 \
 #     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" --query 'SecurityGroups[0].GroupId' --output text)
 #   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
+#
+# If VPC/subnet destroy stalls for 10+ minutes, it's usually account-level GuardDuty runtime
+# monitoring having injected resources into this VPC that terraform doesn't manage (don't
+# delete the GuardDuty detector itself, just these two, scoped to $VPC_ID):
+#   ① the GuardDuty VPC Endpoint (its ENI occupies a subnet) ② GuardDutyManagedSecurityGroup.
+
+# Delete orphaned persistent state EBS volumes (mandatory — destroy won't remove them, and
+# they're billed per volume, ~$32/mo each). The metal node's persistent state volume has
+# DeleteOnTermination=false (by design, so it survives spot reclaim), so it's left "available"
+# after phase3 destroy. Filter strictly by the eks:cluster-name tag and list before deleting —
+# never filter broadly by Name/status (this account has other projects' volumes too).
+aws ec2 describe-volumes --region us-east-1 \
+  --filters "Name=status,Values=available" "Name=tag:eks:cluster-name,Values=claude-sbx" \
+  --query 'Volumes[].{id:VolumeId,size:Size,name:Tags[?Key==`Name`].Value|[0]}' --output table
+read -p "Confirm all of the above belong to this project and delete? (yes/no) " ok
+if [ "$ok" = "yes" ]; then
+  aws ec2 describe-volumes --region us-east-1 \
+    --filters "Name=status,Values=available" "Name=tag:eks:cluster-name,Values=claude-sbx" \
+    --query 'Volumes[].VolumeId' --output text | tr '\t' '\n' \
+    | xargs -r -n1 aws ec2 delete-volume --region us-east-1 --volume-id
+fi
+
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
 # Clean up leftovers that destroy won't remove but that block a future re-create:
