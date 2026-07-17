@@ -471,6 +471,12 @@ curl -s -X DELETE -H "Authorization: Bearer ${API_KEY}" \
 > ⏱ 顺序：stage2 → phase3（删 EKS+metal，真正停止 metal 计费的一步，约 15-20 分钟）→ stage1。
 > phase3 destroy 里 node group 删除本身就要 3-6 分钟，metal 实例到那时才终止，属正常。
 
+> 🛑 **删除审核铁律（务必遵守，本账号是共享账号，有其它业务资源）**：
+> 所有 terraform 之外的手动清理（`aws ec2 delete-*` 等）**必须先按项目 tag 过滤并打印待删清单、人工核对后再删**，
+> 绝不用宽泛过滤（只按 `status=available` 或只按 `Name`）直接删——旁边可能有别的项目的资源（实测同账号有
+> Zabbix 等无关卷）。本项目所有 terraform 资源都带 `Project=claude-sbx-poc`（provider `default_tags` 注入），
+> EKS 间接建的资源带 `eks:cluster-name=claude-sbx`——审核就认这两个 tag。
+
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
@@ -498,14 +504,22 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
 # 强删后 destroy 会在 1-2 分钟内继续完成。
 
 # 2. 删孤儿 pod ENI（节点终止后不自动清理，会让 VPC destroy 卡 7+ 分钟）
+#    ENI 按本项目 VPC 过滤（不会误伤别项目——ENI 属于特定 VPC），但仍先打印清单核对再删。
 VPC_ID=$(aws ec2 describe-vpcs --region us-east-1 \
   --filters "Name=tag:Name,Values=claude-sbx-vpc" --query 'Vpcs[0].VpcId' --output text)
 if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
-  for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
-      --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
-      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
-    aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
-  done
+  echo "== 待删 available ENI（VPC $VPC_ID）=="
+  aws ec2 describe-network-interfaces --region us-east-1 \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+    --query 'NetworkInterfaces[].{id:NetworkInterfaceId,desc:Description}' --output table
+  read -p "确认以上全属本项目、删除？(yes/no) " ok
+  if [ "$ok" = "yes" ]; then
+    for eni in $(aws ec2 describe-network-interfaces --region us-east-1 \
+        --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+        --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+      aws ec2 delete-network-interface --region us-east-1 --network-interface-id "$eni" 2>/dev/null || true
+    done
+  fi
 fi
 
 # 4. 删 EKS 集群 + metal 节点（约 15-20 分钟；var 要与 apply 时一致）
@@ -521,6 +535,32 @@ cd ../phase3 && terraform destroy -auto-approve \
 #     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" \
 #     --query 'SecurityGroups[0].GroupId' --output text)
 #   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
+
+# 4a. ⚠️ VPC / subnet destroy 卡十几分钟不动？——多半是账号级 GuardDuty runtime monitoring
+#     往本 VPC 注入了 terraform 不管理的托管资源（不是本项目建的，别删 GuardDuty detector 本身）：
+#     ① GuardDuty VPC Endpoint（其 ENI 占着 subnet）② GuardDutyManagedSecurityGroup（占着 VPC）。
+#     删掉这两个（仅这个 VPC 内的），subnet/VPC 立即能删。VPC_ID 用上面第 2 步取到的。
+#   aws ec2 describe-vpc-endpoints --region us-east-1 --filters "Name=vpc-id,Values=$VPC_ID" \
+#     --query 'VpcEndpoints[?contains(ServiceName,`guardduty`)].VpcEndpointId' --output text \
+#     | xargs -r -n1 aws ec2 delete-vpc-endpoints --region us-east-1 --vpc-endpoint-ids
+#   aws ec2 describe-security-groups --region us-east-1 --filters "Name=vpc-id,Values=$VPC_ID" \
+#     "Name=group-name,Values=GuardDutyManagedSecurityGroup-*" --query 'SecurityGroups[0].GroupId' \
+#     --output text | grep -q sg- && aws ec2 delete-security-group --region us-east-1 --group-id <上面的 sg>
+
+# 4b. 删孤儿【状态 EBS 卷】（必做，destroy 删不掉、按块计费 ~$32/月/块）——这次实测漏删过。
+#     metal 的持久状态卷 DeleteOnTermination=false（spot 幸存设计），phase3 destroy 后残留为 available。
+#     ⚠️ 严格按 eks:cluster-name tag 过滤 + 先列后删，别按 Name/status 宽泛删（同账号有别项目的卷）。
+echo "== 待删孤儿状态卷（eks:cluster-name=claude-sbx，available）=="
+aws ec2 describe-volumes --region us-east-1 \
+  --filters "Name=status,Values=available" "Name=tag:eks:cluster-name,Values=claude-sbx" \
+  --query 'Volumes[].{id:VolumeId,size:Size,name:Tags[?Key==`Name`].Value|[0]}' --output table
+read -p "确认以上全属本项目、删除？(yes/no) " ok
+if [ "$ok" = "yes" ]; then
+  aws ec2 describe-volumes --region us-east-1 \
+    --filters "Name=status,Values=available" "Name=tag:eks:cluster-name,Values=claude-sbx" \
+    --query 'Volumes[].VolumeId' --output text | tr '\t' '\n' \
+    | xargs -r -n1 aws ec2 delete-volume --region us-east-1 --volume-id
+fi
 
 # 5. 删 DynamoDB（建议彻底删，不要保留）
 #    stage1 共 5 张表：sandboxes / events / tap-idx / nodes / locks
