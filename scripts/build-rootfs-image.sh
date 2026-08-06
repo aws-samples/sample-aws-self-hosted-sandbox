@@ -7,19 +7,27 @@
 # 用法: bash scripts/build-rootfs-image.sh <name> <s3-bucket>
 #   name = min      → 等价于 build-min-rootfs.sh(基础模板)
 #   name = web      → 自带 demo 首页 + 开机自起 :80(端口暴露打开即见站点)
+#   name = openclaw → 预装 Node + OpenClaw(npm 包)的会话式 AI Agent 基础镜像
 #   其它 name        → 目前回退到 min 内容(可在下方 case 里加预设)
+#
+# 目标架构:ARCH=arm64(默认, c6g.metal) 或 ARCH=amd64(i7i 生产, 嵌套虚拟化)。
+#   生产 i7i 用:  ARCH=amd64 bash scripts/build-rootfs-image.sh openclaw <bucket>
 set -euo pipefail
 
 NAME="${1:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
 S3_BUCKET="${2:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
 REGION="${AWS_REGION:-us-east-1}"
+# 目标 CPU 架构 → docker --platform。默认 arm64 保持既有行为;i7i 生产传 ARCH=amd64。
+ARCH="${ARCH:-arm64}"
+case "$ARCH" in arm64|amd64) ;; *) echo "ARCH must be arm64 or amd64 (got '$ARCH')"; exit 1 ;; esac
+PLATFORM="linux/${ARCH}"
 WORK=$(mktemp -d)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PUBKEY_FILE="${ROOT}/.sbxkeys/sbx_exec.pub"
 [ -f "$PUBKEY_FILE" ] || { echo "missing $PUBKEY_FILE (run ssh-keygen first)"; exit 1; }
 PUBKEY=$(cat "$PUBKEY_FILE")
 
-echo "==> build rootfs template '$NAME' in $WORK"
+echo "==> build rootfs template '$NAME' ($PLATFORM) in $WORK"
 
 # ---------- 1. sbxinit (guest PID 1) ----------
 # 通用部分与 min 一致;额外:若 /web/index.html 存在则开机自起 :80(web 预设用)。
@@ -65,6 +73,22 @@ if [ -f /web/index.html ]; then
   echo "[sbxinit] demo web on :80 (from /web)" > /dev/console
 fi
 
+# openclaw 预设:已安装则开机自起 Gateway + Control UI(:18789)。
+# PATH 必须含 /usr/local/bin —— openclaw 启动器是 #!/usr/bin/env node(实测坑)。
+# token:优先用内核 cmdline 注入的 OC_TOKEN(node-agent 每沙盒注入,便于控制面反代鉴权);
+#        缺省则本次启动随机生成,写 /run/openclaw/token(可经 exec 取回)。
+# 模型不在镜像里配置(auth-choice skip),运行时由租户注入(SecretRef/UI)。
+if command -v openclaw >/dev/null 2>&1; then
+  export PATH=/usr/local/bin:\$PATH
+  export HOME=/root
+  OCTOK=\$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^OC_TOKEN=//p')
+  [ -z "\$OCTOK" ] && OCTOK=\$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  mkdir -p /run/openclaw && echo "\$OCTOK" > /run/openclaw/token
+  (OPENCLAW_GATEWAY_TOKEN="\$OCTOK" openclaw gateway run --bind lan --port 18789 \
+     --auth token --token "\$OCTOK" --allow-unconfigured > /var/log/oc-gw.log 2>&1 &)
+  echo "[sbxinit] openclaw gateway starting on :18789 (token in /run/openclaw/token)" > /dev/console
+fi
+
 echo "[sbxinit] microVM booted ($NAME)" > /dev/console
 
 i=0
@@ -77,8 +101,28 @@ done
 INIT
 chmod +x "$WORK/sbxinit"
 
-# ---------- 2. docker 造 rootfs 基底(通用:python + iproute2 + sshd)----------
-cat > "$WORK/Dockerfile" <<'DOCKER'
+# ---------- 2. docker 造 rootfs 基底 ----------
+# openclaw 预设需要 Node 运行时(openclaw 是 npm 包);其余预设用轻量 python 基底。
+# 两者都保证 python3(vsock-exec-agent 主通道用) + iproute2 + sshd(兜底)。
+if [ "$NAME" = "openclaw" ]; then
+  cat > "$WORK/Dockerfile" <<'DOCKER'
+FROM public.ecr.aws/docker/library/node:22-bookworm-slim
+# build-essential + python3: openclaw 若含 native 依赖(node-gyp)需要;curl/ca-certs 供运行时拉取。
+RUN (sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    python3 iproute2 openssh-server iputils-ping ca-certificates curl build-essential \
+ && rm -rf /var/lib/apt/lists/* \
+ && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+ && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+ && npm install -g openclaw@latest \
+ && npm cache clean --force \
+ && (HOME=/root openclaw onboard --non-interactive --accept-risk --skip-health \
+       --flow quickstart --auth-choice skip --gateway-bind lan --gateway-auth token || true)
+# ↑ 预置 ~/.openclaw 工作区+配置(auth-choice skip:不烧录任何 model key/token,
+#   模型与网关 token 均运行时注入)。boot 时由 sbxinit 起 gateway(见下)。
+DOCKER
+else
+  cat > "$WORK/Dockerfile" <<'DOCKER'
 FROM public.ecr.aws/docker/library/python:3.12-slim
 RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
  && apt-get update && apt-get install -y --no-install-recommends \
@@ -87,8 +131,9 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
  && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 DOCKER
-docker build --platform linux/arm64 -t "sbx-rootfs:$NAME" "$WORK"
-CID=$(docker create --platform linux/arm64 "sbx-rootfs:$NAME" sleep infinity)
+fi
+docker build --platform "$PLATFORM" -t "sbx-rootfs:$NAME" "$WORK"
+CID=$(docker create --platform "$PLATFORM" "sbx-rootfs:$NAME" sleep infinity)
 mkdir -p "$WORK/rootfs"
 docker export "$CID" | tar -C "$WORK/rootfs" -xf -
 docker rm "$CID" >/dev/null
@@ -135,6 +180,15 @@ case "$NAME" in
   </div>
 </body></html>
 HTML
+    ;;
+  openclaw)
+    # OpenClaw 基础镜像:
+    #   - npm -g 安装 openclaw + 预置 ~/.openclaw 工作区/配置(见上 Dockerfile)。
+    #   - sbxinit 开机自起 Gateway + Control UI(:18789)——见上方 sbxinit 的 openclaw 块。
+    # 【不烧录密钥】:model provider key 与 gateway token 都不进镜像,运行时注入
+    #   (token 走内核 cmdline OC_TOKEN;model 走 UI 或 SecretRef,见 docs/Workshop方案借鉴与优化.md §4)。
+    printf 'OpenClaw base image\narch=%s\ngateway: :18789 (auto-start via sbxinit)\ntoken: runtime (cmdline OC_TOKEN or random -> /run/openclaw/token)\nmodel: runtime (UI / SecretRef)\n' \
+      "$ARCH" > "$WORK/rootfs/etc/openclaw-image.txt"
     ;;
   min|"")
     : # 基础模板,无额外内容

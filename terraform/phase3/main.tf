@@ -99,8 +99,8 @@ variable "rootfs_s3_uri" {
 # 默认含 web(自带 demo 站点)。min 无需列出(即默认 rootfs)。
 variable "rootfs_images" {
   type        = string
-  default     = "web"
-  description = "逗号分隔的命名 rootfs 模板列表(除 min 外),节点会各拉一份造 ext4 模板。"
+  default     = "web,openclaw"
+  description = "逗号分隔的命名 rootfs 模板列表(除 min 外),节点会各拉一份造 ext4 模板。openclaw=预装 Node+OpenClaw 的会话式 AI Agent 基础镜像(开机自起 Gateway :18789)。"
 }
 
 # ---------- 方案C:持久状态 EBS(挂 /var/lib/sbx,存快照+rootfs,spot 幸存) ----------
