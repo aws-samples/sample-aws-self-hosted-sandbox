@@ -81,6 +81,16 @@ variable "use_instance_store" {
   description = "true(i7i 默认):把节点本地 NVMe 实例存储挂到 /var/lib/sbx 作沙盒快照/rootfs 暂存盘(临时,随实例销毁,快照权威副本走 S3)。false(.metal 方案C):改挂一块持久 EBS(delete_on_termination=false),spot 终止后幸存、可跨机恢复。"
 }
 
+variable "capacity_type" {
+  type        = string
+  default     = "ON_DEMAND"
+  description = "承载节点组的计费类型:ON_DEMAND(默认,稳定)或 SPOT(便宜,可被回收 → 触发 node-agent 疏散到 S3)。M1 验证真 Spot 中断时传 -var=\"capacity_type=SPOT\"。"
+  validation {
+    condition     = contains(["ON_DEMAND", "SPOT"], var.capacity_type)
+    error_message = "capacity_type 仅支持 \"ON_DEMAND\" 或 \"SPOT\"。"
+  }
+}
+
 variable "node_count" {
   type        = number
   default     = 1
@@ -184,6 +194,16 @@ module "eks" {
   endpoint_public_access_cidrs             = var.endpoint_public_access_cidrs # v20: cluster_endpoint_public_access_cidrs
   enable_cluster_creator_admin_permissions = true
 
+  # ⚠️ EKS 模块 v21 起 bootstrap_self_managed_addons 硬编码为 false —— 不再自动装
+  #    vpc-cni / kube-proxy / coredns(v20 会自动装)。必须经 EKS addons API 显式声明,
+  #    否则节点无 CNI → 一直 NotReady → 节点组卡 CREATING 最终 CREATE_FAILED(实测踩到)。
+  #    vpc-cni / kube-proxy 用 before_compute=true,确保在节点组【之前】装好,节点一 join 就有网络。
+  addons = {
+    vpc-cni    = { before_compute = true }
+    kube-proxy = { before_compute = true }
+    coredns    = {} # coredns 需要 Ready 节点才能调度,放节点之后(默认)
+  }
+
   vpc_id = module.vpc.vpc_id
   # 控制平面 ENI 放私有子网;节点组单独指定公有子网(见 node group subnet_ids)
   subnet_ids = module.vpc.private_subnets
@@ -194,15 +214,23 @@ module "eks" {
       ami_type       = local.node_arch_cfg.ami_type
       instance_types = [var.instance_type]
 
+      # 计费类型:ON_DEMAND(默认)/ SPOT。SPOT 时实例可被回收,EC2 提前 ~120s 发中断通知到
+      # IMDS(/latest/meta-data/spot/instance-action),node-agent 的 RECLAIM_WATCH 轮询检出 →
+      # 并发疏散本节点所有 sandbox 到 S3(权威副本),节点消失后可在其它节点从 S3 恢复。
+      capacity_type = var.capacity_type
+
       # 成本优先单机 demo 默认 1 台;跨机快照/spot 疏散演示需 2 台(node_count 变量)。
       min_size     = var.node_count
       max_size     = var.node_count
       desired_size = var.node_count
 
       # 节点放公有子网直接出网(无 NAT)。
-      # ⚠️ .metal 方案C(持久 EBS)要求同一 AZ(EBS 不能跨 AZ attach),故钉死到 public_subnets[0]。
-      #    i7i + 本地 NVMe 无此约束,但保持单 AZ 简化(多台时同 AZ,便于演示)。
-      subnet_ids = [module.vpc.public_subnets[0]]
+      # i7i + 本地 NVMe(use_instance_store=true):跨【全部 AZ】—— i7i 各 AZ 容量不均,
+      #   钉单 AZ 会踩 InsufficientInstanceCapacity(实测 us-east-1a 无 i7i.4xlarge 容量);
+      #   多 AZ 让 ASG 在有容量的 AZ 落地。
+      # .metal 方案C(持久 EBS,use_instance_store=false):必须【同一 AZ】(EBS 不能跨 AZ attach),
+      #   钉死到 public_subnets[0]。
+      subnet_ids = var.use_instance_store ? module.vpc.public_subnets : [module.vpc.public_subnets[0]]
 
       # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → S3 只读;SSM 供排障。
       iam_role_additional_policies = {

@@ -86,6 +86,9 @@ FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
 HOST_IFACE   = os.environ.get("HOST_IFACE", "")                 # 空则自动探测
 AWS_REGION   = os.environ.get("AWS_REGION", "us-east-1")
 NODE_ID      = os.environ.get("NODE_ID", socket.gethostname())
+# 方案 A:S3 快照桶。控制面调用时会在 body 里带 s3_prefix;但节点自发的 spot 疏散
+# (_evacuate_local)需自己拼前缀,故这里也读一份桶名(DaemonSet 已注入 SNAPSHOT_S3_BUCKET)。
+SNAPSHOT_S3_BUCKET = os.environ.get("SNAPSHOT_S3_BUCKET", "")
 
 # ---------- 心跳注册(P0-3:控制面按 last_seen 判活,替换 FC_NODES 硬编码)----------
 NODES_TABLE       = os.environ.get("DYNAMODB_NODES_TABLE", "sandbox_nodes")
@@ -102,6 +105,9 @@ RECLAIM_WATCH         = os.environ.get("RECLAIM_WATCH_ENABLED", "1").lower() in 
 RECLAIM_POLL_S        = int(os.environ.get("RECLAIM_POLL_S", "5"))
 # =0(默认)DRY-RUN 只记录计划;=1 才真正触发疏散(打 Diff 快照到持久 EBS)。
 RECLAIM_AUTO_EVACUATE = os.environ.get("RECLAIM_AUTO_EVACUATE", "0").lower() in ("1", "true")
+# spot 疏散时并发处理本节点沙盒数(每个 = 打快照 + pigz + 分片上传 S3)。
+# spot 窗口仅 ~120s,串行会超时;并发受 CPU(pigz 吃多核)/S3 带宽约束,默认 8 折中。
+RECLAIM_EVAC_CONCURRENCY = int(os.environ.get("RECLAIM_EVAC_CONCURRENCY", "8"))
 # 最近一次回收检测/疏散计划(供 GET /reclaim/status 观测;injected 供测试注入)
 _RECLAIM_STATE: dict = {"detected": False, "signal": None, "at": None,
                         "plan": None, "evacuated": False, "injected": None}
@@ -328,7 +334,7 @@ def _s3_upload_sync(local_dir: str, s3_prefix: str, retries: int = 3) -> None:
 
 
 def _s3_download(s3_prefix: str, local_dir: str) -> None:
-    """同步从 S3 拉三件套到 local_dir(resume 前调用)。"""
+    """同步从 S3 拉快照文件到 local_dir(resume 前调用)。"""
     if not s3_prefix:
         return
     os.makedirs(local_dir, exist_ok=True)
@@ -339,7 +345,132 @@ def _s3_download(s3_prefix: str, local_dir: str) -> None:
     )
 
 
+# ---------- S3 布局(方案 A:S3 为快照权威副本)----------
+# 每沙盒一个前缀 s3://<bucket>/sbx/{sid}/,下分三个【稀疏保留的 tar.gz】:
+#   base.tar.gz   —— 内存 base(vm.mem.base + vm.snapshot.base),op_snapshot_base 上传一次
+#   diff.tar.gz   —— 内存 diff(vm.mem + vm.snapshot),每次 suspend 上传
+#   rootfs.tar.gz —— 磁盘(rootfs.ext4),每次 suspend 上传(FC 快照不含磁盘内容)
+#
+# 【为什么必须 tar -S 而非 aws s3 cp 原文件】:内存 diff 与 rootfs 都是【稀疏文件】
+# (空洞 = 未写过的干净页,读为 0)。aws s3 cp 会把空洞 densify 成真实 0 字节;下载回来后
+# merge 用 SEEK_DATA/SEEK_HOLE 找不到空洞 → 把本该是"干净页"的区域用 0 覆盖到 base 上
+# → guest 内存损坏 → resume 后 vcpu 立即 Shutdown(真机实测踩到)。tar -S 保留空洞语义,
+# 下载解包后仍是稀疏文件,SEEK 合并正确;顺带 gzip 压掉大量 0 页,上传更快(利于 spot 窗口)。
+def _sbx_s3_prefix(sid: str) -> str:
+    """节点自发疏散时按桶名拼每沙盒的 S3 根前缀(与控制面 driver._s3_prefix 一致)。"""
+    return f"s3://{SNAPSHOT_S3_BUCKET}/sbx/{sid}/" if SNAPSHOT_S3_BUCKET else ""
+
+
+# pigz(并行 gzip,吃满多核)优先;不在则回退单核 gzip。探测一次缓存。
+# 为什么:incompressible 的内存 diff 单核 gzip 只有 ~21MB/s → 卡死 spot 窗口;
+# pigz 把压缩摊到全部 vCPU,吞吐≈核数×单核。base 内存是大片 0 页,压缩收益极高,保留压缩。
+_PIGZ_BIN = shutil.which("pigz")
+
+
+def _compress_args() -> list[str]:
+    """返回 tar 的 --use-compress-program 参数(pigz 优先,回退 gzip)。
+
+    用最快压缩级 -1:base 内存是大片 0 页,即便 -1 也能压掉上千倍;
+    incompressible 的 diff 内存则几乎不浪费 CPU 硬压(-1 早早放弃),
+    在"spot 窗口内压完"和"减少上传字节"间取平衡。解压侧级别参数被忽略,pigz/gzip -d 通吃。"""
+    if _PIGZ_BIN:
+        return ["--use-compress-program", "pigz -1"]
+    return ["--use-compress-program", "gzip -1"]
+
+
+def _s3_tar_upload(workdir: str, members: list[str], s3_uri: str, retries: int = 3,
+                   compress: bool = True) -> None:
+    """把 workdir 下的 members 用 tar -S(保留稀疏)打成临时包,再 aws s3 cp(自动分片并发)
+    上传到 s3_uri,失败退避重试。临时包落在 workdir(NVMe)本地,传完即删。
+
+    compress:
+      - True(base 用):zeros 多、可压 → pigz -1,省上传字节。base 在创建时传一次,不在 spot 窗口内。
+      - False(diff/rootfs 用):内存脏页基本不可压,gzip 只是 1.00x 白烧 CPU;更致命的是 spot 疏散
+        时 N 个沙盒并发,每个 pigz 只分到 ~2 核 → ~100MB/s,成为 120s 窗口内的瓶颈(实测)。
+        直接 tar -S(保留稀疏,2GB/s+)+ aws s3 cp(2.8GB/s)→ 端到端快 20 倍以上。
+        下载侧按 gzip 魔数自动识别是否解压,故对象名沿用 .tar.gz 不影响 resume。
+
+    为什么"落临时文件再传"而非"tar|aws s3 cp - 流式":流式 stdin 时 aws cli 不知大小无法分片
+      → 单连接串行;落 NVMe(本地极快)后由 aws cli 分片多连接并发上传 → 打满带宽。
+    """
+    if not s3_uri:
+        return
+    members = [m for m in members if os.path.exists(os.path.join(workdir, m))]
+    if not members:
+        return
+    comp = _compress_args() if compress else []
+    tmp = os.path.join(workdir, f".upload-{uuid.uuid4().hex}.tar.gz")
+    last_err: Exception | None = None
+    try:
+        for attempt in range(retries):
+            tar = subprocess.run(
+                ["tar", "-S", *comp, "-C", workdir, "-cf", tmp, *members],
+                capture_output=True, text=True)
+            if tar.returncode != 0:
+                last_err = RuntimeError(f"tar {s3_uri} rc={tar.returncode}: {tar.stderr.strip()[:300]}")
+            else:
+                cp = subprocess.run(
+                    ["aws", "s3", "cp", tmp, s3_uri, "--region", AWS_REGION, "--only-show-errors"],
+                    capture_output=True, text=True)
+                if cp.returncode == 0:
+                    return
+                last_err = RuntimeError(f"s3cp {s3_uri} rc={cp.returncode}: {cp.stderr.strip()[:300]}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # nosemgrep: arbitrary-sleep -- 上传重试退避
+        raise last_err or RuntimeError("s3 tar upload failed")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _s3_tar_download(s3_uri: str, workdir: str) -> bool:
+    """从 s3_uri 拉包到 workdir 本地临时文件(aws cli 自动分片并发),再 tar -S 解包(还原稀疏空洞)。
+    是否 gzip 压缩【按魔数自动识别】(0x1f8b)→ 上传侧压不压都能正确解包,与对象名无关。
+    对象不存在(如无 base.tar.gz)返回 False,不抛异常;成功返回 True。"""
+    if not s3_uri:
+        return False
+    os.makedirs(workdir, exist_ok=True)
+    tmp = os.path.join(workdir, f".download-{uuid.uuid4().hex}.tar.gz")
+    try:
+        cp = subprocess.run(
+            ["aws", "s3", "cp", s3_uri, tmp, "--region", AWS_REGION, "--only-show-errors"],
+            capture_output=True, text=True)
+        if cp.returncode != 0:
+            return False  # 对象不存在或拉取失败
+        # 按魔数判断是否 gzip:压缩包(base)走 pigz 解压,未压包(diff/rootfs)直接 tar 展开。
+        with open(tmp, "rb") as f:
+            magic = f.read(2)
+        comp = _compress_args() if magic == b"\x1f\x8b" else []
+        tar = subprocess.run(
+            ["tar", "-S", *comp, "-C", workdir, "-xf", tmp])
+        return tar.returncode == 0
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 # ---------- 操作实现 ----------
+
+def _write_epoch(d: str, epoch: int) -> None:
+    """把栅栏世代持久化到沙盒目录,供 node-agent 重启后 _recover_vms 还原(否则默认 1 会误触发栅栏)。"""
+    try:
+        with open(f"{d}/.epoch", "w") as f:
+            f.write(str(int(epoch)))
+    except OSError:
+        pass
+
+
+def _read_epoch(d: str) -> int:
+    try:
+        with open(f"{d}/.epoch") as f:
+            return int((f.read().strip() or "1"))
+    except (OSError, ValueError):
+        return 1
+
 
 def op_create(body: dict) -> dict:
     sid      = body["id"]
@@ -348,6 +479,7 @@ def op_create(body: dict) -> dict:
     mem_mib  = int(body.get("mem_mib", 4096))
     kernel   = body.get("kernel", "/opt/sbx/vmlinux")
     env      = body.get("env", {})
+    epoch    = int(body.get("epoch", 1))  # 栅栏世代:控制面每次(重)放置自增,用于识别陈旧重复 VM
 
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
@@ -372,8 +504,10 @@ def op_create(body: dict) -> dict:
             "tap_idx": tap_idx,
             "ip":      guest_ip,
             "dir":     d,
+            "epoch":   epoch,
         }
-    return {"state": "running", "ip": guest_ip}
+    _write_epoch(d, epoch)
+    return {"state": "running", "ip": guest_ip, "epoch": epoch}
 
 
 def op_destroy(body: dict) -> dict:
@@ -427,8 +561,25 @@ def op_snapshot_base(body: dict) -> dict:
         # 打完 base 立即恢复运行(base 是运行期快照,不释放 RAM)
         _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
     dt = time.monotonic() - t0
+
+    # 方案 A:base 内存快照上传 S3(创建期打 base → 传 S3)。off 关键路径,失败重试后抛。
+    # 只传内存 base;磁盘(rootfs)在 suspend 时才传(那时的磁盘状态才是恢复所需)。
+    s3_prefix = body.get("s3_prefix", "")
+    uploaded_s3 = False
+    if s3_prefix and body.get("upload_s3", False):
+        _s3_tar_upload(snap_dir, ["vm.mem.base", "vm.snapshot.base"],
+                       s3_prefix.rstrip("/") + "/base.tar.gz")
+        # 记录已上传 base 的指纹,供 op_suspend 判断是否需要重传(base 未变则跳过)
+        try:
+            with open(f"{snap_dir}/.base_s3", "w") as mf:
+                mf.write(f"{os.path.getsize(base_mem)}:{int(os.path.getmtime(base_mem))}")
+        except OSError:
+            pass
+        uploaded_s3 = True
+
     return {"base_created": True, "base_snapshot_time_s": round(dt, 3),
-            "base_mem_bytes": os.path.getsize(base_mem)}
+            "base_mem_bytes": os.path.getsize(base_mem),
+            "base_s3": (s3_prefix.rstrip("/") + "/base.tar.gz") if uploaded_s3 else ""}
 
 
 def op_suspend(body: dict) -> dict:
@@ -533,14 +684,50 @@ def op_suspend(body: dict) -> dict:
         vm["state"] = "suspended"
         vm["pid"]   = None
 
-    # 跨机恢复靠 EBS detach/attach(控制面/运维编排),node-agent 不主动上传。
-    # (非方案C 场景若显式要求 upload_s3,保留 S3 上传作兜底路径。)
+    # 方案 A(S3 权威):把快照上传 S3 —— 内存(base+diff,sync 增量只传变化)+ 磁盘(rootfs 全量)。
+    #   顺序:snapshot/create 已把文件落本地 NVMe → kill VMM 释放 RAM(文件仍在)→ 此处上传。
+    #   不变式:标 suspended ⟺ S3 确有快照 —— 上传失败则 _s3_* 抛异常,op_suspend 随之失败,
+    #   控制面不会把 DynamoDB 记录标成 suspended(本地文件保留,可重试)。
+    #   磁盘必须传:Firecracker 快照不含磁盘内容,跨机 resume 若没有 rootfs 会丢 guest 磁盘写。
+    s3_uploaded = ""
+    upload_dt = 0.0
     if s3_prefix and body.get("upload_s3", False):
-        _s3_upload_sync(snap_dir, s3_prefix)
+        pfx = s3_prefix.rstrip("/")
+        rootfs_dir = os.path.dirname(snap_dir)   # {SBX_BASE}/{sid}
+        base_mem   = f"{snap_dir}/vm.mem.base"
+        marker     = f"{snap_dir}/.base_s3"
+        tu = time.monotonic()
+        # base:仅当【指纹变化】才重传 —— 初次(op_snapshot_base 已传并写指纹→这里跳过)、
+        # 或 resume 后 merged 转正使 base 变化时才传。避免每次 suspend 重传 2GiB 级 base,
+        # 这对 spot 窗口内批量疏散的时序至关重要。
+        if os.path.exists(base_mem):
+            cur = f"{os.path.getsize(base_mem)}:{int(os.path.getmtime(base_mem))}"
+            prev = ""
+            try:
+                with open(marker) as mf:
+                    prev = mf.read().strip()
+            except OSError:
+                pass
+            if cur != prev:
+                _s3_tar_upload(snap_dir, ["vm.mem.base", "vm.snapshot.base"], f"{pfx}/base.tar.gz")
+                try:
+                    with open(marker, "w") as mf:
+                        mf.write(cur)
+                except OSError:
+                    pass
+        # diff(内存脏页)+ rootfs(磁盘):每次 suspend 都传,【不压缩】。
+        #   内存脏页基本不可压(gzip 1.00x),spot 并发下 pigz 每个只分到 ~2 核 → 100MB/s 卡窗口;
+        #   tar -S 保留稀疏、2GB/s+,配合 aws s3 cp 分片并发(2.8GB/s)→ 疏散端到端提速 20x+。
+        _s3_tar_upload(snap_dir, ["vm.mem", "vm.snapshot"], f"{pfx}/diff.tar.gz", compress=False)
+        _s3_tar_upload(rootfs_dir, ["rootfs.ext4"], f"{pfx}/rootfs.tar.gz", compress=False)
+        upload_dt = time.monotonic() - tu
+        s3_uploaded = s3_prefix
 
     return {
         "snapshot_type": snap_type,
         "snapshot_create_time_s": round(dt, 3),
+        "s3_upload_time_s": round(upload_dt, 3),
+        "snapshot_s3": s3_uploaded,
         "mem_file_bytes": mem_apparent,
         "mem_actual_bytes": mem_actual,
     }
@@ -611,13 +798,15 @@ def op_resume(body: dict) -> dict:
     rootfs     = body["rootfs_path"]          # 统一路径约定
     tap_idx    = int(body["tap_idx"])
     s3_prefix  = body.get("s3_prefix", "")
+    epoch      = int(body.get("epoch", 1))    # 栅栏世代(见 op_create)
 
-    # 兜底:若本地无快照文件且传了 s3_prefix,从 S3 拉回。
-    # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
-    # s3_prefix 恒为空 → 这段兜底当前【不会触发】,为未来可选的 S3 归档预留。
-    # 现实的跨机恢复靠持久状态 EBS 卷幸存 + attach 到新节点(卷已 attach 则本地就有快照)。
+    # 方案 A(S3 权威):若本地无快照(跨节点恢复:原节点被 spot 回收/终止,本地 NVMe 已随之消失)
+    # 且传了 s3_prefix → 从 S3 拉回内存快照 base+diff(tar -S 解包还原稀疏)。磁盘在下方 rootfs 处一并拉。
+    # 同节点 resume 时本地 NVMe 上快照还在 → 跳过下载,亚秒恢复。
     if not os.path.exists(f"{snap_dir}/vm.snapshot") and s3_prefix:
-        _s3_download(s3_prefix, snap_dir)
+        pfx = s3_prefix.rstrip("/")
+        _s3_tar_download(f"{pfx}/base.tar.gz", snap_dir)   # base(可能不存在:纯 Full 场景)
+        _s3_tar_download(f"{pfx}/diff.tar.gz", snap_dir)   # diff / Full(必需)
 
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
@@ -639,8 +828,14 @@ def op_resume(body: dict) -> dict:
         snap_rootfs = f"{snap_dir}/rootfs.ext4"
         if os.path.exists(snap_rootfs):
             shutil.copy2(snap_rootfs, rootfs)
+        elif s3_prefix and _s3_tar_download(s3_prefix.rstrip("/") + "/rootfs.tar.gz",
+                                            os.path.dirname(rootfs)):
+            # 方案 A:跨节点恢复,从 S3 拉磁盘(suspend 时上传的 rootfs,tar -S 还原稀疏)。
+            # 必须用这份磁盘,不能回退模板 CoW —— 否则 guest 磁盘写全丢(快照只含内存)。
+            pass
         else:
-            # 最后兜底:按模板 CoW(与 create 一致,未知模板回退默认)
+            # 最后兜底:按模板 CoW(与 create 一致,未知模板回退默认)。
+            # 仅当既无本地磁盘也无 S3 磁盘时才走到这(无状态磁盘场景)。
             src = _rootfs_template_path(body.get("rootfs_template", ""))
             subprocess.run(["cp", "--reflink=auto", src, rootfs], check=True)
 
@@ -752,7 +947,9 @@ def op_resume(body: dict) -> dict:
             "tap_idx": tap_idx,
             "ip":      guest_ip,
             "dir":     d,
+            "epoch":   epoch,
         }
+    _write_epoch(d, epoch)
 
     # ---- P1: resume 后经 vsock 加速 guest 网络收敛 ----
     # 跨机 resume 后,guest 内存快照固化了旧宿主 tap 的网关 MAC(stale ARP)。
@@ -781,6 +978,7 @@ def op_resume(body: dict) -> dict:
     return {"restore_time_s": round(dt, 4), "ip": guest_ip,
             "merge_time_s": round(merge_time, 4),
             "net_fix_ok": net_fix_ok,
+            "epoch": epoch,
             "juicefs_mode": JUICEFS_ENABLED}
 
 
@@ -877,7 +1075,8 @@ def op_get(sid: str) -> dict:
         vm = _VMS.get(sid)
     if not vm:
         raise KeyError(sid)
-    return {"state": vm["state"], "ip": vm.get("ip", ""), "pid": vm.get("pid")}
+    return {"state": vm["state"], "ip": vm.get("ip", ""), "pid": vm.get("pid"),
+            "epoch": vm.get("epoch", 1)}
 
 
 def op_health() -> dict:
@@ -927,12 +1126,16 @@ def _heartbeat_once() -> None:
     from datetime import datetime, timezone
     with _LOCK:
         vm_count = len(_VMS)
+        # 栅栏:上报本节点当前承载的 VM 清单 {sid: epoch},供控制面对账识别陈旧重复 VM。
+        vms_map = {sid: {"N": str(int(vm.get("epoch", 1)))}
+                   for sid, vm in _VMS.items() if vm.get("state") == "running"}
     item = {
         "node_id":      {"S": NODE_ID},
         "ip":           {"S": _advertise_ip()},
         "free_mem_mib": {"N": str(_free_mem_mib())},
         "vm_count":     {"N": str(vm_count)},
         "last_seen":    {"S": datetime.now(timezone.utc).isoformat()},
+        "vms":          {"M": vms_map},
     }
     subprocess.run(
         ["aws", "dynamodb", "put-item",
@@ -991,6 +1194,7 @@ def _recover_vms() -> int:
                     "tap":   f"fctap{_tap_idx_guess(sid)}",
                     "ip":    "",
                     "dir":   d,
+                    "epoch": _read_epoch(d),  # 从磁盘还原世代,避免重启后误判陈旧
                 }
             recovered += 1
             break
@@ -1071,14 +1275,15 @@ def _evacuate_local(signal: dict) -> dict:
     """
     收到回收信号 → 疏散本节点所有 running 沙盒。
     - DRY-RUN(默认):只算并记录疏散计划,不真打快照。
-    - REAL(RECLAIM_AUTO_EVACUATE=1):对每个本地 running VM 打 Diff 快照到持久 EBS
-      (方案C,不传 S3)。状态回写 DynamoDB 由控制面 reconcile 感知(节点消失→
-      needs_reschedule),编排层跨机拉起见 Block 2(尚未实现)。
+    - REAL(RECLAIM_AUTO_EVACUATE=1):对每个本地 running VM 打 Diff 快照并【上传 S3】
+      (方案 A:内存 base+diff + 磁盘 rootfs)。S3 为权威副本,本地 NVMe 随实例销毁也不丢。
+      控制面 reconcile 感知节点消失后,可在其它节点从 S3 拉起(resume 走 s3_prefix)。
     """
     import sys
     sids = _local_running_vms()
-    # 疏散耗时粗估:满载 ~1.3GB/个 Diff、单卷 1000MB/s,实测 50 个并发 ~80s。
-    est_s = round(len(sids) * 1.3 + 20, 1)
+    # 疏散耗时粗估(方案 A):每个 = Diff 内存(秒级)+ 磁盘 rootfs 上传(~2GiB)。
+    # i7i 上行实测 1.4~2.9GB/s → 单个磁盘 ~1-2s;串行 N 个约 N*(2~4)s。真机验证以实测为准。
+    est_s = round(len(sids) * 3.0 + 10, 1)
     mode  = "REAL" if RECLAIM_AUTO_EVACUATE else "DRY-RUN"
     plan  = {"node": NODE_ID, "signal": signal, "count": len(sids),
              "sandboxes": sids, "est_evac_s": est_s, "mode": mode}
@@ -1091,15 +1296,28 @@ def _evacuate_local(signal: dict) -> dict:
         print("[reclaim] DRY-RUN: 不实际疏散。设 RECLAIM_AUTO_EVACUATE=1 开启真疏散。",
               file=sys.stderr, flush=True)
         return plan
-    # REAL 疏散:逐个打 Diff 快照(方案C 落持久 EBS)。批量并发由控制面侧限流更合适,
-    # 这里节点自救走串行/尽力而为,保证内存先落盘幸存。
+    # REAL 疏散(方案 A):并发打 Diff 快照 + 上传 S3(内存+磁盘)。spot 窗口紧,串行会超时,
+    # 故用线程池并发(受 RECLAIM_EVAC_CONCURRENCY 限流)。每个成功即代表 S3 已有权威副本
+    # (op_suspend 上传失败会抛,不计入 ok)。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _evac_one(sid: str) -> bool:
+        op_suspend({"id": sid, "snapshot_local_path": f"{SBX_BASE}/{sid}/snap",
+                    "s3_prefix": _sbx_s3_prefix(sid),
+                    "upload_s3": bool(SNAPSHOT_S3_BUCKET)})
+        return True
+
     ok = 0
-    for sid in sids:
-        try:
-            op_suspend({"id": sid, "snapshot_local_path": f"{SBX_BASE}/{sid}/snap"})
-            ok += 1
-        except Exception as e:
-            print(f"[reclaim] evacuate {sid} failed: {e}", file=sys.stderr, flush=True)
+    workers = max(1, min(RECLAIM_EVAC_CONCURRENCY, len(sids))) if sids else 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_evac_one, sid): sid for sid in sids}
+        for fut in as_completed(futs):
+            sid = futs[fut]
+            try:
+                fut.result()
+                ok += 1
+            except Exception as e:
+                print(f"[reclaim] evacuate {sid} failed: {e}", file=sys.stderr, flush=True)
     plan["evacuated_ok"] = ok
     _RECLAIM_STATE["evacuated"] = True
     print(f"[reclaim] REAL evacuation done: {ok}/{len(sids)}", file=sys.stderr, flush=True)

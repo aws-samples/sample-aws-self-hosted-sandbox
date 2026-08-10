@@ -13,6 +13,7 @@
   DELETE /sandboxes/{id}               销毁
   POST   /sandboxes/{id}/suspend       挂起 + 快照
   POST   /sandboxes/{id}/resume        从快照恢复
+  POST   /sandboxes/{id}/migrate       打快照→在另一节点恢复(手动迁移;body 可选 {target_node})
   POST   /sandboxes/{id}/exec          在沙盒内执行命令
   GET    /sandboxes/{id}/locate        定位 VMM(调试用)
   GET    /capabilities                 当前 driver 能力
@@ -213,6 +214,8 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         "mem_mib":          spec.mem_mib,
         "created_at":       db._utcnow(),
         "updated_at":       db._utcnow(),
+        # 栅栏世代:每次(重)放置 VM 自增,用于对账识别陈旧重复 VM(防分区愈合后双 VM)。
+        "epoch":            1,
         # 自动休眠用:最后活跃时刻。初始 = 创建时刻;之后由 proxy/exec 热路径 _touch_activity 刷新。
         "last_active_at":   db._utcnow(),
         "meta":             spec.meta,
@@ -234,7 +237,7 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         wants_default = normalize_image(spec.image) == "min"
         claimed = _warm_pool.claim(sid, spec) if wants_default else False
         if not claimed:
-            driver_fields = _driver.create(sid, spec)
+            driver_fields = _driver.create(sid, spec, epoch=1)
             db.force_update(sid, {**driver_fields, "state": "running"})
         db.write_event(sid, "created", "creating")
         # 方案C:create 成功后异步打一次 Full base 快照(供后续 Diff 疏散),不阻塞 create 返回。
@@ -635,7 +638,10 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
             _RESUME_SEM.acquire()
         try:
             t0 = time.monotonic()
-            driver_fields = _driver.resume(sid, record)
+            # 栅栏:每次 resume 自增 epoch(lease 已互斥,读-增-写安全)。新 VM 带新 epoch,
+            # 旧节点若残留老 VM(epoch 更小)会被对账栅栏识别并围杀。
+            new_epoch = int(record.get("epoch", 1)) + 1
+            driver_fields = _driver.resume(sid, record, epoch=new_epoch)
             restore_time  = round(time.monotonic() - t0, 4)
         finally:
             if _RESUME_SEM is not None:
@@ -658,6 +664,89 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         return 500, {"error": str(e)}
     except Exception as e:
         db.force_update(sid, {"state": "failed", "error": str(e)})
+        return 500, {"error": str(e)}
+    finally:
+        if lease_id:
+            db.release_lease(sid, lease_id)
+
+
+def migrate_sandbox(sid: str, target_node: str | None = None,
+                    caller_tenant: str | None = None) -> tuple[int, dict]:
+    """
+    手动迁移:在当前节点打快照(→ S3 权威副本),然后在【另一台】节点从 S3 恢复。
+    等价于 suspend + resume-on-other-node,合并在一个 lease 内完成。
+    需要集群至少有 2 台可用 sandbox 节点(否则 409)。
+
+    - target_node 可选:指定目标节点(node-agent 内网 IP);不传则自动选一台非当前节点的活节点。
+    - 失败语义:快照未成功 → 回滚 running(VM 未释放,数据未变);快照已成功但目标恢复失败
+      → 停在 suspended(S3 有权威副本,可重试 resume/migrate),绝不标 failed 丢状态。
+    """
+    record = db.get(sid)
+    if not record:
+        return 404, {"error": "not found"}
+    if (denied := _check_tenant_access(record, caller_tenant)):
+        return denied
+
+    lease_id = None
+    snapshotted = False  # 越过 suspend 后,失败要停 suspended(数据在 S3)而非 failed
+    try:
+        lease_id = db.acquire_lease(sid)
+        if record.get("state") != "running":
+            return 409, {"error": "sandbox is not running", "state": record.get("state")}
+
+        current = record.get("node", "")
+        # 先选目标节点(在打快照前失败得早):指定则校验非当前;否则自动选另一台活节点。
+        if target_node:
+            if target_node == current:
+                return 409, {"error": "target_node is the current node", "node": current}
+            target = target_node
+        else:
+            target = _driver.pick_other_node(current)
+            if not target:
+                return 409, {"error": "no other available node to migrate to (need >=2 nodes)",
+                             "current_node": current}
+
+        # 1) 打快照 → S3(权威副本)
+        db.update_state(sid, "suspending", "running")
+        snap_info = _driver.suspend(sid, record)
+        db.update_state(sid, "suspended", "suspending", snap_info)
+        db.write_event(sid, "suspended", "running", {**snap_info, "reason": "migrate"})
+        snapshotted = True
+
+        # 2) 在目标节点从 S3 恢复(force_node 强制换机,不复用原节点)
+        db.update_state(sid, "resuming", "suspended")
+        if _RESUME_SEM is not None:
+            _RESUME_SEM.acquire()
+        try:
+            t0 = time.monotonic()
+            new_epoch = int(record.get("epoch", 1)) + 1   # 栅栏:换机也是一次(重)放置
+            driver_fields = _driver.resume(sid, record, force_node=target, epoch=new_epoch)
+            restore_time  = round(time.monotonic() - t0, 4)
+        finally:
+            if _RESUME_SEM is not None:
+                _RESUME_SEM.release()
+        with _ACTIVITY_LOCK:
+            _ACTIVITY_LAST[sid] = time.monotonic()
+        db.update_state(sid, "running", "resuming",
+                        {**driver_fields, "restore_time_s": str(restore_time),
+                         "last_active_at": db._utcnow()})
+        db.write_event(sid, "migrated", "suspended",
+                       {"from_node": current, "to_node": driver_fields.get("node"),
+                        "restore_time_s": restore_time})
+        return 200, db.get(sid)
+    except UnsupportedOperation as e:
+        return 501, {"error": str(e)}
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return 409, {"error": "sandbox is not in expected state or is locked"}
+        return 500, {"error": str(e)}
+    except Exception as e:
+        if snapshotted:
+            # 快照已在 S3,目标恢复失败 → 停 suspended(可重试),不丢状态。
+            db.force_update(sid, {"state": "suspended", "error": str(e)})
+        else:
+            # 快照阶段失败 → node-agent 已尽力恢复 VM,回滚 running。
+            db.force_update(sid, {"state": "running", "error": str(e)})
         return 500, {"error": str(e)}
     finally:
         if lease_id:
@@ -1041,6 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
                 "DELETE /sandboxes/{id}",
                 "POST   /sandboxes/{id}/suspend",
                 "POST   /sandboxes/{id}/resume",
+                "POST   /sandboxes/{id}/migrate  (snapshot → resume on another node; body opt {target_node})",
                 "POST   /sandboxes/{id}/exec",
                 "GET    /sandboxes/{id}/locate",
                 "GET    /capabilities",
@@ -1076,6 +1166,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if action == "resume":
                 code, result = resume_sandbox(sid, ct)
+                return self._send(code, result)
+
+            if action == "migrate":
+                # 可选 body: {"target_node": "<ip>"};不传则自动选另一台活节点。
+                target = (self._body() or {}).get("target_node")
+                code, result = migrate_sandbox(sid, target, ct)
                 return self._send(code, result)
 
             if action == "exec":
