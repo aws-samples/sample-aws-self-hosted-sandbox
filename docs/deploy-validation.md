@@ -1,5 +1,9 @@
 # README 部署指引验证报告（第一轮 · kata-deploy 路线 · 已被方案 A 取代）
 
+> 本文是历史 Kata 部署审计。当前 Firecracker 双架构流程以
+> [`deploy.md`](deploy.md) 为准；2026-08-10 的 i7i x86 真机验证见
+> [`i7i-e2e-test-report-2026-08-10.md`](i7i-e2e-test-report-2026-08-10.md)。
+
 > 验证日期：2026-06-14 ｜ 账号：427169985960 ｜ Region：us-east-1
 > 验证方式：在真实 AWS 环境按 README「快速开始（Agent 部署指南）」逐步执行
 > 工具版本：terraform 1.15.2 / kubectl 1.36 / helm 4.2.0 / aws-cli / docker(colima) 29.5.3
@@ -74,7 +78,7 @@ kubectl get runtimeclass | grep kata-qemu                                     # 
    # kata-deploy 会重启 containerd，节点将 NotReady 约 10-15 分钟，等待自愈：
    kubectl wait node --all --for=condition=Ready --timeout=1200s
    ```
-4. **强烈建议**：要么把 Terraform 默认机型 `metal_instance_type` 改为作者实测通过的 `c7g.metal`，要么在文档中明确标注「c6g.metal 上 kata-deploy 存在节点重启循环，推荐 c7g.metal」，并补充 containerd 重启的规避方案（如预先在节点 user_data 写好 kata 的 containerd drop-in，避免运行时 restart）。
+4. **历史建议（已过期）**：该问题属于已移除的 Kata 路径。当前 Firecracker 节点由 `sandbox_instance_type` 选择，不再安装 kata-deploy。
 
 ---
 

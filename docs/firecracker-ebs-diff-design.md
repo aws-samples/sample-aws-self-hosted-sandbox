@@ -107,7 +107,7 @@
 > **实例类型：换回 c6g.metal（不用 c6gd.metal）。** 方案 C 下状态落持久 EBS，本地 NVMe
 > （c6gd 的卖点）用不上（临时盘，spot 死即清空）。实测 c6g.metal 与 c6gd.metal **EBS 带宽同为
 > 2375MB/s、IOPS 同为 80000、CPU/内存相同**，唯一差别是本地 NVMe → 换回 c6g.metal **省 ~13% 成本、
-> 零性能损失**。切换方式：部署时 `-var="metal_instance_type=c6g.metal"`（已参数化，代码不用改）。
+> 零性能损失**。Graviton 路径固定使用 `c6g.metal`；x86 路径改用支持嵌套虚拟化的 i7i 系列。
 
 ```
 c6g.metal 节点

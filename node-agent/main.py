@@ -117,8 +117,21 @@ JUICEFS_FS_NAME    = "sbxfs"                      # JuiceFS 文件系统名（�
 # 重启后靠控制面重新 reconcile;这里只是操作句柄缓存。
 _VMS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+_VM_OP_LOCKS: dict[str, threading.RLock] = {}
 
 os.makedirs(SBX_BASE, exist_ok=True)
+
+
+def _vm_op_lock(sandbox_id: str) -> threading.RLock:
+    """Serialize Firecracker API operations for one VM while allowing other VMs in parallel."""
+    with _LOCK:
+        return _VM_OP_LOCKS.setdefault(sandbox_id, threading.RLock())
+
+
+def _drop_vm_op_lock(sandbox_id: str, lock: threading.RLock) -> None:
+    with _LOCK:
+        if _VM_OP_LOCKS.get(sandbox_id) is lock:
+            _VM_OP_LOCKS.pop(sandbox_id, None)
 
 
 # ---------- tap 网络 ----------
@@ -1324,18 +1337,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
         body = self._body()
         try:
-            if path == "/vm/create":
-                return self._send(200, op_create(body))
-            if path == "/vm/destroy":
-                return self._send(200, op_destroy(body))
-            if path == "/vm/snapshot_base":
-                return self._send(200, op_snapshot_base(body))
-            if path == "/vm/suspend":
-                return self._send(200, op_suspend(body))
-            if path == "/vm/resume":
-                return self._send(200, op_resume(body))
-            if path == "/vm/exec":
-                return self._send(200, op_exec(body))
+            if path.startswith("/vm/") and body.get("id"):
+                sid = str(body["id"])
+                op_lock = _vm_op_lock(sid)
+                try:
+                    with op_lock:
+                        if path == "/vm/create":
+                            return self._send(200, op_create(body))
+                        if path == "/vm/destroy":
+                            return self._send(200, op_destroy(body))
+                        if path == "/vm/snapshot_base":
+                            return self._send(200, op_snapshot_base(body))
+                        if path == "/vm/suspend":
+                            return self._send(200, op_suspend(body))
+                        if path == "/vm/resume":
+                            return self._send(200, op_resume(body))
+                        if path == "/vm/exec":
+                            return self._send(200, op_exec(body))
+                finally:
+                    if path == "/vm/destroy":
+                        _drop_vm_op_lock(sid, op_lock)
             # Block 1 测试:注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
             if path == "/reclaim/simulate":
                 sig = {"type": body.get("type", "spot-termination"),

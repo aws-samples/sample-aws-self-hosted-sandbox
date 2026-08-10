@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 构建【命名 rootfs 模板】—— 泛化自 build-min-rootfs.sh。
-# 每个模板 = 一个可启动 arm64 rootfs.tar.gz,含 sbxinit(PID1) + vsock-exec-agent(exec 主通道),
+# 每个模板 = 一个可启动 rootfs.tar.gz,含 sbxinit(PID1) + vsock-exec-agent(exec 主通道),
 # 在其上叠加该"镜像"的应用层。产出 rootfs-{name}.tar.gz 上传 S3,节点拉取造 /opt/sbx/rootfs-{name}.ext4。
 # create 时按沙盒的 image 字段选模板(见 node-agent op_create 的 rootfs_template)。
 #
@@ -10,6 +10,8 @@
 #   其它 name        → 目前回退到 min 内容(可在下方 case 里加预设)
 set -euo pipefail
 
+PLATFORM="${PLATFORM:-linux/arm64}"
+ROOTFS_PREFIX="${ROOTFS_PREFIX:-rootfs}"
 NAME="${1:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
 S3_BUCKET="${2:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
 REGION="${AWS_REGION:-us-east-1}"
@@ -87,8 +89,8 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
  && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 DOCKER
-docker build --platform linux/arm64 -t "sbx-rootfs:$NAME" "$WORK"
-CID=$(docker create --platform linux/arm64 "sbx-rootfs:$NAME" sleep infinity)
+docker build --platform "$PLATFORM" -t "sbx-rootfs:$NAME" "$WORK"
+CID=$(docker create --platform "$PLATFORM" "sbx-rootfs:$NAME" sleep infinity)
 mkdir -p "$WORK/rootfs"
 docker export "$CID" | tar -C "$WORK/rootfs" -xf -
 docker rm "$CID" >/dev/null
@@ -150,9 +152,9 @@ tar -C "$WORK/rootfs" -czf "$TARBALL" .
 echo "==> rootfs tarball: $(du -h "$TARBALL" | cut -f1)"
 # min 兼容旧路径 min-rootfs.tar.gz;其余用 rootfs-{name}.tar.gz
 if [ "$NAME" = "min" ]; then
-  S3_URI="s3://${S3_BUCKET}/rootfs/min-rootfs.tar.gz"
+  S3_URI="s3://${S3_BUCKET}/${ROOTFS_PREFIX}/min-rootfs.tar.gz"
 else
-  S3_URI="s3://${S3_BUCKET}/rootfs/rootfs-${NAME}.tar.gz"
+  S3_URI="s3://${S3_BUCKET}/${ROOTFS_PREFIX}/rootfs-${NAME}.tar.gz"
 fi
 aws s3 cp "$TARBALL" "$S3_URI" --region "$REGION"
 echo "==> uploaded: $S3_URI"

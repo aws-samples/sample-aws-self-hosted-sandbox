@@ -8,8 +8,17 @@
 ## 后端：裸 Firecracker microVM
 
 本平台后端为**裸 Firecracker microVM + node-agent DaemonSet**：支持 suspend/resume 亚秒恢复 +
-持久 EBS 跨机快照（状态卷落持久 EBS + Diff 增量内存快照），成本优先。控制面通过 HTTP 直管每台 .metal 节点上的
+持久 EBS 跨机快照（状态卷落持久 EBS + Diff 增量内存快照），成本优先。控制面通过 HTTP 直管每台沙盒节点上的
 node-agent，不依赖 K8s 编排沙盒本身。
+
+部署者必须选择节点架构：
+
+| 选择 | `node_arch` | 默认实例 | KVM 来源 |
+|---|---|---|---|
+| Graviton | `arm64` | `c6g.metal` | 裸金属 |
+| Intel x86 | `amd64` | `i7i.8xlarge` | Nitro nested virtualization |
+
+x86 支持所有 `i7i.*` 规格，可用 `sandbox_instance_type` 覆盖；默认选 `i7i.8xlarge`。
 
 > （历史上曾有可插拔的 Kata-on-EKS 后端，因无法快照/恢复、与本平台 spot 疏散核心诉求不符，已移除。
 > 本手册即 Firecracker 单一主线，无需再选 driver。）
@@ -19,8 +28,9 @@ node-agent，不依赖 K8s 编排沙盒本身。
 ## 前提条件
 
 - AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3）
-- 已安装：kubectl, terraform (≥1.5), helm, git, docker（构建 arm64 镜像/rootfs 用）
-- EC2 vCPU 服务配额：c6g.metal = 64 vCPU，默认配额通常不够，需提前申请
+- 已安装：kubectl, terraform (≥1.5), helm, git, docker
+- EC2 vCPU 服务配额：Graviton `c6g.metal` 需要 64 vCPU；x86 默认 `i7i.8xlarge` 需要 32 vCPU
+- x86 部署区域必须提供 i7i 且支持 nested virtualization；部署前按 Step 0.5 查询
 - 生产部署必须设置 `API_KEYS`（见 Step 6 注意事项）
 
 ---
@@ -31,11 +41,11 @@ node-agent，不依赖 K8s 编排沙盒本身。
 2. **DynamoDB 表必须先建**（Step 1）。漏了这步，控制面 create 会报 `ResourceNotFoundException`（boto3 找不到表），且报错发生在业务逻辑里、不易一眼看出。
 3. **`fc_nodes` 是 fallback，节点发现优先走 DynamoDB 心跳表**：P0 加固后 node-agent 每 30s 写 `claude-sbx-nodes` 表，控制面 `_pick_node` 优先从心跳表选活节点（按 `last_seen` 超时剔除死节点），`fc_nodes` 仅在心跳表为空时兜底。**首次部署 fc_nodes 仍建议只填稳定节点**（心跳还没写起来时靠它），但节点增减后无需再改 `fc_nodes` + 重启控制面——心跳表会自动反映。查活节点：`aws dynamodb scan --table-name claude-sbx-nodes --query 'Items[].{node:node_id.S,last_seen:last_seen.S}'`。
 4. **rootfs 必须是含 vsock agent 的 min-rootfs**：exec 走 vsock 通道，需要 `scripts/build-min-rootfs.sh` 产出的 rootfs（内含 `/sbin/vsock-exec-agent.py`，sbxinit 后台启动）。**别用 phase3 `rootfs_s3_uri` 的默认 juicefs 版**——apply phase3 时必须显式传 `-var="rootfs_s3_uri=s3://<bucket>/rootfs/min-rootfs.tar.gz"`（见 Step 1.5 + Step 2）。
-5. **.metal 节点反复 NotReady / ASG 替换循环 —— 真因是 ASG grace period 太短，已固化修复**：c6g.metal 过 EC2 status check 需 5-10 分钟，而 EKS 托管节点组建的 ASG 默认 health check grace period 仅 **15 秒** → 节点刚起就被判 unhealthy 替换 → 无限替换循环，永远收敛不到全 Ready（2026-07-07 实测定位，纠正了旧认知"暂态自愈"）。**`terraform/phase3/main.tf` 已用 `null_resource.metal_asg_grace_period` 固化 grace period=900s，apply 时自动 patch，正常情况无需干预**。若仍见反复替换：`aws autoscaling describe-scaling-activities --auto-scaling-group-name <asg>` 看 cause 是否 "EC2 instance status checks failure"，`aws ec2 describe-instance-status --instance-ids <iid>` 看 status check 是否卡在 initializing/impaired；确认 grace period 已生效：`aws autoscaling describe-auto-scaling-groups ... --query '...HealthCheckGracePeriod'` 应为 900。**给足 15-20 分钟等 metal 过 status check + kubelet 注册**，别在头几分钟手动删节点。
-6. **arm64 镜像 + rootfs**：控制面/node-agent 镜像**和** min-rootfs 都必须在 arm64 机器上构建（M 系列 Mac、Graviton EC2 或 .metal 节点）。Mac 上若用 colima：`colima start --arch aarch64`。
+5. **节点反复 NotReady / ASG 替换循环**：`c6g.metal` 过 EC2 status check 需 5-10 分钟，而 EKS 托管节点组 ASG 默认 grace period 过短。`terraform/phase3/main.tf` 已用 `null_resource.sandbox_asg_grace_period` 固化为 900s。若仍反复替换，检查 ASG activity、EC2 status check 和 grace period。
+6. **镜像与 rootfs 架构必须一致**：Graviton 用 `linux/arm64`，i7i 用 `linux/amd64`。构建脚本通过 `PLATFORM` 选择目标架构。
 8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
-10. **费用提醒**：c6g.metal 按小时计费（约 $2.3/hr/台，FC 默认起 2 台 = ~$4.6/hr），EKS 控制面 $0.1/hr，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，多半是 node-agent pod 在 NotReady 节点上无法优雅终止 → `kubectl delete pods -n sandbox-system --all --force --grace-period=0` 解除。
+10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
 
 ---
 
@@ -46,6 +56,32 @@ git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
 cd aws-self-hosted-sandbox
 export AWS_REGION=us-east-1
 ```
+
+---
+
+## Step 0.5: 选择 Graviton 或 x86
+
+```bash
+# 二选一。本文后续命令复用这两个变量。
+export NODE_ARCH=arm64
+export SANDBOX_INSTANCE_TYPE=c6g.metal
+export SANDBOX_AZ_INDEX=0
+
+# Intel x86（默认 i7i.8xlarge；其他 i7i 规格也支持）
+# export NODE_ARCH=amd64
+# export SANDBOX_INSTANCE_TYPE=i7i.8xlarge
+# export SANDBOX_AZ_INDEX=0   # 0/1/2 = us-east-1a/1b/1c
+
+if [ "$NODE_ARCH" = "amd64" ]; then
+  aws ec2 describe-instance-types --region "$AWS_REGION" \
+    --instance-types "$SANDBOX_INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].{type:InstanceType,arch:ProcessorInfo.SupportedArchitectures,features:ProcessorInfo.SupportedFeatures}' \
+    --output table
+fi
+```
+
+选择 `amd64` 时，Terraform 会在 Launch Template 中显式设置
+`nested_virtualization=enabled`。若查询结果或目标区域不支持该能力，不要继续 apply。
 
 ---
 
@@ -65,7 +101,7 @@ aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 ## Step 1.5: 构建并上传含 vsock agent 的 min-rootfs（FC 专用，勿跳）
 
 FC 的 exec 走 vsock 通道，rootfs 内必须有 `/sbin/vsock-exec-agent.py`（由 sbxinit 后台启动）。
-用 `build-min-rootfs.sh` 构建（**arm64 机器**上跑）：
+用 `build-min-rootfs.sh` 构建。目标平台必须与 `NODE_ARCH` 一致：
 
 ```bash
 cd ../..   # 回到仓库根
@@ -78,15 +114,22 @@ mkdir -p .sbxkeys
 [ -f .sbxkeys/sbx_exec ] || ssh-keygen -t ed25519 -N "" -f .sbxkeys/sbx_exec -C sbx-exec
 cp .sbxkeys/sbx_exec node-agent/sbx_exec_key   # node-agent 镜像构建需要（Dockerfile COPY）
 
-# 构建 + 上传 → s3://<bucket>/rootfs/min-rootfs.tar.gz
+# 按架构隔离 S3 key，避免 arm64 / amd64 rootfs 相互覆盖
+if [ "$NODE_ARCH" = "amd64" ]; then
+  export PLATFORM=linux/amd64 ROOTFS_KEY=rootfs/amd64/min-rootfs.tar.gz
+else
+  export PLATFORM=linux/arm64 ROOTFS_KEY=rootfs/arm64/min-rootfs.tar.gz
+fi
+
 bash scripts/build-min-rootfs.sh "${BUCKET}"
 
 # 验证 vsock agent 确实进了 rootfs（可选）
-aws s3 cp "s3://${BUCKET}/rootfs/min-rootfs.tar.gz" /tmp/r.tgz --region us-east-1
+aws s3 cp "s3://${BUCKET}/${ROOTFS_KEY}" /tmp/r.tgz --region us-east-1
 tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
 ```
 
-> Mac 上 docker 未起：`colima start --cpu 4 --memory 8 --arch aarch64`。
+> Mac 上 docker 未起：Graviton 可用 `colima start --cpu 4 --memory 8 --arch aarch64`；
+> i7i 构建用 Docker 的 `linux/amd64` 平台。
 
 ---
 
@@ -98,7 +141,8 @@ tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
 
 ```bash
 # 构建 web 模板(与 min 同基底,叠加 demo 站点 + 开机自起 :80)
-bash scripts/build-rootfs-image.sh web "${BUCKET}"
+ROOTFS_PREFIX="rootfs/${NODE_ARCH}" PLATFORM="${PLATFORM}" \
+  bash scripts/build-rootfs-image.sh web "${BUCKET}"
 # → 上传到 s3://<bucket>/rootfs/rootfs-web.tar.gz
 ```
 
@@ -108,7 +152,7 @@ bash scripts/build-rootfs-image.sh web "${BUCKET}"
 
 ---
 
-## Step 2: 创建 EKS 集群 + .metal 节点组（传 rootfs_s3_uri）
+## Step 2: 创建 EKS 集群 + Firecracker 沙盒节点组
 
 ```bash
 cd terraform/phase3
@@ -117,27 +161,38 @@ ACCT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET="my-sandbox-snapshots-${ACCT}"
 
 terraform init && terraform apply -auto-approve \
-  -var="node_arch=arm64" \
-  -var="rootfs_s3_uri=s3://${BUCKET}/rootfs/min-rootfs.tar.gz" \
+  -var="node_arch=${NODE_ARCH}" \
+  -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
+  -var="sandbox_az_index=${SANDBOX_AZ_INDEX}" \
+  -var="rootfs_s3_uri=s3://${BUCKET}/${ROOTFS_KEY}" \
   -var="rootfs_images=web" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # rootfs_images(默认 web):节点额外拉 rootfs-{name}.tar.gz 造 /opt/sbx/rootfs-{name}.ext4 模板;
 #   须在 Step 1.6 先构建上传对应模板。不需要自定义镜像可传 -var="rootfs_images="。
-# EKS 控制面约 10-12 分钟，加 .metal 节点组冷启动整体约 15 分钟
-# 默认起 2 台 c6g.metal（跨机快照演示需 2 台；只测 exec 可改 min/max/desired=1）
+# 默认 1 台沙盒节点；跨机快照演示加 -var="sandbox_node_count=2"
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 ```
 
+若 ASG activity 报 `InsufficientInstanceCapacity`，说明所选规格在当前 AZ 暂时无
+On-Demand 容量。保持单 AZ/EBS 约束，设置 `SANDBOX_AZ_INDEX=1`（region-b）或 `2`
+（region-c）后重新 apply。可先用下面命令查看 AWS 的具体建议：
+
+```bash
+aws autoscaling describe-scaling-activities --region "$AWS_REGION" \
+  --auto-scaling-group-name "<asg-name>" --max-items 5 \
+  --query 'Activities[].StatusMessage' --output table
+```
+
 > ⚠️ `rootfs_s3_uri` 不传 → 用默认 juicefs 版 rootfs（无 vsock agent）→ exec 掉到 SSH 兜底并因 sbxinit 硬编码 IP 失败（见注意事项 4）。
-> ⚠️ .metal 节点可能冷启动抖动（NotReady）；记下**稳定 Ready** 的节点内网 IP，Step 6 的 `fc_nodes` 只填稳定节点（见注意事项 3/5）。
+> ⚠️ 节点可能冷启动抖动（NotReady）；记下**稳定 Ready** 的节点内网 IP，Step 6 的 `fc_nodes` 只填稳定节点。
 >
 > 直接进入 Step 5（构建镜像）→ Step 6（部署控制面）。POC 用 kubectl port-forward 访问控制面，
-> 无需 ingress-nginx；沙盒节点即 phase3 的 .metal 托管节点组，无需 Karpenter。
+> 无需 ingress-nginx；沙盒节点即 phase3 的托管节点组，无需 Karpenter。
 
 ---
 
-## Step 5: 创建 ECR 仓库并构建 arm64 镜像
+## Step 5: 创建 ECR 仓库并构建对应架构镜像
 
 ```bash
 # claude-sbx 仓库已由 Step 2 的 Terraform 自动创建，只需建以下两个：
@@ -145,11 +200,11 @@ ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
 
-# 方式 A：本地 arm64 机器（M 系列 Mac 或 Graviton EC2）
+# PLATFORM 已在 Step 1.5 按 NODE_ARCH 设置
 # 前置：Step 1.5 已生成 node-agent/sbx_exec_key（Dockerfile COPY 需要），否则镜像构建失败
-bash scripts/build_and_push.sh
+bash scripts/build_and_push.sh --platform "${PLATFORM}"
 
-# 方式 B：在 .metal 节点上原生构建（x86 机器无 buildx 时推荐，见脚本注释）
+# 也可在目标架构 EC2 上原生构建
 ```
 
 ---
@@ -169,11 +224,12 @@ API_KEY=$(openssl rand -hex 32)
 LITELLM_KEY=$(openssl rand -hex 32)
 echo "API_KEY: $API_KEY  （保存好，后续 curl 鉴权用）"
 
-# FC 模式关键：拿【稳定 Ready】的 .metal 节点内网 IP 拼 fc_nodes（只填稳定节点！见注意事项 3）
+# FC 模式关键：拿【稳定 Ready】的沙盒节点内网 IP 拼 fc_nodes
 FC_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
 echo "FC_NODES=$FC_NODES  （若含 NotReady 节点，手动改成只留稳定的）"
 
 terraform apply -auto-approve \
+  -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
@@ -221,6 +277,7 @@ LITELLM_KEY="<Step 6 生成的 LITELLM_KEY>"
 
 # 1) 重新 apply，打开 create_ingress_nginx（拉起共享 NLB）。其余 var 与 Step 6 保持一致。
 terraform apply -auto-approve \
+  -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
@@ -306,6 +363,10 @@ echo "NLB: $NLB_HOST"
 
 ## Step 9: 验证部署（Firecracker）
 
+> 已验证配置：`node_arch=amd64`、`sandbox_instance_type=i7i.8xlarge`、
+> `sandbox_az_index=1`。完整宿主、guest、生命周期和清理证据见
+> [i7i 真机测试报告](i7i-e2e-test-report-2026-08-10.md)。
+
 ```bash
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
 kubectl get pods -n sandbox-system -o wide   # 控制面 2/2 + node-agent DaemonSet（每台 sandbox=true 节点一个）
@@ -320,7 +381,7 @@ curl -s $BASE/ ; echo
 curl -s $BASE/capabilities ; echo   # {"driver":"firecracker","suspend_resume":true,...}
 
 # 端到端测试（FC 模式）
-bash scripts/e2e_test.sh --driver firecracker --api-url $BASE
+bash scripts/e2e_test.sh --driver firecracker --api-url "$BASE" --api-key "$API_KEY"
 
 # 手动验证 vsock exec 在 microVM 内执行（复现实测报告 §八）
 SID=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
@@ -468,8 +529,7 @@ curl -s -X DELETE -H "Authorization: Bearer ${API_KEY}" \
 
 ## 清理（避免费用）
 
-> ⏱ 顺序：stage2 → phase3（删 EKS+metal，真正停止 metal 计费的一步，约 15-20 分钟）→ stage1。
-> phase3 destroy 里 node group 删除本身就要 3-6 分钟，metal 实例到那时才终止，属正常。
+> ⏱ 顺序：stage2 → phase3（删除 EKS 与沙盒节点，停止主要计算费用）→ stage1。
 
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
@@ -483,6 +543,7 @@ helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
 
 # 1. 删 stage2（var 要与 apply 时一致，含 fc_nodes）
 cd terraform/stage2-control-plane && terraform destroy -auto-approve \
+  -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=placeholder" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
@@ -508,19 +569,27 @@ if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
   done
 fi
 
-# 4. 删 EKS 集群 + metal 节点（约 15-20 分钟；var 要与 apply 时一致）
-#    node group 删除本身 3-6 分钟，metal 实例在此期间终止（计费到实例 terminated 为止）
+# 4. 删 EKS 集群 + 沙盒节点（var 要与 apply 时一致）
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 cd ../phase3 && terraform destroy -auto-approve \
-  -var="node_arch=arm64" \
-  -var="rootfs_s3_uri=s3://my-sandbox-snapshots-${ACCT}/rootfs/min-rootfs.tar.gz" \
+  -var="node_arch=${NODE_ARCH}" \
+  -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
+  -var="sandbox_az_index=${SANDBOX_AZ_INDEX}" \
+  -var="rootfs_s3_uri=s3://my-sandbox-snapshots-${ACCT}/${ROOTFS_KEY}" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # VPC 删除卡住 >5min → 删 eks-cluster-sg：
 #   SG=$(aws ec2 describe-security-groups --region us-east-1 \
 #     --filters "Name=group-name,Values=eks-cluster-sg-claude-sbx-*" \
 #     --query 'SecurityGroups[0].GroupId' --output text)
 #   [ "$SG" != "None" ] && aws ec2 delete-security-group --region us-east-1 --group-id "$SG"
+#
+# 若私有子网仍被 GuardDutyManaged endpoint 占用：
+#   aws ec2 describe-vpc-endpoints --region "$AWS_REGION" \
+#     --filters "Name=vpc-id,Values=${VPC_ID}" \
+#     --query 'VpcEndpoints[?Tags[?Key==`GuardDutyManaged`]].VpcEndpointId' --output text
+# 确认 endpoint 属于本次待删除 VPC 后，删除它并重新执行 phase3 destroy：
+#   aws ec2 delete-vpc-endpoints --region "$AWS_REGION" --vpc-endpoint-ids <vpce-id>
 
 # 5. 删 DynamoDB（建议彻底删，不要保留）
 #    stage1 共 5 张表：sandboxes / events / tap-idx / nodes / locks

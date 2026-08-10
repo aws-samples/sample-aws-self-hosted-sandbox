@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# 构建最小可启动 arm64 rootfs
+# 构建最小可启动 rootfs
 #   里程碑 A: 内存快照 + 跨机恢复(心跳验证)
 #   里程碑 B: exec —— vsock 主通道(guest 起 vsock-exec-agent) + SSH 兜底
 #            (SSH: init 读内核 cmdline 的 SBX_IP 配网 + 起 sshd + 授权公钥)
 # 产出 rootfs.tar.gz 上传 S3,供节点拉取。
 #
-# 用法: bash scripts/build-min-rootfs.sh <s3-bucket>
+# 用法: PLATFORM=linux/amd64 bash scripts/build-min-rootfs.sh <s3-bucket>
 set -euo pipefail
 
 S3_BUCKET="${1:?usage: build-min-rootfs.sh <s3-bucket>}"
 REGION="${AWS_REGION:-us-east-1}"
+PLATFORM="${PLATFORM:-linux/arm64}"
+ROOTFS_KEY="${ROOTFS_KEY:-rootfs/min-rootfs.tar.gz}"
 WORK=$(mktemp -d)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PUBKEY_FILE="${ROOT}/.sbxkeys/sbx_exec.pub"
@@ -81,8 +83,8 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
  && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 DOCKER
-docker build --platform linux/arm64 -t sbx-rootfs:b "$WORK"
-CID=$(docker create --platform linux/arm64 sbx-rootfs:b sleep infinity)
+docker build --platform "$PLATFORM" -t sbx-rootfs:b "$WORK"
+CID=$(docker create --platform "$PLATFORM" sbx-rootfs:b sleep infinity)
 mkdir -p "$WORK/rootfs"
 docker export "$CID" | tar -C "$WORK/rootfs" -xf -
 docker rm "$CID" >/dev/null
@@ -98,6 +100,6 @@ chmod +x "$WORK/rootfs/sbin/vsock-exec-agent.py"
 TARBALL="$WORK/rootfs.tar.gz"
 tar -C "$WORK/rootfs" -czf "$TARBALL" .
 echo "==> rootfs tarball: $(du -h "$TARBALL" | cut -f1)"
-S3_URI="s3://${S3_BUCKET}/rootfs/min-rootfs.tar.gz"
+S3_URI="s3://${S3_BUCKET}/${ROOTFS_KEY}"
 aws s3 cp "$TARBALL" "$S3_URI" --region "$REGION"
 echo "==> uploaded: $S3_URI"

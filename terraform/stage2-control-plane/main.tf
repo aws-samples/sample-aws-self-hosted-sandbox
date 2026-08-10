@@ -27,7 +27,7 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws        = { source = "hashicorp/aws", version = "~> 5.0" }
+    aws        = { source = "hashicorp/aws", version = ">= 6.0, < 7.0" }
     kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.0" }
     helm       = { source = "hashicorp/helm", version = "~> 2.0" }
     null       = { source = "hashicorp/null", version = "~> 3.0" }
@@ -64,7 +64,7 @@ variable "node_agent_image" {
 # 控制面访问 node-agent 的节点内网 IP(逗号分隔)
 variable "fc_nodes" {
   type        = string
-  description = "Comma-separated private IPs of metal nodes running node-agent (firecracker mode)"
+  description = "Comma-separated private IPs of Firecracker sandbox nodes running node-agent"
   default     = ""
 }
 
@@ -140,21 +140,6 @@ variable "node_arch" {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
   }
-}
-
-variable "metal_instance_type" {
-  type        = string
-  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
-  description = ".metal 实例类型(沙盒节点池)。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal。"
-}
-
-locals {
-  # 架构 → 默认 .metal 机型(amd64 取最便宜的 Intel x86 裸金属 c5n.metal)
-  default_metal_by_arch = {
-    arm64 = "c6g.metal"
-    amd64 = "c5n.metal"
-  }
-  metal_type = var.metal_instance_type != "" ? var.metal_instance_type : local.default_metal_by_arch[var.node_arch]
 }
 
 # ---------- Providers ----------
@@ -611,7 +596,7 @@ resource "kubernetes_service" "control_plane" {
   }
 }
 
-# ---------- Kubernetes: node-agent DaemonSet(.metal 节点专用) ----------
+# ---------- Kubernetes: node-agent DaemonSet(Firecracker 沙盒节点专用) ----------
 
 resource "kubernetes_daemon_set_v1" "node_agent" {
   metadata {
@@ -624,7 +609,7 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
       metadata { labels = { app = "node-agent" } }
       spec {
         service_account_name = kubernetes_service_account.node_agent.metadata[0].name
-        # 只调度到 .metal 沙盒节点
+        # 只调度到 Firecracker 沙盒节点
         node_selector = { sandbox = "true" }
         # 需要 hostNetwork + hostPID 才能操作 tap/Firecracker
         host_network = true
