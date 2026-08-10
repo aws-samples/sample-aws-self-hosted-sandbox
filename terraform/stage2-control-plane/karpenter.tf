@@ -218,7 +218,6 @@ resource "null_resource" "karpenter_nodepools" {
 
   triggers = {
     cluster_name = var.cluster_name
-    metal_type   = local.metal_type
     node_arch    = var.node_arch
     node_role    = aws_iam_role.karpenter_node.name
   }
@@ -266,16 +265,16 @@ resource "null_resource" "karpenter_nodepools" {
           consolidationPolicy: WhenEmptyOrUnderutilized
           consolidateAfter: 1m
       ---
-      # NOTE: 承载 sandbox 的 .metal 节点当前由 phase3 的托管节点组提供
+      # NOTE: 承载 sandbox 的 Firecracker 节点当前由 phase3 的托管节点组提供
       #       (固定 desired，打 sandbox=true label，node-agent DaemonSet 直起裸 Firecracker)。
-      #       因此这里【不再】定义 sandbox 的 metal NodePool。
+      #       因此这里【不再】定义 sandbox NodePool。
       #
       #       历史上曾有一个 `kata-metal` NodePool(带 kata-dedicated 污点，供 Kata pod 调度)，
       #       随 Kata 后端移除已删除。
       #
       #       预留位:未来落地 spot 回收自动恢复(见 docs/spot-reclaim-recovery-design.md)时，
-      #       可在此新增一个【FC-only】的 metal NodePool —— 用于在 spot 节点被回收后，
-      #       同 AZ 快速拉起替补 .metal 节点承接跨机恢复(无 kata 污点，打 sandbox=true)。
+      #       可在此新增一个【FC-only】NodePool —— 用于在 spot 节点被回收后，
+      #       同 AZ 快速拉起替补沙盒节点承接跨机恢复(无 kata 污点，打 sandbox=true)。
       NODEPOOL
     EOT
   }

@@ -810,8 +810,8 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
         <div className="deck-cards c3">
           <div className="deck-card accent">
             <span className="dc-icon">🖥️</span>
-            <h3>EKS + Bare Metal EC2</h3>
-            <p>c6g.metal(arm64,默认)/ c5n.metal(x86)。EC2 仅在 .metal 暴露 /dev/kvm,裸金属才能跑 microVM。EKS 管平台,microVM 不进 K8s。</p>
+            <h3>EKS + Firecracker EC2</h3>
+            <p>Graviton 使用 c6g.metal；x86 使用支持嵌套虚拟化的 i7i 全系列，默认 i7i.8xlarge。EKS 管平台，microVM 不进 K8s。</p>
           </div>
           <div className="deck-card accent">
             <span className="dc-icon">🎛️</span>

@@ -45,46 +45,52 @@ terraform destroy -var="my_ip_cidr=$(curl -s https://checkip.amazonaws.com)/32"
 > arm64 内核(c6g.metal 64 核 native 编译几分钟),vmconfig 指向 `/opt/sbx/vmlinux-fuse`。
 
 Phase 1 创建的资源:
-- 1 台 `c6g.metal`(默认;`-var="metal_instance_type=m7g.metal"` 换大内存)+ 200 GiB gp3
+- 1 台 Firecracker 主机（默认 `c6g.metal`；x86 默认 `i7i.8xlarge`）+ 200 GiB gp3
 - 主机 IAM 角色:`bedrock:InvokeModel*`(限 `anthropic.*` 模型与 `us.anthropic.*` inference profile)→ 沙盒走 IAM 凭据链调 Bedrock,无需长期 key
 - 安全组:仅放行你的 IP 的 22 口(也挂了 SSM,可免 22 口用 Session Manager 登录)
 - ECR 仓库 `claude-sbx`
 
-## 选择 CPU 架构(Graviton / Intel x86)
+## 选择 CPU 架构（Graviton / Intel x86）
 
-所有阶段(phase1 / phase3 / stage2)都支持 `node_arch` 变量,二选一:
+所有阶段都支持 `node_arch`，部署时二选一：
 
-| `node_arch` | 默认 .metal 机型 | 规格 | 约价/hr | AMI |
-|---|---|---|---|---|
-| `arm64`(默认) | `c6g.metal` | 64 vCPU / 128 GiB | ~$2.32 | AL2023 ARM64 |
-| `amd64` | `c5n.metal` | 72 vCPU / 192 GiB | ~$3.89 | AL2023 x86_64 |
+| `node_arch` | 默认实例 | 虚拟化方式 | AMI |
+|---|---|---|---|
+| `arm64`（默认） | `c6g.metal` | Graviton 裸金属 KVM | AL2023 ARM64 |
+| `amd64` | `i7i.8xlarge` | Nitro nested virtualization | AL2023 x86_64 |
 
-`c5n.metal` 是当前最便宜的主流 Intel x86 裸金属。切换方式:
+x86 支持全部 `i7i.*` 规格，默认选择 `i7i.8xlarge`。Terraform 会显式开启
+`cpu_options.nested_virtualization=enabled`：
 
 ```bash
-# Intel x86 节点(各阶段 apply 都加这个 -var,需保持一致)
+# Intel x86 默认 i7i.8xlarge
 terraform apply -var="node_arch=amd64" ...
-# 也可显式覆盖机型,如更大内存的 m5zn.metal:
-terraform apply -var="node_arch=amd64" -var="metal_instance_type=c5.metal" ...
+
+# 覆盖为其他 i7i 规格
+terraform apply \
+  -var="node_arch=amd64" \
+  -var="sandbox_instance_type=i7i.16xlarge" ...
 ```
 
-切到 x86 时,这些会自动随架构变化:AMI 类型、默认 .metal 机型、Karpenter NodePool 的
+Phase 3 默认把沙盒节点钉在 VPC 的第一个可用区，以保证持久状态 EBS 可在节点间挂载。
+若 ASG 报 `InsufficientInstanceCapacity`，可用
+`-var="sandbox_az_index=1"`（region-b）或 `2`（region-c）切换整个节点组所在 AZ。
+
+切到 x86 时，这些会自动随架构变化：AMI、默认实例、Karpenter NodePool 的
 `kubernetes.io/arch`、Firecracker 二进制与 CI 内核下载架构、JuiceFS 元数据 Redis 节点族
-(`t4g`→`t3`)。引导脚本(`setup-host.sh` / `build-fuse-kernel.sh`)默认探测宿主架构,
-x86 上自动用 `make ARCH=x86` 编未压缩 `vmlinux`。
+（`t4g`→`t3`）。rootfs 与容器镜像构建须设置 `PLATFORM=linux/amd64`。
 
-> ⚠️ **x86 待办项(部署前确认):**
-> 1. **沙盒/控制面镜像**:`scripts/build_and_push.sh` 默认 `--platform linux/arm64`,
->    x86 需 `PLATFORM=linux/amd64`(或多架构 `linux/arm64,linux/amd64`)重新构建推送。
-> 2. **预构建 rootfs**:phase3 UserData 从 S3 拉 `rootfs/rootfs-juicefs-x86_64.tar.gz`,
->    需先在 x86 .metal 上用 `setup-host.sh` 产出并上传到该 key。
-> 3. **首次务必验证 x86 guest kernel**:Firecracker CI 的 `x86_64/vmlinux` 路径与 FUSE 编译
->    在 x86 上需实测一遍(见下方"验证"小节的思路)。
+> x86 部署前需确认目标区域提供所选 i7i 规格且 `SupportedFeatures` 包含
+> `nested-virtualization`。完整命令见 `docs/deploy.md` Step 0.5。
 
-## 前置:申请 .metal 配额
+`i7i.8xlarge` 已在 `us-east-1b` 完成真实 AWS 生命周期与鉴权 E2E；宿主 KVM、
+amd64 guest、持久状态 EBS 和完整清理均通过。详见
+[`docs/i7i-e2e-test-report-2026-08-10.md`](../docs/i7i-e2e-test-report-2026-08-10.md)。
 
-`.metal` 受 EC2 On-Demand vCPU 配额限制(代码 `L-1216C47A`)。`c6g.metal` = 64 vCPU,
-`c5n.metal` = 72 vCPU。若 apply 报 `VcpuLimitExceeded`,到 Service Quotas 申请提额(可能需 1–2 天)。
+## 前置：申请 EC2 vCPU 配额
+
+`c6g.metal` 需要 64 vCPU，`i7i.8xlarge` 需要 32 vCPU。若 apply 报
+`VcpuLimitExceeded`，到 Service Quotas 为对应实例类别申请提额。
 
 ## 鉴权说明
 

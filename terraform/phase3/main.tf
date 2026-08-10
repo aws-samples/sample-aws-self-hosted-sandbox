@@ -1,12 +1,13 @@
-# Phase 3 基础设施 —— EKS 集群 + .metal 托管节点组(裸 Firecracker 沙盒节点 + 持久状态 EBS)
+# Phase 3 基础设施 —— EKS 集群 + Firecracker 沙盒节点组 + 持久状态 EBS
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个 .metal 节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + 一个沙盒节点组(打 sandbox=true label)。
 #       控制面 / node-agent / LiteLLM 等集群内资源由 stage2-control-plane 部署,不归此处。
 #
-# 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或 amd64(Intel x86 c5n.metal)。
+# 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或
+#       amd64(Intel x86 i7i.8xlarge,显式开启 nested virtualization)。
 #       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
 #
-# ⚠️ 计费:EKS 控制平面 $0.10/hr + .metal 节点(c6g.metal≈$2.32/hr,c5n.metal≈$3.89/hr)。用完务必 destroy。
+# ⚠️ 计费:EKS 控制平面 + 沙盒节点按小时计费。用完务必 destroy。
 #
 # 用法:
 #   terraform init
@@ -21,7 +22,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = ">= 6.0, < 7.0"
     }
   }
 }
@@ -43,43 +44,61 @@ variable "cluster_name" {
 variable "node_arch" {
   type        = string
   default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI 类型、默认 .metal 机型、Firecracker/内核下载架构。"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI、默认实例、Firecracker/内核下载架构以及是否开启嵌套虚拟化。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
   }
 }
 
-variable "metal_instance_type" {
+variable "sandbox_instance_type" {
   type        = string
-  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
-  description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜的 Intel x86 裸金属)。"
+  default     = ""
+  description = "Firecracker 沙盒节点实例类型。留空时 arm64=c6g.metal,amd64=i7i.8xlarge；x86 可覆盖为任意 i7i 规格。"
+  validation {
+    condition = (
+      var.sandbox_instance_type == "" ||
+      (var.node_arch == "arm64" && var.sandbox_instance_type == "c6g.metal") ||
+      (var.node_arch == "amd64" && can(regex("^i7i\\.", var.sandbox_instance_type)))
+    )
+    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 i7i 系列（例如 i7i.8xlarge）。"
+  }
 }
 
-variable "metal_node_count" {
+variable "sandbox_node_count" {
   type        = number
   default     = 1
-  description = ".metal 节点常驻台数(min=max=desired)。成本优先默认 1 台(单机可测全生命周期);跨机快照/spot 疏散演示需设为 2。"
+  description = "沙盒节点常驻台数(min=max=desired)。成本优先默认 1 台；跨机快照/spot 疏散演示需设为 2。"
+}
+
+variable "sandbox_az_index" {
+  type        = number
+  default     = 0
+  description = "沙盒节点所在单一可用区索引:0/1/2 分别对应 VPC 的 region-a/b/c。遇到实例容量不足时切换索引。"
+  validation {
+    condition     = contains([0, 1, 2], var.sandbox_az_index)
+    error_message = "sandbox_az_index 仅支持 0、1 或 2。"
+  }
 }
 
 locals {
-  # 架构派生:AMI 类型、默认 .metal 机型、Firecracker/内核下载用的架构标识(uname -m 风格)
+  # 架构派生:AMI、默认实例、Firecracker/内核架构。
   arch_cfg = {
     arm64 = {
-      ami_type      = "AL2023_ARM_64_STANDARD"
-      default_metal = "c6g.metal" # Graviton 裸金属
-      fc_arch       = "aarch64"   # Firecracker 发行包 / CI vmlinux 的架构后缀
-      rootfs_key    = "rootfs/rootfs-juicefs.tar.gz"
+      ami_type         = "AL2023_ARM_64_STANDARD"
+      default_instance = "c6g.metal"
+      fc_arch          = "aarch64"
+      rootfs_key       = "rootfs/rootfs-juicefs.tar.gz"
     }
     amd64 = {
-      ami_type      = "AL2023_x86_64_STANDARD"
-      default_metal = "c5n.metal" # 最便宜的主流 Intel x86 裸金属(72 vCPU/192GiB)
-      fc_arch       = "x86_64"
-      rootfs_key    = "rootfs/rootfs-juicefs-x86_64.tar.gz" # 需另行构建 x86 rootfs(见 setup-host.sh)
+      ami_type         = "AL2023_x86_64_STANDARD"
+      default_instance = "i7i.8xlarge"
+      fc_arch          = "x86_64"
+      rootfs_key       = "rootfs/rootfs-juicefs-x86_64.tar.gz"
     }
   }
-  node_arch_cfg = local.arch_cfg[var.node_arch]
-  metal_type    = var.metal_instance_type != "" ? var.metal_instance_type : local.node_arch_cfg.default_metal
+  node_arch_cfg         = local.arch_cfg[var.node_arch]
+  sandbox_instance_type = var.sandbox_instance_type != "" ? var.sandbox_instance_type : local.node_arch_cfg.default_instance
 }
 
 variable "endpoint_public_access_cidrs" {
@@ -120,10 +139,10 @@ variable "state_ebs_throughput" {
   description = "状态 EBS 吞吐(MB/s)。1000=gp3 单卷上限,让 50 个 Diff 快照并发落盘 ~16s。"
 }
 
-# ---------- VPC(EKS 专用,3 AZ;裸金属在多 AZ 提高可得性) ----------
+# ---------- VPC(EKS 专用,3 AZ) ----------
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+  version = "~> 6.0"
 
   name = "${var.cluster_name}-vpc"
   cidr = "10.0.0.0/16"
@@ -149,50 +168,64 @@ module "vpc" {
   }
 }
 
-# ---------- EKS 集群 + Graviton .metal 节点组 ----------
+# ---------- EKS 集群 + Firecracker 沙盒节点组 ----------
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.0"
+  version = "~> 21.0"
 
-  cluster_name    = var.cluster_name
-  cluster_version = "1.31"
+  name               = var.cluster_name
+  kubernetes_version = "1.31"
 
-  cluster_endpoint_public_access = true
+  # EKS module v21 disables legacy self-managed add-on bootstrap. Declare the
+  # managed add-ons explicitly so a new node has CNI before it joins.
+  addons = {
+    coredns    = {}
+    kube-proxy = {}
+    vpc-cni = {
+      before_compute = true
+    }
+  }
+
+  endpoint_public_access = true
   # 收窄到指定 CIDR;留空时模块默认 0.0.0.0/0(对全网开放)——生产/共享账号务必传入自己的 IP。
-  cluster_endpoint_public_access_cidrs     = var.endpoint_public_access_cidrs
+  endpoint_public_access_cidrs             = var.endpoint_public_access_cidrs
   enable_cluster_creator_admin_permissions = true
 
   vpc_id = module.vpc.vpc_id
   # 控制平面 ENI 放私有子网;节点组单独指定公有子网(见 node group subnet_ids)
   subnet_ids = module.vpc.private_subnets
 
-  # POC:节点放公有子网,拿公网 IP 直接出网(无 NAT)
-  eks_managed_node_group_defaults = {
-    subnet_ids = module.vpc.public_subnets
-    # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → 给节点角色 S3 只读
-    iam_role_additional_policies = {
-      s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-    }
-  }
-
-  # 托管 .metal 节点组:既跑系统组件（控制面 / LiteLLM），也【承载 sandbox】——
+  # 托管沙盒节点组:既跑系统组件（控制面 / LiteLLM），也【承载 sandbox】——
   #   打 sandbox=true label，让 node-agent DaemonSet 调度上来，在本机直起裸 Firecracker microVM。
   #   挂持久状态 EBS（/dev/sdf → /var/lib/sbx），存内存快照（base + Diff），spot 疏散跨机恢复。
   eks_managed_node_groups = {
-    "metal_${var.node_arch}" = {
+    "sandbox_${var.node_arch}" = {
       ami_type       = local.node_arch_cfg.ami_type
-      instance_types = [local.metal_type]
+      instance_types = [local.sandbox_instance_type]
+
+      # Intel i7i 是虚拟化实例，必须显式打开 Nitro nested virtualization 才会暴露 /dev/kvm。
+      # c6g.metal 直接使用宿主 KVM，不设置该选项。
+      cpu_options = var.node_arch == "amd64" ? {
+        nested_virtualization = "enabled"
+      } : {}
+
       # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化。
       # 成本优先的单机 demo:降到 1 台(单机可测 create/exec/suspend/resume/destroy 全流程,
-      # 仅跨机快照/spot 疏散演示需要 2 台)。由 metal_node_count 变量控制,默认 1。
-      min_size     = var.metal_node_count
-      max_size     = var.metal_node_count
-      desired_size = var.metal_node_count
+      # 仅跨机快照/spot 疏散演示需要 2 台)。由 sandbox_node_count 变量控制,默认 1。
+      min_size     = var.sandbox_node_count
+      max_size     = var.sandbox_node_count
+      desired_size = var.sandbox_node_count
 
       # 方案C:两台节点必须【同一 AZ】—— EBS 状态卷不能跨 AZ attach。
-      # 钉死到单个 AZ 的公有子网(public_subnets[0] = azs[0] = us-east-1a),否则 EKS 会把两台
-      # 分散到不同 AZ,导致 spot 疏散后状态卷无法 attach 到另一 AZ 的新节点。
-      subnet_ids = [module.vpc.public_subnets[0]]
+      # 钉死到 sandbox_az_index 指定的单个 AZ,否则 EKS 会把两台分散到不同 AZ,
+      # 导致 spot 疏散后状态卷无法 attach 到另一 AZ 的新节点。默认 0=region-a;
+      # 若所选 i7i 规格暂时无容量,可切到 1=region-b 或 2=region-c。
+      subnet_ids = [module.vpc.public_subnets[var.sandbox_az_index]]
+
+      # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz。
+      iam_role_additional_policies = {
+        s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      }
 
       block_device_mappings = {
         xvda = {
@@ -234,11 +267,17 @@ module "eks" {
 
         # 方案C:挂载【持久状态 EBS】到 /var/lib/sbx —— sandbox 快照(base+diff)+ rootfs 都落这块盘。
         # 它 delete_on_termination=false,spot 终止后幸存,可 attach 到新机恢复。
-        # 识别:非根盘、无分区表、无挂载点的块设备(附加的数据卷)。首次为空盘 → mkfs;
+        # 识别:只选择 Amazon EBS,避免 i7i 上把本地 NVMe instance store 误当状态盘格式化。
+        # EBS NVMe 盘的 MODEL 为 "Amazon Elastic Block Store"。首次为空盘 → mkfs;
         # 已有文件系统(从旧节点迁移来的幸存卷)→ 直接挂,不格式化(否则抹掉数据!)。
         SBX_DISK=""
         for dev in /dev/nvme*n1 /dev/sd[b-z] /dev/xvd[b-z]; do
           [ -b "$dev" ] || continue
+          model=$(lsblk -ndo MODEL "$dev" 2>/dev/null | xargs)
+          case "$model" in
+            *"Elastic Block Store"*) ;;
+            *) continue ;;
+          esac
           # 跳过根盘及其分区(有挂载点的)
           if lsblk -no MOUNTPOINT "$dev" 2>/dev/null | grep -q .; then continue; fi
           # 跳过有分区表的(根盘通常有 p1/p128)
@@ -254,9 +293,27 @@ module "eks" {
             echo "[pre-bootstrap] state EBS $SBX_DISK blank, mkfs.xfs"
             mkfs.xfs -f -m reflink=1 "$SBX_DISK" 2>/dev/null
           fi
-          mount -o noatime "$SBX_DISK" /var/lib/sbx 2>/dev/null && \
-            echo "[pre-bootstrap] state EBS $SBX_DISK -> /var/lib/sbx OK" || \
-            echo "[pre-bootstrap] state EBS mount failed (non-fatal)"
+          # cloud-init shell parts may run in a transient mount namespace on AL2023.
+          # Ask PID 1 to own the mount so it persists after this script exits.
+          SBX_UUID=$(blkid -s UUID -o value "$SBX_DISK")
+          cat >/etc/systemd/system/var-lib-sbx.mount <<UNIT
+        [Unit]
+        Description=Sandbox persistent state EBS
+        Before=kubelet.service
+
+        [Mount]
+        What=UUID=$${SBX_UUID}
+        Where=/var/lib/sbx
+        Type=xfs
+        Options=noatime
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+          systemctl daemon-reload
+          systemctl enable --now var-lib-sbx.mount 2>/dev/null && \
+            echo "[pre-bootstrap] state EBS $SBX_DISK -> /var/lib/sbx OK (systemd)" || \
+            echo "[pre-bootstrap] state EBS systemd mount failed (non-fatal)"
         else
           echo "[pre-bootstrap] no state EBS found, /var/lib/sbx on root disk"
         fi
@@ -335,15 +392,15 @@ module "eks" {
 # 节点角色不再持有 Bedrock 权限 —— 沙盒内代码无法直接调 Bedrock(R8 凭据隔离落地)
 # 沙盒走: Claude Code → ANTHROPIC_BASE_URL=http://litellm.litellm:4000 → LiteLLM Pod → Bedrock
 
-# ---------- .metal ASG health check grace period 加长(防冷启动替换循环) ----------
+# ---------- 沙盒 ASG health check grace period 加长(防冷启动替换循环) ----------
 # 根因:c6g.metal 裸金属过 EC2 status check 需 5-10 分钟,而 EKS 托管节点组建的 ASG
 # 默认 grace period 仅 15s → 节点刚起就被判 unhealthy 替换 → 无限替换循环,节点永远
 # 收敛不到全部 Ready(实测 07-07 重建时踩到,老 memory 误判为"暂态自愈")。
 # EKS 托管节点组的 API/模块不暴露 ASG grace period,只能在节点组创建后 patch ASG。
-resource "null_resource" "metal_asg_grace_period" {
+resource "null_resource" "sandbox_asg_grace_period" {
   # 节点组变化(如换机型/架构)时重新 patch
   triggers = {
-    asg_name = module.eks.eks_managed_node_groups["metal_${var.node_arch}"].node_group_autoscaling_group_names[0]
+    asg_name = module.eks.eks_managed_node_groups["sandbox_${var.node_arch}"].node_group_autoscaling_group_names[0]
   }
 
   provisioner "local-exec" {

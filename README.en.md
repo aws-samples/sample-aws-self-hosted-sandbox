@@ -12,6 +12,7 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
 - **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
+- **Graviton or x86**: choose `c6g.metal` on Graviton, or any nested-virtualization-capable `i7i.*` size on Intel x86 (`i7i.8xlarge` by default); see the [live i7i E2E report](docs/i7i-e2e-test-report-2026-08-10.md)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
@@ -76,7 +77,8 @@ Idle sandboxes snapshot themselves to a distinct `slept` state (freeing RAM); th
 ```
 ┌─ EKS cluster ───────────────────────────────────────────────────────────┐
 │                                                                           │
-│  Managed node group (system)      c6g.metal nodes (sandboxes)           │
+│  Managed node group (system)      Firecracker sandbox nodes             │
+│                                   c6g.metal or i7i.*                    │
 │  ┌────────────────────────────┐   ┌──────────────────────────────────┐  │
 │  │ sandbox-control-plane      │   │  Firecracker microVM             │  │
 │  │ (Deployment, IRSA)         │──►│  node-agent DaemonSet            │  │
@@ -102,7 +104,7 @@ Follow these steps exactly, debugging any errors before proceeding.
 [Prerequisites]
 - AWS CLI configured (IAM permissions: EKS, EC2, IAM, DynamoDB, ECR, S3)
 - kubectl, terraform(>=1.5), helm, git installed
-- EC2 vCPU service quota for c6g.metal (64 vCPU) — request increase if needed
+- EC2 vCPU quota for the selected host (`c6g.metal`=64, `i7i.8xlarge`=32)
 
 [Step 0: Clone the repository]
 git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
@@ -114,29 +116,31 @@ cd terraform/stage1-dynamodb
 terraform init && terraform apply -auto-approve
 aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 
-[Step 2: Create EKS cluster + .metal node group]
+[Step 2: Create EKS cluster + Firecracker sandbox node group]
 cd ../phase3
 MY_IP=$(curl -s https://checkip.amazonaws.com)
+# Choose one:
+NODE_ARCH=arm64; SANDBOX_INSTANCE_TYPE=c6g.metal
+# NODE_ARCH=amd64; SANDBOX_INSTANCE_TYPE=i7i.8xlarge
 terraform init && terraform apply -auto-approve \
+  -var="node_arch=${NODE_ARCH}" \
+  -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
-# EKS control plane ~10-12 min; total with .metal node group cold start ~15 min
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-# (No RuntimeClass / ingress-nginx / Karpenter needed — bare Firecracker uses the phase3
-#  managed .metal node group directly, and POC accesses the control plane via port-forward.)
+# (No RuntimeClass / ingress-nginx / Karpenter needed; phase3 supplies the sandbox node group.)
 
-[Step 5: Build and push arm64 images]
+[Step 5: Build and push matching-architecture images]
 # Note: the sandbox image repo claude-sbx is auto-created by phase3 (Step 2); only create these two:
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-# Run on arm64 machine (M-series Mac, Graviton EC2, or the .metal node itself)
-# See build_and_push.sh for SSM-based remote build on .metal node
-bash scripts/build_and_push.sh
+PLATFORM=$([ "$NODE_ARCH" = "amd64" ] && echo linux/amd64 || echo linux/arm64)
+bash scripts/build_and_push.sh --platform "$PLATFORM"
 
 [Step 6: Deploy control plane + node-agent + LiteLLM]
-# FC_NODES: internal IPs of the STABLE metal nodes (control plane reaches node-agent over HTTP)
+# FC_NODES: internal IPs of stable sandbox nodes
 # sandbox_domain is the subdomain root; control plane will be at api.<sandbox_domain>
 cd terraform/stage2-control-plane && terraform init
 ACCT=$(aws sts get-caller-identity --query Account --output text)
@@ -278,7 +282,7 @@ aws ecr delete-repository --repository-name claude-sbx --force --region us-east-
 
 ```
 You are the ops engineer for this AWS sandbox platform. Platform overview:
-- EKS cluster claude-sbx, c6g.metal nodes, bare Firecracker microVM + node-agent DaemonSet
+- EKS cluster claude-sbx, c6g.metal or i7i sandbox nodes, Firecracker microVM + node-agent DaemonSet
 - Control plane: sandbox-system namespace, Deployment 2 replicas
   External access: http://api.sbx.<domain> (ingress-nginx NLB; POC use port-forward)
 - State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx / nodes / locks)
@@ -294,7 +298,7 @@ Common ops tasks:
 5. DynamoDB item count:   aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
 6. Update images:         bash scripts/build_and_push.sh
                           kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
-7. Scale node capacity:   adjust the phase3 metal node group desired/min/max and terraform apply
+7. Scale node capacity:   adjust phase3 `sandbox_node_count` and terraform apply
 8. Cost optimization — bulk-suspend idle sandboxes:
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
@@ -347,7 +351,8 @@ Monitoring:
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| Smoke tests | **26/26 PASS** | moto mock, `sandbox-api/smoke_test.py` |
+| Smoke tests | **48/48 PASS** | moto mock, `sandbox-api/smoke_test.py` |
+| i7i x86 lifecycle | **ALL TESTS PASSED** | `i7i.8xlarge`, create/exec/suspend/resume/destroy/auth |
 
 #### Snapshot persistence & cross-node recovery (current state — please read)
 
@@ -377,7 +382,7 @@ To avoid misunderstanding vs. the implementation, the current boundaries:
 ```bash
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# Expected: 29/29 PASS
+# Expected: 48/48 PASS
 ```
 
 ---

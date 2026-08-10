@@ -12,6 +12,7 @@
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
 - **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS（**不经 S3**），跨机恢复靠 EBS 卷幸存 + detach/attach（见下方"快照落盘与跨机恢复"说明）
+- **Graviton / x86 可选**：Graviton 使用 `c6g.metal`；Intel x86 使用支持嵌套虚拟化的 i7i 全系列，默认 `i7i.8xlarge`；[i7i 真机 E2E 已通过](docs/i7i-e2e-test-report-2026-08-10.md)
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
 - **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
@@ -219,7 +220,8 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────┐
 │                                                                      │
-│  托管节点组（系统节点）          c6g.metal 节点（沙盒）              │
+│  托管节点组（系统节点）          Firecracker 沙盒节点                │
+│                                 c6g.metal 或 i7i.*                   │
 │  ┌──────────────────────────┐      ┌───────────────────────────┐   │
 │  │ sandbox-control-plane    │ HTTP │  Firecracker microVM       │   │
 │  │ (Deployment, 2 副本,IRSA)│─────►│  node-agent DaemonSet      │   │
@@ -253,13 +255,14 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 1. 认证安全：Step 6 必须传入 api_keys 和 litellm_master_key（用 openssl rand -hex 32 生成），
    不能留空——控制面无 key 时所有受保护接口返回 503。
 2. rootfs 必须含 vsock agent：Step 1.5 的 min-rootfs（exec 走 vsock 通道），phase3 apply 需显式传 rootfs_s3_uri。
-3. arm64 镜像：Step 5 的 build_and_push.sh 须在 arm64 机器上执行（M 系列 Mac 或 .metal 节点）。
-4. 计费：c6g.metal 约 $2.3/hr，测试完成后立即执行 docs/deploy.md 中的【清理】步骤。
+3. 节点架构二选一：Graviton=`node_arch=arm64` + `c6g.metal`；x86=`node_arch=amd64` + `i7i.8xlarge`（可覆盖任意 `i7i.*`）。
+4. 镜像和 rootfs 必须与节点架构一致：arm64 用 `linux/arm64`，x86 用 `linux/amd64`。
+5. 测试完成后立即执行 docs/deploy.md 中的【清理】步骤。
 
 开始前先确认：
 - AWS CLI 已配置（需要 EKS / EC2 / IAM / DynamoDB / ECR / S3 权限）
 - 已安装 kubectl, terraform (≥1.5), helm, git
-- c6g.metal vCPU 配额已申请（64 vCPU，默认配额不足需提前提单）
+- 对应实例的 EC2 vCPU 配额已申请（c6g.metal=64，i7i.8xlarge=32）
 
 确认就绪后，请读取并执行 docs/deploy.md 中的所有步骤。
 ```
@@ -270,7 +273,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 
 ```
 你是这套 AWS 沙盒平台的运维工程师。平台概况：
-- EKS 集群 claude-sbx，c6g.metal 节点，裸 Firecracker microVM + node-agent DaemonSet
+- EKS 集群 claude-sbx，c6g.metal 或 i7i 沙盒节点，Firecracker microVM + node-agent DaemonSet
 - 控制面：sandbox-system namespace，Deployment 2 副本
   外部访问：http://api.sbx.<domain>（ingress-nginx NLB）
 - 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx / nodes / locks）
@@ -286,7 +289,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 4. 查看 LiteLLM：kubectl logs -n litellm deployment/litellm --tail=50
 5. DynamoDB 直查：aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
 6. 镜像更新：bash scripts/build_and_push.sh，然后 kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
-7. 节点扩容：调整 phase3 metal 节点组 desired/min/max 并 terraform apply
+7. 节点扩容：调整 phase3 的 `sandbox_node_count` 并 terraform apply
 8. 成本优化：批量挂起空闲沙盒
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
@@ -315,7 +318,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 # 无需 AWS，本地直接跑
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# 期望：29/29 PASS（含 leader 锁 / 节点注册表 / reconcile 漂移检测）
+# 期望：48/48 PASS
 ```
 
 ---
@@ -337,6 +340,9 @@ python3 sandbox-api/smoke_test.py
 
 ### 实测关键数据
 
+> i7i x86 的宿主 KVM、guest 生命周期、鉴权和资源清理证据见
+> [i7i x86 Firecracker 真机测试报告](docs/i7i-e2e-test-report-2026-08-10.md)。
+
 | 指标 | 实测值 | 环境 |
 |---|---|---|
 | microVM 启动延迟 | ~0.31s | c6g.metal，Firecracker v1.16 |
@@ -345,7 +351,8 @@ python3 sandbox-api/smoke_test.py
 | 单机最大并发 | 60 VM（测试截止，未到上限）| c6g.metal 128 GiB |
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
-| 冒烟测试通过率 | **26/26（ALL PASS）** | moto mock，`sandbox-api/smoke_test.py` |
+| 冒烟测试通过率 | **48/48（ALL PASS）** | moto mock，`sandbox-api/smoke_test.py` |
+| i7i x86 生命周期 | **ALL TESTS PASSED** | `i7i.8xlarge`，create/exec/suspend/resume/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |
 | FC suspend→resume | 快照落持久 EBS（不传 S3）/ resume 亚秒 | 内存态跨快照精确保留（数据保真已验证）|
 | 节点心跳注册 | 每 30s 写 nodes 表，`_pick_node` 从表选点 | 替换硬编码 FC_NODES |

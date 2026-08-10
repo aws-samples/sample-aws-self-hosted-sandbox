@@ -171,7 +171,7 @@ export function ArchDiagram() {
       {/* 裸金属节点框 */}
       <rect x="486" y="128" width="286" height="300" rx="12" fill="rgba(255,255,255,0.02)" stroke="#f5a623" strokeOpacity="0.5" />
       <text x="500" y="148" fontSize="11" fontWeight="700" fill="#f5a623">
-        c6g.metal / c5n.metal 裸金属 · KVM 嵌套虚拟化
+        c6g.metal / i7i.* · KVM / Nested Virtualization
       </text>
 
       {/* node-agent */}

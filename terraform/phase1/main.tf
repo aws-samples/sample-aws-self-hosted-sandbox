@@ -15,7 +15,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = ">= 6.0, < 7.0"
     }
   }
 }
@@ -38,30 +38,37 @@ variable "az" {
 variable "node_arch" {
   type        = string
   default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI 与默认 .metal 机型。"
+  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI、默认实例和嵌套虚拟化配置。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
   }
 }
 
-variable "metal_instance_type" {
+variable "sandbox_instance_type" {
   type        = string
-  default     = "" # 留空时按 node_arch 选默认机型(arm64→c6g.metal / amd64→c5n.metal)
-  description = ".metal 实例类型。留空则由 node_arch 决定:arm64=c6g.metal,amd64=c5n.metal(最便宜 Intel x86 裸金属)。"
+  default     = ""
+  description = "Firecracker 主机实例类型。留空时 arm64=c6g.metal,amd64=i7i.8xlarge；x86 可覆盖为任意 i7i 规格。"
+  validation {
+    condition = (
+      var.sandbox_instance_type == "" ||
+      (var.node_arch == "arm64" && var.sandbox_instance_type == "c6g.metal") ||
+      (var.node_arch == "amd64" && can(regex("^i7i\\.", var.sandbox_instance_type)))
+    )
+    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 i7i 系列（例如 i7i.8xlarge）。"
+  }
 }
 
 locals {
-  # 架构 → (默认机型, AL2023 SSM 路径里的架构后缀)
-  default_metal_by_arch = {
+  default_instance_by_arch = {
     arm64 = "c6g.metal"
-    amd64 = "c5n.metal"
+    amd64 = "i7i.8xlarge"
   }
   ssm_arch_suffix = {
     arm64 = "arm64"
     amd64 = "x86_64"
   }
-  metal_type = var.metal_instance_type != "" ? var.metal_instance_type : local.default_metal_by_arch[var.node_arch]
+  sandbox_instance_type = var.sandbox_instance_type != "" ? var.sandbox_instance_type : local.default_instance_by_arch[var.node_arch]
 }
 
 variable "my_ip_cidr" {
@@ -210,10 +217,10 @@ resource "aws_ecr_repository" "sbx" {
   force_delete         = true # POC 方便清理
 }
 
-# ---------- .metal 主机 ----------
+# ---------- Firecracker 主机 ----------
 resource "aws_instance" "host" {
   ami                    = data.aws_ssm_parameter.al2023.value
-  instance_type          = local.metal_type
+  instance_type          = local.sandbox_instance_type
   key_name               = aws_key_pair.sbx.key_name
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.sbx.id]
@@ -230,6 +237,13 @@ resource "aws_instance" "host" {
     http_tokens   = "required"
   }
 
+  dynamic "cpu_options" {
+    for_each = var.node_arch == "amd64" ? [1] : []
+    content {
+      nested_virtualization = "enabled"
+    }
+  }
+
   # 开机装好 docker/git 依赖。.metal 的 cloud-init 偶发不可靠(实测有一次没装上 docker),
   # 故加重试 + 落完成标记;setup-host.sh 里也会再次防御性安装 docker(双保险)。
   user_data = <<-EOF
@@ -242,7 +256,7 @@ resource "aws_instance" "host" {
     for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break; sleep 3; done
     docker version > /var/log/userdata-docker.log 2>&1 || echo "WARN: docker 未就绪(setup-host.sh 会补装)"
     # 校验 KVM(关键前提)
-    ls -l /dev/kvm > /var/log/userdata-kvm.log 2>&1 || echo "WARN: /dev/kvm missing — 选错实例?必须是 .metal"
+    ls -l /dev/kvm > /var/log/userdata-kvm.log 2>&1 || echo "WARN: /dev/kvm missing — 检查实例类型和 nested virtualization"
     touch /var/log/userdata-done
   EOF
 

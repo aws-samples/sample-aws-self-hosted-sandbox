@@ -20,6 +20,7 @@ from sandbox_api.driver import SandboxSpec, ServiceSpec
 
 POOL_SIZE    = int(os.environ.get("WARM_POOL_SIZE", "5"))
 REFILL_EVERY = int(os.environ.get("WARM_POOL_REFILL_S", "30"))
+SNAPSHOT_SETTLE_S = float(os.environ.get("WARM_SNAPSHOT_SETTLE_S", "1"))
 
 # 暖池用的基础镜像和规格(与真实沙盒保持一致)
 _BASE_SPEC = SandboxSpec(
@@ -104,10 +105,19 @@ class WarmPool:
                     "updated_at": db._utcnow(),
                     **driver_fields,
                 })
-                # 3. suspend → 快照
+                # 3. 等 guest init 和 vsock agent 确实可用后再快照。刚收到
+                # InstanceStart 就暂停会固化 early-boot 状态，在 nested KVM 上
+                # 恢复后可能立即退出。
                 record = db.get(warm_id) or {}
+                rc, _, stderr = self._driver.exec(warm_id, record, "true")
+                if rc != 0:
+                    raise RuntimeError(f"warm guest readiness failed: rc={rc}, stderr={stderr}")
+                if SNAPSHOT_SETTLE_S > 0:
+                    time.sleep(SNAPSHOT_SETTLE_S)
+
+                # 4. suspend → 快照
                 snap_info = self._driver.suspend(warm_id, record)
-                # 4. 标记为 warm
+                # 5. 标记为 warm
                 db.force_update(warm_id, {
                     "pool_state":  "warm",
                     "state":       "warm",

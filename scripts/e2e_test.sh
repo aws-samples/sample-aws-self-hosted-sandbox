@@ -19,18 +19,20 @@
 #      bash scripts/e2e_test.sh
 #
 #   3) 直接指定地址:
-#      bash scripts/e2e_test.sh --api-url http://localhost:18000
+#      bash scripts/e2e_test.sh --api-url http://localhost:18000 --api-key "$API_KEY"
 
 set -euo pipefail
 
 # ---------- 参数解析 ----------
 DRIVER="firecracker"
 API_URL=""
+API_KEY=""
 CURL_EXTRA=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --driver)    DRIVER="$2";    shift 2 ;;
     --api-url)   API_URL="$2";   shift 2 ;;
+    --api-key)   API_KEY="$2";   shift 2 ;;
     --resolve)   CURL_EXTRA="--resolve $2"; shift 2 ;;  # 覆盖 DNS(用于 Ingress 测试)
     *)           shift ;;
   esac
@@ -75,14 +77,20 @@ trap teardown_portforward EXIT
 # ---------- HTTP helpers ----------
 api() {
   local method="$1" path="$2" body="${3:-}"
+  local auth_args=()
+  if [[ -n "$API_KEY" ]]; then
+    auth_args=(-H "Authorization: Bearer ${API_KEY}")
+  fi
   if [[ -n "$body" ]]; then
     # shellcheck disable=SC2086
     curl -s -w "\n%{http_code}" -X "$method" \
+      "${auth_args[@]}" \
       -H "Content-Type: application/json" \
       -d "$body" ${CURL_EXTRA} "${API_URL}${path}"
   else
     # shellcheck disable=SC2086
-    curl -s -w "\n%{http_code}" -X "$method" ${CURL_EXTRA} "${API_URL}${path}"
+    curl -s -w "\n%{http_code}" -X "$method" \
+      "${auth_args[@]}" ${CURL_EXTRA} "${API_URL}${path}"
   fi
 }
 
