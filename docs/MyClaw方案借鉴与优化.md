@@ -1,0 +1,458 @@
+# MyClaw 方案借鉴与优化 —— 客户生产改造 vs 本仓库现状
+
+> 来源：客户《MyClaw 平台架构迁移概要 · Bare-metal Docker → AWS EKS》（`aws-migration-architecture-brief`，数据基线 2026-07-31，目标区域 us-east-2）
+> 对照对象：本仓库当前实现（`sandbox-api/` 控制面 + `node-agent/` 每节点执行手 + `terraform/`）
+> 整理日期：2026-08-04
+> 筛选口径：**生产就绪度优先** —— 重点覆盖机型选型、Spot + 跨节点恢复、安全合规、GitOps 交付、空闲检测、计费口径、可观测性
+
+---
+
+## 0. 结论速览
+
+客户基于本仓库的思路做了一次真实规模的生产化改造（1.1 万实例 / 42 节点 / 3 AZ）。它最大的价值不是"架构更好"，而是**它被真实规模逼着回答了本仓库还没回答的问题**。
+
+标注含义：
+- 🆕 **新维度** = 本仓库既有 gap 文档（`fc-生产就绪-gap分析.md` / `编排层调研与改进路线.md`）**未覆盖**的
+- 📌 **已在雷达** = 已列在既有 gap 文档，但客户给了**更具体的做法**
+
+| # | 维度 | 客户做法 | 本仓库现状 | 借鉴判断 | 优先级 | 改动量 |
+|---|---|---|---|---|---|---|
+| §2 | **机型选型** | `i7i.8xlarge` 虚拟化实例（嵌套虚拟化 + 本地 NVMe），5 机型对比表 | 硬编码 `.metal`（`c6g.metal`/`c5n.metal`），**均无本地 NVMe** | 🆕 **强烈建议**——`.metal` 不再是必需（已核实官方文档），且这正是本仓库 suspend 22~94s 的根因 | **P1** | 中（含 benchmark） |
+| §3 | **Spot + 跨节点恢复** | 本地 NVMe 纯缓存 + **S3 权威**；受保护池/抢占池分离；活动信号否决 Spot 放置 | **EBS 权威** → 锁死单 AZ；S3 上传是死代码；Spot 疏散 DRY-RUN | 📌 **架构级分歧，建议至少补文档**说明 trade-off；全面切换是大工程 | **P1** | 大 |
+| §4 | **安全合规** | S3 强制 SSE-KMS 客户托管密钥 + 版本化；全私有子网；Secrets Manager | S3 桶**零加固**；节点在**公有子网带公网 IP**；密钥经 `-var` 传入 | 🆕 **S3 加固必做**（低成本高价值）；私有子网需权衡 EIP 配额 | **P0**(S3) / P2(其余) | 小→中 |
+| §5 | **GitOps 与交付** | Flux 单一真相源；Terragrunt；CI 经 OIDC 推 ECR；tag 不可变 + 扫描；provider 默认标签 | **零 CI**（无 `.github/`）；**tfstate 本地无锁**；ECR `MUTABLE` 无扫描；无 `default_tags` | 🆕 **部分借鉴**——远程 backend / default_tags / ECR 加固该做；**Flux + Terragrunt 不建议**（见 §9） | **P1** | 小→中 |
+| §6 | **空闲检测** | 多信号裁决（agent 在途任务 + Web Shell 连接 + 临近定时任务）+ 信号**新鲜度** | 单信号 `last_active_at`，仅 2 个调用点；**WebSocket 终端不刷新活跃时间（真实缺陷）** | 📌 **修缺陷必做**；多信号裁决建议借鉴思路 | **P0**(缺陷) / P1(多信号) | 小→中 |
+| §7 | **成本与计量** | AWS 基础设施 + **外部推理支出 30-40 万美元/月**并列呈现 | 无运行时计量；`cost-comparison.md` 只算基础设施 | 🆕 **成本口径补全极有说服力**（纯文档）；运行时计量另论 | **P1**(口径) / P2(计量) | 小→中 |
+| §8 | **可观测性** | 30+ 指标**分层清单** + 5 类告警矩阵 + **高基数治理策略** | **零指标**、日志被主动静音 | 📌 缺口早已自陈，但客户的清单**可近乎直接抄** | **P1** | 中 |
+| §9 | **架构叙事** | "沙盒实例不是 Pod"——一个刻意选择及其理由 | 实际就是这么做的，但**从未讲清楚为什么** | 🆕 **零成本、对 SA 讲客户价值最高** | **P1** | 极小 |
+
+**一句话总结**：最该立刻做的三件事是 —— ① 修 WebSocket 不刷新活跃时间这个真实缺陷（§6）；② S3 快照桶加固（§4）；③ 把"沙盒不是 Pod"和完整成本口径写进 README（§9/§7）。最值得投入的一件事是 —— 验证 i7i/i7ie 能否取代 `.metal`（§2），因为它同时解决本仓库自陈的 suspend 性能痛点。
+
+---
+
+## 1. 客户方案速览（不必翻原文档）
+
+**业务形态**：多租户 AI Agent 平台，每用户一个长期存活的沙盒（完整 Linux + root + Web Shell），可挂 Telegram/Discord 被动触发。三个决定架构的特征：
+1. 多租户且沙盒内有 root → 共享内核隔离强度不够
+2. 长期存活但**绝大多数时间空闲**——客户自述实测仅 **5.6%** 实例 CPU 占用超 5%
+3. 状态必须持久
+
+**迁移前**：80 台裸金属，Docker + 自研宿主 Agent，均摊约 140 容器/机，控制面靠**数据库轮询**下发命令。
+
+**迁移后**：EKS 托管控制面 + 自研 Operator（`ClawInstance` CRD）+ 每节点特权 node-agent 直管 Firecracker microVM。42 节点（system 6 + observability 3 + sandbox-protected 6 + sandbox-spot 27），1,104 vCPU，3 AZ。
+
+**客户自述的关键实测数字**（⚠️ 均为客户单方面陈述，本文未独立验证）：
+
+| 指标 | 客户自述值 |
+|---|---|
+| 本地快照恢复 | 1.13 s |
+| 跨节点恢复（含跨 AZ） | 5.3 s |
+| 挂起实例常驻内存 | ≈ 0 |
+| 单实例真实状态盘均值 | 2.62 GiB（而非承诺规格 40 GiB） |
+| 运行时内存 P90 | 1.88 GiB |
+| 单节点实例密度 | ~400（**客户明确标注：设计目标，尚未单节点满载实测**） |
+
+密度推导公式（值得学的严谨性）：`密度 = 内存 ÷ (并发系数 × 单实例工作集)`，并发系数取 30%（实测繁忙比 5.6% 的 5 倍以上余量）。客户把"单节点密度实测"列为首批迁移的**退出判据**。
+
+---
+
+## 2. 🆕 机型选型：`.metal` 不再是必需条件
+
+### 本仓库现状
+
+全程假设**必须用裸金属**才能拿到 `/dev/kvm`：
+
+```
+terraform/phase3/main.tf:66-83   arm64 → c6g.metal（默认）/ amd64 → c5n.metal
+terraform/phase3/main.tf:53-82   metal-only 假设硬编码在变量与 locals 里
+```
+
+**这两个机型都没有本地 NVMe**，而本仓库自己的实测报告早已把它定为核心痛点：
+
+> `docs/两-driver-e2e-实测报告-2026-07-01.md:153-158`
+> `c6g.metal` **没有本地 NVMe instance store**，只能用 EBS → 快照注定慢。
+> 修复方向：(a) 用带本地 NVMe 的机型（`i4g`/`im4gn` 等）承载快照…
+
+> 同文档 `:230`
+> **suspend 耗时不稳定（22~94s）**：根因仍是 `c6g.metal` 只能用 EBS gp3（无本地 NVMe），Full 快照写 2GB 内存受 ~81MB/s 带宽限制。
+
+痛点定位了一个多月，但**至今未落地**——而且从未评估过"非 metal 的嵌套虚拟化机型"这条路，因为整个项目都建立在"必须 metal"的前提上。
+
+### 客户做法
+
+客户选 `i7i.8xlarge`（32 vCPU / 256 GiB / 7.5 TB 本地 NVMe），**且它是虚拟化实例，不是裸金属**。选型逻辑：嵌套虚拟化白名单 ∩ 大内存 ∩ 本地 NVMe，三者交集只剩 I7i。客户还给了 5 机型对比表，取舍维度包含"爆炸半径"与"疏散余量"——`i7i.16xlarge` 单位成本更低但全舰队仅需 14 台、单点影响面过大，故不选。
+
+### ✅ 已核查 AWS 官方文档
+
+这是本次分析**最有价值的一条**，因此做了独立核查（未采信客户陈述）：
+
+| 核查项 | 结论 |
+|---|---|
+| 虚拟化 EC2 上的嵌套虚拟化是否官方支持 | **是**。Nitro 向 L1 透传 Intel VT-x，文档明确点名支持 **KVM**。来源：`docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html`；上线日期 **2026-02-16**（据 EC2 DocumentHistory）；无额外收费 |
+| `i7i` 是否真支持 | **是**，文档正文 + 实时 API 双重确认，`i7i.large`→`i7i.48xlarge` 全尺寸，本地 NVMe 至 45 TB |
+| 客户清单是否准确 | **有两处错误**。客户称 `i7ie` **不**支持 —— 错，`i7ie` 实际支持全部 9 个尺寸且本地 NVMe 至 **120 TB**；客户还列了 C7id/M7id/R7id 之类不在清单内的条目。客户对 `i3en` / `i4i` 不支持的判断是**对的** |
+
+**对本仓库最关键的一条约束**：该特性 **Intel-only，任何 arm64/Graviton 机型均不支持**。本仓库默认 `node_arch=arm64` + `c6g.metal` —— 走嵌套虚拟化这条路等于**必须放弃 Graviton**。这是一个本仓库从未面对过的取舍：Graviton 性价比 vs（本地 NVMe + 分钟级启动）。
+
+另两个务实约束：
+- 需**逐实例显式开启**，非默认：`run-instances --cpu-options "NestedVirtualization=enabled"`，或对**已停止**实例 `modify-instance-cpu-options --nested-virtualization enabled`
+- **分区域可用性不一**：us-east-1 / us-west-2 实测 18 个族；eu-west-1 缺部分；ap-southeast-1 仅 14 个。选区前须按区查询：
+  ```bash
+  aws ec2 describe-instance-types --filters \
+    Name=processor-info.supported-features,Values=nested-virtualization
+  ```
+
+### ⚠️ 必须一并记录的反面论据
+
+AWS 官方文档在同一页里给出警告：对硬件虚拟化扩展有**性能或严格时延要求**的负载，建议**评估裸金属实例**。Firecracker 恰属此类。此外 Firecracker 上游文档至今仍**过时地**声称"EC2 仅 `.metal` 支持 KVM"（`firecracker/docs/getting-started.md`），说明这个变化很新、社区经验尚少。
+
+### 借鉴判断
+
+**强烈建议借鉴，但结论是"验证"而非"直接切换"**：
+
+1. `.metal` 不再是必需 —— 本仓库的核心机型假设需要修订，至少 README / POC 文档应更新这个事实
+2. `i7i` / `i7ie` 是正当选项，且**同时解决本仓库自陈的 suspend 慢问题**（本地 NVMe 替代 EBS gp3 的 ~81MB/s 瓶颈）
+3. 但因 AWS 自己都把时延敏感的 hypervisor 负载引向裸金属，**必须先 benchmark**：microVM 冷启动时延、Full/Diff 快照写入吞吐、resume 时延，与现有 `c5n.metal` 对比
+4. 若切换，需明确接受**放弃 Graviton**；建议保留 metal 路径作为可选，而非单向替换
+
+**改动范围**：`terraform/phase3/main.tf` 的 `node_arch` / `metal_instance_type` locals 需扩展出"虚拟化 + 嵌套虚拟化"这一档（含 `cpu_options` 设置），`scripts/setup-host.sh` 的 `/dev/kvm` 检查逻辑复用即可（无需改），本地 NVMe 需新增 XFS + reflink 格式化流程（可复用 `phase3:249-259` 已有的 `mkfs.xfs -m reflink=1` + blkid 守卫写法）。
+
+---
+
+## 3. 📌 Spot + 跨节点恢复：EBS 权威 vs S3 权威的架构级分歧
+
+### 本仓库现状（"方案C"）
+
+以**持久 EBS 卷为权威副本**：
+
+```
+sandbox-api/drivers/firecracker.py:60    SBX_BASE = "/var/lib/sbx"（快照落此）
+terraform/phase3/main.tf:207             delete_on_termination=false（求 Spot 终止后卷幸存）
+```
+
+**代价是锁死单 AZ**——`terraform/phase3/main.tf:192-195` 明确把节点都钉在 `public_subnets[0]`，因为 EBS 不能跨 AZ attach。3 AZ VPC 的价值就此让掉。
+
+**S3 上传路径是死代码**：`op_suspend` 仅当 `body["upload_s3"]` 为真才上传（`node-agent/main.py:538`），而 driver **从不传该字段**（`drivers/firecracker.py:133`）。因此 resume 侧的 S3 回拉分支（`main.py:619-620`）不可达——代码注释自己承认了这点：
+
+> `node-agent/main.py:616-618`
+> 注：方案C 从不往 S3 上传快照（见 op_suspend 的 upload_s3 分支），控制面传下来的 s3_prefix 恒为空 → 这段兜底当前【不会触发】。
+
+**无 Spot 容量**：全仓 terraform 无 `capacity_type = "SPOT"`。Karpenter 存在但默认关（`karpenter.tf:161-167`），且仅供给 on-demand 非 metal 系统节点，sandbox metal NodePool 被刻意移除（`karpenter.tf:269-278`）。无 EventBridge 规则、无中断 SQS 队列、无 node-termination-handler。
+
+**疏散是 DRY-RUN**：`RECLAIM_AUTO_EVACUATE=0`（`node-agent/main.py:104`），`_evacuate_local` 只打印计划；跨机恢复（"Block 2"）显式未实现（`main.py:1076`）。`reconcile.py` 只给失联节点上的沙盒打 `needs_reschedule` 标签，**无任何消费者**。
+
+> 🧹 顺带发现一处**悬空引用**：`terraform/stage2-control-plane/karpenter.tf:276` 注释指向 `docs/spot-reclaim-recovery-design.md`，该文件**不存在**。零成本清理项。
+
+### 客户做法
+
+**双层存储：本地 NVMe 纯缓存 + S3 权威**。
+- 挂起时先写本地 NVMe 再分块并行上传 S3；本地层"设计上是纯缓存，丢了不影响正确性"
+- 同节点唤醒走本地（自述 1.13s）；节点丢失 / Spot 中断 / 跨 AZ 重调度均从 S3 恢复（自述 5.3s）
+- 快照指针带 **epoch，CAS 抢占防双写**
+
+**双池分离**：受保护池（On-Demand 6 台）承载任务在途 / 交互中的实例；抢占池（Spot 27 台）承载挂起态与空闲实例。**活动信号会否决**繁忙实例落 Spot（客户称之为 `spot-safety observer`）。中断事件经 EventBridge **提前接管**，立即挂起上传，在其他节点恢复。
+
+### 借鉴判断
+
+这是**架构级分歧**，不是缺个功能。客户的 S3-权威模型换来了三样本仓库现在没有的东西：真正的跨 AZ、真正可用的 Spot、以及节点可随时替换。代价是每次挂起都要付一次 S3 上传的延迟与流量成本。
+
+**建议分两步**：
+1. **立即（P2，纯文档）**：把这个 trade-off 明确写进 `docs/快照存储架构.md` —— 说明"方案C 选 EBS 权威是为了省掉 S3 上传延迟，代价是单 AZ 绑定"，让读者知道这是**刻意选择**而非遗漏。顺手清理 karpenter.tf 的悬空引用。
+2. **中期（P1，大工程）**：若要支持 Spot，S3-权威几乎是必经之路（Spot 终止后卷虽幸存但跨 AZ 无法 attach，而 Spot 容量池恰恰要求跨 AZ 灵活性）。落地顺序建议：激活现有 S3 上传死代码 → 给快照指针加 epoch + CAS → 消费 `needs_reschedule` → EventBridge 中断队列 → 双池分离。
+
+**注**：`fc-生产就绪-gap分析.md` 已列 P0-2「S3 快照上传发射后不管」并标记为已修（改为 EBS-first + confirm-before-release）。本节不是回退那个修复，而是指出**当前 EBS-only 的形态引入了新的 AZ 约束**，这一点既有文档未覆盖。
+
+---
+
+## 4. 🆕 安全合规：S3 加固是最高性价比的一项
+
+### 本仓库现状
+
+**S3 快照桶零加固** —— `terraform/stage2-control-plane/main.tf:206-227` 只有桶资源 + 30 天生命周期规则：
+
+```hcl
+resource "aws_s3_bucket" "snapshots" {
+  bucket = "${var.cluster_name}-snapshots-${local.account_id}"
+  tags   = { Project = "claude-sbx-poc" }
+}
+```
+
+无 versioning、无 SSE-KMS、无 public-access-block、无桶策略。全仓无 KMS CMK。
+
+**节点在公有子网带公网 IP** —— `terraform/phase3/main.tf:135-140` 为省 EIP 配额禁用了 NAT（`enable_nat_gateway = false`），节点因此落公有子网并带公网 IP。
+
+其余：无 Secrets Manager / External Secrets（密钥经 Terraform `-var` 传入，`litellm.tf:107` 注释自陈"生产应从 Secrets Manager 取"）；**IAM 资源范围过宽** —— action 已逐条枚举（做得对），但 `ec2:DescribeInstances` / `ssm:SendCommand` / ECR 拉取类均为 `Resource = ["*"]`（`stage2-control-plane/main.tf:269-280, 329-335`），其中 `ssm:SendCommand` on `*` 意味着可对账号内任意实例下发命令；jailer 默认关（`USE_BARE_FC=1`，`node-agent/main.py:193`）；无 CloudTrail、无 EKS 审计日志组、无租户间 NetworkPolicy。
+
+### ✅ 但本仓库这几处做得比客户文档还细，不应被埋没
+
+- **每组件独立 IRSA 且带 `sub`/`aud` 条件**（`main.tf:231-247, 296-312`、`litellm.tf:11-27`、`karpenter.tf:12-28`）
+- **Bedrock 凭据刻意隔离到 LiteLLM IRSA**，使沙盒代码碰不到（`phase3:334-336`）—— 这是很扎实的多租户凭据隔离，客户文档里没有对应论述
+- IMDSv2 required；EKS Access Entry API 取代 aws-auth；ElastiCache 双向加密
+
+### 客户做法
+
+S3 强制 **SSE-KMS 客户托管密钥**（桶策略拒绝任何非 KMS 写入）+ 版本化 + 生命周期驱动的确定性回收；2 个 KMS CMK（快照桶 / EBS 与 EKS Secret 信封加密）；**全部节点位于私有子网** + 每 AZ 一个 NAT；Secrets Manager + External Secrets（轮换不需重新部署）；VPC Gateway Endpoint 走 S3（快照收发是最大内部流量源，不走 NAT）；租户 microVM 之间默认零互通。
+
+### 借鉴判断
+
+**S3 桶加固：P0，必做，改动极小**。三个 resource 就能补齐 versioning + SSE + public-access-block，而快照里装的是用户完整内存与磁盘状态——这是全系统最敏感的数据，目前连版本化都没有。这是整份清单里**性价比最高的一项**。
+
+**私有子网 + NAT：P2，需权衡**。当前公有子网是为省 EIP 配额的**有意决定**（注释写明），对 demo 场景可接受，但应在 README 明确标注"生产必须改私有子网"。若改，顺带加 S3 Gateway Endpoint 收益很大（快照流量不走 NAT，直接省钱）。
+
+**其余（Secrets Manager / IAM 资源范围收窄 / jailer / NetworkPolicy / CloudTrail）：P2**，逐项跟进即可，jailer 一项已在既有 gap 文档。
+
+---
+
+## 5. 🆕 GitOps 与交付：部分借鉴
+
+### 本仓库现状
+
+- **零 CI**：`.github/` 目录不存在。交付全靠手工——`scripts/build_and_push.sh` 用本机 ambient 凭据推**可变 `:latest`**；节点修复靠 `aws ssm send-command`（`scripts/node-fc-setup.sh`）；`docs/deploy.md` 是 8 步手工 runbook
+- **tfstate 本地且无锁**：全仓无 `backend` 块，state 被 gitignore，无 DynamoDB 锁。三个独立 root state 靠命名约定字符串拼接耦合
+- **ECR `MUTABLE` + `force_delete=true` + 无 `image_scanning_configuration`**（`phase1:207-211`、`phase3:360-366`）
+- **无 provider `default_tags`**：打标是散落的 `{ Project = "claude-sbx-poc" }` —— 无法做 Cost Allocation Tags 维度分摊（与 §7 的计费诉求直接冲突）
+- 无 dev/prod 分离（无 tfvars、无 workspace），全靠 CLI `-var`
+
+### 客户做法
+
+Flux 持续调谐，**手工改动自动回退**，所有变更必须走代码评审；Terragrunt 管 dev/prod（共用模块、仅参数不同、环境差异可审计）；CI 经 **OIDC 联合取临时凭据**推 ECR（无长期密钥），镜像 tag **不可变**且附带漏洞扫描；provider 默认标签统一打上项目/环境/组件维度，使整个资源池可按维度筛选、归集与清理。
+
+### 借鉴判断
+
+**建议借鉴（P1，改动小）**：
+| 项 | 理由 |
+|---|---|
+| **tfstate 远程 backend（S3 + DynamoDB 锁）** | 本地 state 对任何多人协作的 repo 都是隐患，且 state 丢失等于失去对资源的管理能力 |
+| **provider `default_tags`** | 一处配置，全资源受益；且是 §7 成本归因的**前置条件** |
+| **ECR 不可变 tag + `image_scanning_configuration`** | 两个字段的事；`:latest` 可变 tag 让"回滚到上一版"变得不可能 |
+| **GitHub Actions + OIDC 推 ECR** | 消除本机 ambient 凭据依赖，且 OIDC 是 AWS 推荐做法 |
+
+**不建议借鉴**：Flux 全量 GitOps 与 Terragrunt —— 见 §9。
+
+---
+
+## 6. 📌 空闲检测：先修一个真实缺陷，再谈多信号
+
+### 本仓库现状
+
+单信号：仅 `last_active_at`。`_touch_activity()`（`sandbox-api/app.py:155`）**只有两个调用点**：
+
+```
+sandbox-api/app.py:491    端口暴露代理路径（resolve_proxy_target 内）
+sandbox-api/app.py:673    POST /exec
+```
+
+### 🐛 真实缺陷：Web 终端交互不算"活跃"
+
+WebSocket 隧道（`_raw_tunnel`，`app.py:397`；反代入口 `app.py:846-899`）**从不刷新活跃时间**。后果：
+
+> 用户开着 Web 终端正在敲命令，只要不走 proxy / exec 路径，`AUTO_SLEEP_IDLE_S`（默认 300s）一到就会被自动快照挂起。
+
+`upload_file` / `download_file` 同样不刷新 —— 一个长时间的大文件传输期间，沙盒会被判定为空闲。
+
+考虑到 README 把"Web 终端"列为核心特性之一，而自动休眠也是核心特性之一，这两个特性目前**互相冲突**。
+
+### 其他现状问题
+
+- **阈值重复声明两处**：`app.py:82` 与 `autosleep.py:27` 各自 `int(os.environ.get("AUTO_SLEEP_IDLE_S", "300"))`。poller 判定用 `autosleep.IDLE_S`（`autosleep.py:57`），而 `auto_sleep_sandbox` 内的二次校验用 `app.AUTO_SLEEP_IDLE_S`（`app.py:574`）。目前默认值相同所以行为一致，但这是一个等着被踩的坑
+- **每 30s 一次 DynamoDB 全表 scan**：`scan_once`（`autosleep.py:45`）走 `db.list_by_states(["running"])`，而 sandboxes 表**没有 state 维度的 GSI**（`terraform/stage1-dynamodb/main.tf` 仅 3 个：`tenant_id-updated_at` / `idempotency_key` / `pool_state-driver`）。万级实例规模下这会成为成本与延迟问题——客户规模正是万级
+
+### 客户做法
+
+**多信号裁决**，挂起需同时满足：实例内 Agent 无在途任务 + 无 Web Shell 连接 + 无临近的定时任务。
+
+**信号带新鲜度**：`myclaw_activity_signal_age_seconds` 指标专门监控信号年龄，"信号过期即按最保守方式处理"（即宁可不挂起）。同一份活动信号还复用于 Spot 放置决策（繁忙实例不落 Spot）。
+
+### 借鉴判断
+
+**P0（必做，改动小）**：在 WebSocket 隧道建立与传输路径上补 `_touch_activity(sid)`；`upload_file` / `download_file` 同补。现有的内存节流机制（`ACTIVITY_TOUCH_MIN_S=15`，`app.py:87`）已经能防止写放大，直接复用即可。
+
+**P1（低成本）**：`IDLE_S` 收敛为单一声明（`autosleep.py` 从 `app` 导入或反之），消除双声明。
+
+**P1（借鉴思路，非照搬）**："无 Web Shell 活跃连接"这条客户判据，本仓库其实可以用比时间戳更强的信号 —— WebSocket 是**有状态长连接**，直接维护一个活跃连接计数即可，比"最后活跃时间戳"精确得多。客户的"信号新鲜度 → 过期则按最保守方式处理"这个原则也值得采纳（当前 `_idle_seconds` 在无时间戳时回退 `created_at`，`app.py:604`，方向是对的但可以更显式）。
+
+**P2**：若要支撑万级规模，需给 sandboxes 表加 state 维度 GSI 以替代全表 scan。
+
+---
+
+## 7. 🆕 成本与计量：口径完整性比计量实现更值得先做
+
+### 本仓库现状
+
+**运行时计量完全缺失**：无用量表、无 billable-seconds、无租户成本归集。DynamoDB 只有 5 张表（sandboxes / events / tap_idx / nodes / locks），没有用量表。
+
+**自陈矛盾** —— 同一个 repo 里三处说法不一致：
+| 位置 | 说法 |
+|---|---|
+| `portal/REQUIREMENTS.md:37` | "**不做计费**、告警、Prometheus 指标导出"（明确非目标） |
+| `README.md:27` | "SaaS 沙盒服务 \| …多租户、**按量计费**"（列为目标场景） |
+| `docs/沙盒状态存储设计.md:35,37` | "计费时长"列为必须显式存的业务元数据；"要**计费聚合 / 报表**（按运行时长计费）"列为加数据库的理由之一 |
+
+**`sandbox_events` 表带 30 天 TTL**（`sandbox-api/db.py:338`）—— 会主动销毁计费与审计依据。若将来要做按量计费，这个 TTL 是直接冲突的。
+
+`docs/cost-comparison.md` 是 100% 静态价格建模（Fly.io vs c6g.metal、overcommit 敏感性、egress 分层），无任何运行时归因。
+
+### 客户做法：最值得抄的其实是"成本口径的完整性"
+
+客户在 §7.7 把**外部模型推理支出**与 AWS 基础设施**并列呈现**：
+
+| 服务 | 供应商 | 客户自述月度支出 | 占比 |
+|---|---|---|---|
+| Claude API | Anthropic | 25–30 万美元 | ≈ 3/4 |
+| GPT API | OpenAI | 5–10 万美元 | ≈ 1/4 |
+| **合计** | | **30–40 万美元 / 月** | 100% |
+
+并明确指出：这是平台**最大的单项可变成本**，且**不随基础设施架构变化而变化**——"挂起机制节省的是宿主内存与计算，不改变这部分支出"。
+
+### 借鉴判断
+
+**P1（纯文档，零代码，说服力极高）**：`docs/cost-comparison.md` 目前只算基础设施（~$632/mo、~$4/sandbox·mo）。对一个 **AI Agent 沙盒**平台，推理支出很可能是基础设施的**数十倍**。补上这个口径有三重价值：
+1. **诚实**——让"挂起省钱"的价值主张边界清晰（省 RAM 与计算，不省 token）
+2. **说服力**——SA 讲客户时，"基础设施只占总成本的零头"是个有力论点，反而让优化基础设施的决策更容易（因为它不是主要矛盾）
+3. **完整**——本仓库已经把 LiteLLM 作为统一网关落地了，而 LiteLLM 天然带用量统计能力，这是现成的抓手
+
+同时建议按客户的严谨性，把 `~$4/sandbox·mo` **明确标注为建模值而非实测值**（客户对其 400 密度就是这么标的）。
+
+**P2（运行时计量）**：若要真做，前置条件是 §5 的 provider `default_tags`（Cost Allocation Tags 才能按维度分摊），且需重新考虑 `sandbox_events` 的 30 天 TTL。建议先明确 `portal/REQUIREMENTS.md` 与 `README.md` 的口径矛盾——要么承认不做计费并从 README 移除该场景，要么把它列入 roadmap。
+
+---
+
+## 8. 📌 可观测性：缺口早已自陈，但客户的清单可以直接抄
+
+### 本仓库现状
+
+**零指标**：全仓无 `/metrics` 端点、无 prometheus client、无 OTel/StatsD/CloudWatch 自定义指标；terraform 无 Prometheus / Grafana / ADOT / Container Insights / CloudWatch 日志组 / CloudTrail。
+
+**日志被主动静音**：`app.py:779-780` 与 `node-agent/main.py:1197` 均 `def log_message(self, *_): pass`。诊断靠裸 `print(file=sys.stderr)`。多个后台 loop 静默吞异常（`reconcile.py:73-74`、`autosleep.py:79-80`、`app.py:166`）。
+
+现有抓手仅：`sandbox_events` 审计表 + `/admin/*` JSON 视图 + `/reclaim/status`。
+
+⚠️ **这不是新发现** —— 已列在 `fc-生产就绪-gap分析.md`（P2）、`编排层调研与改进路线.md`（P2）、`POC-实测结果.md:227`（P1）。本节的价值在于客户给了**可直接复用的具体清单**。
+
+### 客户做法（可近乎直接抄的部分）
+
+**出发点值得记住**：沙盒实例不是 Pod，因此 K8s 原生可观测性只覆盖控制面 ——「Kubernetes 层看得见的，和真正决定用户体验的，不是同一批东西」。
+
+**分层清单**：
+| 层 | 覆盖内容 | 数据去向 |
+|---|---|---|
+| 集群与节点 | kube-state-metrics / node-exporter / metrics-server | 集群内 Prometheus |
+| 控制面组件 | 请求量、时延、错误率、在途请求、幂等重放 | 集群内 Prometheus |
+| **数据面（关键）** | microVM 数量与状态、快照收发、唤醒各阶段耗时、节点内存余量 | 集群内 Prometheus |
+| **租户实例内** | Agent 忙闲状态、信号新鲜度（驱动自动挂起与放置决策） | 控制器采集后聚合暴露 |
+| 托管服务 | ALB/NAT/EBS/S3/DynamoDB/EC2 | CloudWatch |
+| 审计 | EKS 控制面日志、CloudTrail | CloudWatch Logs |
+
+**按域归类的核心指标**（客户共 30+ 个，此处列与本仓库最相关的）：
+
+| 域 | 客户指标 | 回答什么问题 | 本仓库是否已有对应数据 |
+|---|---|---|---|
+| 实例生命周期 | `fc_vms` / `fc_operation_duration_seconds` / `fc_restore_mode_total` | 每节点承载多少、各操作耗时分布、恢复走本地还是 S3 | 部分（`nodes` 表有 `vm_count`；`restore_time_s` 有记录但无聚合） |
+| 唤醒体验 | `wake_rpc_duration_seconds` / `fc_resume_stage_duration_seconds` / `fc_resume_inflight` | 端到端唤醒时延、分阶段瓶颈、是否唤醒风暴 | 无（`_ensure_awake` 有耗时但不导出） |
+| 快照持久化 | `fc_snapshot_upload_duration_seconds` / `fc_snapshot_errors_total` / `fc_snapshot_verify_total` | 上传耗时、失败计数、完整性校验 | 部分（有 `snapshot_size_bytes` 等字段；**无完整性校验**） |
+| 容量与放置 | `fcnode_free_memory_bytes` / `fcnode_vm_count` / `fc_scratch_bytes` | 放置决策与扩容判据、本地缓存是否逼近上限 | 前两项 `nodes` 表已有；**磁盘水位无**（已是既有 gap 文档 P1） |
+| 活动信号 | `agent_activity_state` / `activity_signal_age_seconds` | 忙闲状态、信号新鲜度 | 无（见 §6） |
+| 一致性自愈 | `fc_fence_events_total` / `fc_orphan_reaped_total` | 分区竞争状况、泄漏早期信号 | reconcile 有行为但无计数导出 |
+
+**5 类告警矩阵**（触发信号 / 影响面 / 响应方向）：用户可感知（唤醒时延分位超阈值）、数据安全（快照上传失败 / 校验不通过 / 栅栏事件异常）、容量（节点内存低于水位 / 本地缓存逼近上限 / Spot 不可得）、资源泄漏（孤儿回收计数持续增长）、控制面（调谐队列积压 / 领导选举翻转）。
+
+**🌟 高基数治理策略（最容易被忽略、也最容易踩的坑）**：实例维度标签在万级规模会产生高基数序列并撑爆 Prometheus 内存。客户的生产配置是 **"控制器侧先聚合、仅按节点与状态维度暴露"**，实例级明细仅在排障时按需下钻。
+
+### 借鉴判断
+
+**P1，中等改动**。好消息是本仓库的**数据基本都已经在了**（`nodes` 表心跳、`restore_time_s`、`snapshot_*_bytes`、reconcile 的判定结果），缺的是导出层。建议顺序：
+1. 先接 prometheus client 暴露 `/metrics`，从上表"本仓库已有数据"的项开始 —— 边际成本最低
+2. 同时**从第一天就按客户的高基数策略设计标签**（按节点与状态聚合，不打 sandbox id 标签）——这是事后极难改的架构决定
+3. 恢复被静音的日志（改为结构化日志），并让静默吞异常的 loop 至少计数
+4. `myclaw_fc_snapshot_verify_total` 对应的**快照完整性校验本仓库完全没有**（当前只有 `os.path.exists`）——考虑到快照里是用户全部状态，这值得单独列一项
+
+---
+
+## 9. 不建议借鉴的部分（明确划界，避免 sample 变重）
+
+本仓库定位是**教学参考实现**——读者要能看懂、能跑起来、能改。以下客户做法虽然在其生产语境下正确，但引入本仓库会显著抬高入门成本，且与既有决策冲突：
+
+| 客户做法 | 不建议理由 |
+|---|---|
+| **自研 Operator + CRD（`ClawInstance`）** | `docs/编排层调研与改进路线.md` 已有明确"不做"清单（无 K8s CRD / KubeVirt / kopf），本节与之一致。CRD + Operator 会让读者必须先理解 controller-runtime 才能读懂沙盒生命周期，而当前的 `reconcile.py` 用几十行就讲清了同样的调谐思想 |
+| **Flux 全量 GitOps** | 对单人/小团队的 sample 而言，"手工改动自动回退"是负担而非保障（调试时会不断跟你打架）。§5 建议的 GH Actions + 远程 backend 已能覆盖主要风险 |
+| **Terragrunt** | 多一层工具链依赖。dev/prod 差异用 tfvars 文件 + workspace 即可，读者不需要先学 Terragrunt |
+| **SQS FIFO 消息渠道接入 / channel-ingress / exec-proxy** | 客户业务专属（Telegram/Discord 被动触发）。本仓库的 `/exec` + 端口暴露 + Web 终端已覆盖通用需求 |
+| **独立 observability 节点池（3 台 m7g.2xlarge）** | 客户是万级实例规模的必需，对 demo 是纯成本。§8 的指标导出可先落在现有节点 |
+
+---
+
+## 10. 🌟 架构叙事：零成本、对 SA 讲客户价值最高
+
+客户文档里有一段本仓库**应该有但没有**的论述：
+
+> **一个刻意的架构选择：沙盒实例不是 Pod。**
+> 用户实例不经过 kube-scheduler，也不使用 PVC，而是由 node-agent 直接管理的 Firecracker 进程。原因是 Pod 与 PVC 的生命周期语义（卷的可用区绑定、Pod 重建即冷启动）与「快照级快速恢复 + 跨可用区自由重调度」相冲突。Kubernetes 在此承担控制面职责（声明式调谐、滚动发布、服务发现、可观测性），而非实例调度器。
+
+**本仓库实际就是这么做的** —— node-agent 是 `hostNetwork`/`hostPID` 特权 DaemonSet，直接管 Firecracker 进程，沙盒不是 Pod、不用 PVC。但 README 从未把这个**刻意选择及其理由**讲清楚，读者容易以为这只是"还没做完 K8s 集成"。
+
+同理，客户在滚动升级一节把这个选择的**收益**也讲透了：「沙盒实例不依赖 Pod 生命周期，集群版本升级期间可继续服务 → 无中断」。
+
+**建议（P1，纯文档，改动极小）**：在 README 或 `docs/POC-技术文档.md` 加一节讲清这个设计决策 —— 它是本项目最核心的架构判断，却是唯一没有被文档化的。这也是 SA 讲客户时最有力的一段（"我们不是没做 K8s 集成，我们是刻意不把沙盒做成 Pod，因为⋯⋯"）。
+
+同时借鉴客户的**严谨性习惯**：客户对 400 密度明确标注"设计目标，取值来自单实例实测足迹的推导，**尚未在单节点满载条件下实测**"，并把它列为首批迁移的退出判据。本仓库的 `~$4/sandbox·mo` 同为建模值，应同样标注实测 vs 推导的边界。
+
+---
+
+## 11. 建议实施顺序
+
+### 第一档：零成本 / 纯文档（建议立刻做）
+| 项 | 位置 | 节 |
+|---|---|---|
+| 讲清"沙盒不是 Pod"这个刻意选择及其理由 | README / `POC-技术文档.md` | §10 |
+| 成本口径补上外部推理支出，标注建模 vs 实测 | `cost-comparison.md` | §7 |
+| 记录 EBS-权威 vs S3-权威的 trade-off | `快照存储架构.md` | §3 |
+| 更新"必须 `.metal`"这个已过时的事实 | README / `POC-技术文档.md` | §2 |
+| 清理指向不存在文件的悬空引用 | `karpenter.tf:276` | §3 |
+| 明确 REQUIREMENTS 与 README 的计费口径矛盾 | `portal/REQUIREMENTS.md` / README | §7 |
+
+### 第二档：低改动高 ROI
+| 项 | 优先级 | 节 |
+|---|---|---|
+| **修 WebSocket / 文件传输不刷新活跃时间**（真实缺陷） | **P0** | §6 |
+| **S3 快照桶加固**（versioning + SSE + public-access-block） | **P0** | §4 |
+| provider `default_tags` | P1 | §5 |
+| ECR 不可变 tag + `image_scanning_configuration` | P1 | §5 |
+| tfstate 远程 backend（S3 + DynamoDB 锁） | P1 | §5 |
+| `AUTO_SLEEP_IDLE_S` 收敛为单一声明 | P1 | §6 |
+
+### 第三档：中大改动（需独立评估）
+| 项 | 优先级 | 节 |
+|---|---|---|
+| `/metrics` 指标体系（从第一天就按高基数策略设计标签） | P1 | §8 |
+| 机型验证：i7i / i7ie 嵌套虚拟化 vs 现有 metal（含放弃 Graviton 的取舍） | P1 | §2 |
+| 多信号空闲裁决 + 活跃连接计数 | P1 | §6 |
+| S3-权威 + 跨 AZ 恢复 + epoch/CAS | P1 | §3 |
+| Spot 池 + EventBridge 中断处理 + 双池分离 | P1 | §3 |
+| GitHub Actions + OIDC 推 ECR | P1 | §5 |
+| 快照完整性校验 | P1 | §8 |
+| 运行时计量表（前置：default_tags + events TTL 决策） | P2 | §7 |
+| 私有子网 + NAT + S3 Gateway Endpoint | P2 | §4 |
+| Secrets Manager / IAM 资源范围收窄 / jailer 开启 / 租户 NetworkPolicy / CloudTrail | P2 | §4 |
+
+---
+
+## 12. 附：与既有 gap 文档的关系
+
+本文**不替代** `docs/fc-生产就绪-gap分析.md` 与 `docs/编排层调研与改进路线.md`，而是补充一个外部生产实践的对照视角。
+
+**既有文档已列、客户给了更具体做法的**：
+- 可观测性（既有 P2）→ 客户给了完整的分层清单 + 指标名 + 告警矩阵 + **高基数治理策略**（§8）
+- 磁盘水位 / 快照 GC（既有 P1）→ 客户对应 `fc_scratch_bytes` 指标 + 容量告警（§8）
+- 调度只看 free_mem（既有 P1）→ 客户的活动信号驱动放置 + 双池分离（§3、§6）
+- jailer 默认关（既有 P2）→ 客户无对应论述，维持既有判定（§4）
+
+**既有文档未覆盖的新维度**（本文主要贡献）：
+- **机型选型**：嵌套虚拟化使 `.metal` 不再必需（§2）—— 这条直接影响既有 gap 文档没能解决的 suspend 性能问题
+- **成本口径**：推理支出与基础设施并列（§7）
+- **安全合规基线**：S3 加密版本化、私有子网、Secrets Manager（§4）
+- **GitOps 与 IaC 卫生**：远程 backend、default_tags、ECR 加固（§5）
+- **空闲检测的 WebSocket 缺陷**（§6）—— 既有文档记录的是"autostop 未实现"，该项已 DONE，但新引入的这个缺陷尚未被记录
+- **架构叙事**：沙盒不是 Pod 的理由（§10）
+
+**已 DONE、本文不重复列为缺失的项**（避免与既有文档矛盾）：reconcile loop、S3 上传语义（发射后不管）、节点发现（硬编码 → DynamoDB 心跳）、leader 选举、autostop/idle 框架。
