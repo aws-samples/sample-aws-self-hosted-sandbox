@@ -85,9 +85,12 @@ class FirecrackerDriver:
     # create
     # ------------------------------------------------------------------
 
-    def create(self, sandbox_id: str, spec: SandboxSpec, epoch: int = 1) -> dict:
+    def create(self, sandbox_id: str, spec: SandboxSpec, epoch: int = 1,
+               pool: str | None = None) -> dict:
         tap_idx = db.alloc_tap_idx()
-        node_id = self._pick_node()
+        # M2:按目标池挑节点(pool=None → 不限池,任意活节点)。
+        # 若目标池当前无活节点,回退不限池(有胜于无 —— 宁可放到另一个池也别创建失败)。
+        node_id = self._pick_node(pool=pool)
         rootfs  = f"{SBX_BASE}/{sandbox_id}/rootfs.ext4"
 
         self._agent(node_id, "POST", "/vm/create", {
@@ -270,20 +273,23 @@ class FirecrackerDriver:
                 pass  # 原节点已死/不可达 → 跨节点兜底
         return self._pick_node()
 
-    def _pick_node(self, exclude: str | None = None) -> str:
+    def _pick_node(self, exclude: str | None = None,
+                   pool: str | None = None) -> str:
         # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
         # 拿不到注册表(如本地测试用 FC_NODES)时回退到逐个探 /health。
         # exclude:跳过某个节点(手动 migrate 用 —— 强制换到另一台)。
+        # pool:M2 池亲和(spot / protected)。先在目标池内挑;目标池无活节点则
+        #   回退不限池(宁可跨池放置也不让 create 失败 —— 池分离是优化非硬约束)。
         registry = self._active_nodes_from_registry()
         if registry:
-            for node_id, _ in sorted(registry, key=lambda x: -x[1]):
-                if exclude and node_id == exclude:
-                    continue
-                try:
-                    self._agent(node_id, "GET", "/health")  # 存活兜底确认
-                    return node_id
-                except Exception:
-                    continue
+            picked = self._pick_from_registry(registry, exclude, pool)
+            if picked:
+                return picked
+            # 目标池内没有可达节点 → 回退不限池再试一遍
+            if pool is not None:
+                picked = self._pick_from_registry(registry, exclude, None)
+                if picked:
+                    return picked
             raise RuntimeError("all registered nodes unreachable")
 
         nodes = self._list_metal_nodes()
@@ -306,6 +312,22 @@ class FirecrackerDriver:
             raise RuntimeError("all nodes unreachable")
         return best_node
 
+    def _pick_from_registry(self, registry: list[tuple[str, int, str]],
+                            exclude: str | None, pool: str | None) -> str | None:
+        """在心跳注册表候选里按 free_mem_mib 降序挑第一个可达(且池匹配)的节点。
+        pool=None 不限池;否则只选 node_pool==pool 的。挑不到返回 None。"""
+        for node_id, _mem, node_pool in sorted(registry, key=lambda x: -x[1]):
+            if exclude and node_id == exclude:
+                continue
+            if pool is not None and node_pool != pool:
+                continue
+            try:
+                self._agent(node_id, "GET", "/health")  # 存活兜底确认
+                return node_id
+            except Exception:
+                continue
+        return None
+
     def pick_other_node(self, current: str) -> str | None:
         """为手动 migrate 选一台【不是 current】的活节点;没有别的活节点则返回 None。"""
         try:
@@ -327,21 +349,24 @@ class FirecrackerDriver:
                 return False
         return True
 
-    def _active_nodes_from_registry(self) -> list[tuple[str, int]]:
+    def _active_nodes_from_registry(self) -> list[tuple[str, int, str]]:
         """
-        从 DynamoDB 心跳注册表拉活节点,返回 [(node_ident, free_mem_mib), ...]。
+        从 DynamoDB 心跳注册表拉活节点,返回 [(node_ident, free_mem_mib, pool), ...]。
         node_ident 用 ip(node-agent 心跳里写的内网 IP),与 _agent 的 host 解析一致。
+        pool 为节点池归属(spot / protected);老节点未上报 pool 时默认 "protected"
+        (保守:当作不可回收池,避免把活跃沙盒误放到未知池)。
         表为空(未部署心跳/本地测试)返回 []，调用方回退 FC_NODES。
         """
         try:
             nodes = db.list_active_nodes()
         except Exception:
             return []
-        out: list[tuple[str, int]] = []
+        out: list[tuple[str, int, str]] = []
         for n in nodes:
             ident = n.get("ip") or n.get("node_id")
             if ident:
-                out.append((ident, int(n.get("free_mem_mib", 0))))
+                pool = (n.get("pool") or "protected").strip().lower()
+                out.append((ident, int(n.get("free_mem_mib", 0)), pool))
         return out
 
     def _list_metal_nodes(self) -> list[str]:

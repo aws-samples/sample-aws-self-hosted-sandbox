@@ -186,6 +186,30 @@ def _autostart_enabled(record: dict) -> bool:
 
 # ---------- 业务逻辑 ----------
 
+# ---------- M2:受保护池 / 抢占池放置策略 ----------
+# 池分离把节点分成两类:
+#   protected —— on-demand,不会被回收。活跃/交互沙盒放这里,避免 spot 抢占中断用户。
+#   spot      —— 抢占实例,便宜但随时可能被回收。空闲/可疏散沙盒放这里省成本。
+# 放置为【软约束】:目标池无活节点时 driver 会回退跨池放置(有胜于无)。
+# 默认新建沙盒 → protected(刚创建通常紧接着交互/装环境,不该被抢占打断);
+# 可用 DEFAULT_CREATE_POOL 改默认,或请求体 pool / meta.pool 显式指定。
+DEFAULT_CREATE_POOL = os.environ.get("DEFAULT_CREATE_POOL", "protected").strip().lower()
+# 池分离总开关:关掉(0)则 pool 一律 None(不限池,回到原行为),便于单池集群或回滚。
+POOL_PLACEMENT_ENABLED = os.environ.get("POOL_PLACEMENT_ENABLED", "1").lower() in ("1", "true")
+
+
+def _placement_pool(body: dict, spec: "SandboxSpec") -> str | None:
+    """决定新建沙盒的目标池。返回 "spot"/"protected",或 None(不限池)。
+    优先级:请求体 pool > meta.pool > DEFAULT_CREATE_POOL。非法值回退默认。"""
+    if not POOL_PLACEMENT_ENABLED:
+        return None
+    cand = (body.get("pool")
+            or (spec.meta or {}).get("pool")
+            or DEFAULT_CREATE_POOL or "")
+    cand = str(cand).strip().lower()
+    return cand if cand in ("spot", "protected") else None
+
+
 def create_sandbox(body: dict) -> tuple[int, dict]:
     idem_key = body.get("idempotency_key")
     if idem_key:
@@ -203,6 +227,7 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
     )
     tenant_id = body.get("tenant_id", "default")
     sid       = uuid.uuid4().hex[:8]
+    pool      = _placement_pool(body, spec)   # M2:目标池(protected/spot/None)
 
     record: dict = {
         "id":               sid,
@@ -212,6 +237,8 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         "image":            spec.image,
         "cpu":              spec.cpu,
         "mem_mib":          spec.mem_mib,
+        # M2:期望池(记录下来供观测/重调度参考;实际落点见 driver 返回的 node)。
+        "pool":             pool or "",
         "created_at":       db._utcnow(),
         "updated_at":       db._utcnow(),
         # 栅栏世代:每次(重)放置 VM 自增,用于对账识别陈旧重复 VM(防分区愈合后双 VM)。
@@ -235,9 +262,12 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         # 跳过暖池直接冷建,才会走 op_create 的模板选择(CoW 对应 rootfs-{name}.ext4)。
         from sandbox_api.drivers.firecracker import normalize_image
         wants_default = normalize_image(spec.image) == "min"
-        claimed = _warm_pool.claim(sid, spec) if wants_default else False
+        # M2:暖池预热的 VM 池归属不确定(可能在任意池),若请求了明确 pool 则跳过暖池,
+        # 走冷建以保证落到目标池。未指定 pool(None)时仍可用暖池(维持秒级 create)。
+        use_warm = wants_default and pool is None
+        claimed = _warm_pool.claim(sid, spec) if use_warm else False
         if not claimed:
-            driver_fields = _driver.create(sid, spec, epoch=1)
+            driver_fields = _driver.create(sid, spec, epoch=1, pool=pool)
             db.force_update(sid, {**driver_fields, "state": "running"})
         db.write_event(sid, "created", "creating")
         # 方案C:create 成功后异步打一次 Full base 快照(供后续 Diff 疏散),不阻塞 create 返回。

@@ -97,6 +97,18 @@ variable "node_count" {
   description = "承载节点常驻台数(min=max=desired)。成本优先默认 1 台(单机可测全生命周期);跨机快照/spot 疏散演示需设为 2。"
 }
 
+# ---------- M2:受保护池 / 抢占池分离 ----------
+# 主节点组(sandbox_*)作抢占池:传 -var=\"capacity_type=SPOT\" 便宜但会被回收。
+# 此变量开一个【额外的 on-demand 节点组】作受保护池,承载活跃/交互沙盒,不会被 spot 抢占中断。
+# 默认 0(不创建 → 完全非破坏性,单池集群行为不变)。池分离演示:capacity_type=SPOT + protected_node_count>=1。
+# node-agent 自动经 IMDS instance-life-cycle 判定池归属(spot 组→spot 池;此 on-demand 组→protected 池),
+# 无需额外注入;控制面据心跳里的 pool 字段做放置(默认新建→protected)。
+variable "protected_node_count" {
+  type        = number
+  default     = 0
+  description = "受保护池(on-demand)节点常驻台数。0=不创建(默认,非破坏)。>=1 时创建 sbxprot_* on-demand 节点组承载活跃沙盒,与抢占(spot)池分离。"
+}
+
 locals {
   # 架构派生:AMI 类型、Firecracker/内核下载用的架构标识(uname -m 风格)
   arch_cfg = {
@@ -209,82 +221,101 @@ module "eks" {
   subnet_ids = module.vpc.private_subnets
 
   # 承载 sandbox 的托管节点组(裸 Firecracker microVM),打 sandbox=true 让 node-agent DaemonSet 调度上来。
-  eks_managed_node_groups = {
-    "sandbox_${var.node_arch}" = {
-      ami_type       = local.node_arch_cfg.ami_type
-      instance_types = [var.instance_type]
+  # M2:两个池共享同一套引导(local.sandbox_ng),仅计费类型/台数不同 —— 避免重复 ~100 行引导脚本。
+  #   主组 sandbox_*         :capacity_type=var.capacity_type(可设 SPOT 作抢占池)。
+  #   受保护组 sbxprot_*      :protected_node_count>0 时创建,强制 ON_DEMAND(受保护池)。
+  eks_managed_node_groups = merge(
+    {
+      "sandbox_${var.node_arch}" = local.sandbox_ng
+    },
+    var.protected_node_count > 0 ? {
+      "sbxprot_${var.node_arch}" = merge(local.sandbox_ng, {
+        capacity_type = "ON_DEMAND"
+        min_size      = var.protected_node_count
+        max_size      = var.protected_node_count
+        desired_size  = var.protected_node_count
+      })
+    } : {}
+  )
+}
 
-      # 计费类型:ON_DEMAND(默认)/ SPOT。SPOT 时实例可被回收,EC2 提前 ~120s 发中断通知到
-      # IMDS(/latest/meta-data/spot/instance-action),node-agent 的 RECLAIM_WATCH 轮询检出 →
-      # 并发疏散本节点所有 sandbox 到 S3(权威副本),节点消失后可在其它节点从 S3 恢复。
-      capacity_type = var.capacity_type
+# M2:节点组引导配置抽成 local,供抢占池 + 受保护池两个节点组复用(内容与原内联块一致)。
+locals {
+  sandbox_ng = {
+    ami_type       = local.node_arch_cfg.ami_type
+    instance_types = [var.instance_type]
 
-      # 成本优先单机 demo 默认 1 台;跨机快照/spot 疏散演示需 2 台(node_count 变量)。
-      min_size     = var.node_count
-      max_size     = var.node_count
-      desired_size = var.node_count
+    # 计费类型:ON_DEMAND(默认)/ SPOT。SPOT 时实例可被回收,EC2 提前 ~120s 发中断通知到
+    # IMDS(/latest/meta-data/spot/instance-action),node-agent 的 RECLAIM_WATCH 轮询检出 →
+    # 并发疏散本节点所有 sandbox 到 S3(权威副本),节点消失后可在其它节点从 S3 恢复。
+    capacity_type = var.capacity_type
 
-      # 节点放公有子网直接出网(无 NAT)。
-      # i7i + 本地 NVMe(use_instance_store=true):跨【全部 AZ】—— i7i 各 AZ 容量不均,
-      #   钉单 AZ 会踩 InsufficientInstanceCapacity(实测 us-east-1a 无 i7i.4xlarge 容量);
-      #   多 AZ 让 ASG 在有容量的 AZ 落地。
-      # .metal 方案C(持久 EBS,use_instance_store=false):必须【同一 AZ】(EBS 不能跨 AZ attach),
-      #   钉死到 public_subnets[0]。
-      subnet_ids = var.use_instance_store ? module.vpc.public_subnets : [module.vpc.public_subnets[0]]
+    # 成本优先单机 demo 默认 1 台;跨机快照/spot 疏散演示需 2 台(node_count 变量)。
+    min_size     = var.node_count
+    max_size     = var.node_count
+    desired_size = var.node_count
 
-      # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → S3 只读;SSM 供排障。
-      iam_role_additional_policies = {
-        s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-        ssm_core    = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-      }
+    # 节点放公有子网直接出网(无 NAT)。
+    # i7i + 本地 NVMe(use_instance_store=true):跨【全部 AZ】—— i7i 各 AZ 容量不均,
+    #   钉单 AZ 会踩 InsufficientInstanceCapacity(实测 us-east-1a 无 i7i.4xlarge 容量);
+    #   多 AZ 让 ASG 在有容量的 AZ 落地。
+    # .metal 方案C(持久 EBS,use_instance_store=false):必须【同一 AZ】(EBS 不能跨 AZ attach),
+    #   钉死到 public_subnets[0]。
+    subnet_ids = var.use_instance_store ? module.vpc.public_subnets : [module.vpc.public_subnets[0]]
 
-      # 【i7i 关键】嵌套虚拟化:向 guest 暴露 /dev/kvm 才能跑 Firecracker。
-      #   需 provider ≥6.33 + EKS 模块 v21。.metal 裸金属设 enable_nested_virtualization=false(此处置 null)。
-      cpu_options = var.enable_nested_virtualization ? { nested_virtualization = "enabled" } : null
+    # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz → S3 只读;SSM 供排障。
+    iam_role_additional_policies = {
+      s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      ssm_core    = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    }
 
-      # v21 IMDS 默认 hop_limit=1(v20 是 2)。node-agent 走 IRSA 不依赖 IMDS,但保持 2 以贴合旧行为、
-      # 避免 host/pod 访问 IMDS 的意外(略放宽,已知取舍)。
-      metadata_options = {
-        http_endpoint               = "enabled"
-        http_tokens                 = "required"
-        http_put_response_hop_limit = 2
-      }
+    # 【i7i 关键】嵌套虚拟化:向 guest 暴露 /dev/kvm 才能跑 Firecracker。
+    #   需 provider ≥6.33 + EKS 模块 v21。.metal 裸金属设 enable_nested_virtualization=false(此处置 null)。
+    cpu_options = var.enable_nested_virtualization ? { nested_virtualization = "enabled" } : null
 
-      # 存储盘:
-      #   use_instance_store=true(i7i 默认):仅根盘;沙盒暂存盘用本地 NVMe 实例存储
-      #     (Nitro 自动挂载为 /dev/nvme1n1,下方 pre-bootstrap 探测并 mkfs+挂到 /var/lib/sbx)。
-      #     临时盘,随实例销毁;快照权威副本走 S3。
-      #   use_instance_store=false(.metal 方案C):额外挂一块持久 EBS(delete_on_termination=false),
-      #     存快照+rootfs,spot 终止后幸存、可跨机恢复。
-      block_device_mappings = merge(
-        {
-          xvda = {
-            device_name = "/dev/xvda"
-            ebs = {
-              volume_size = 200
-              volume_type = "gp3"
-            }
-          }
-        },
-        var.use_instance_store ? {} : {
-          sbxdata = {
-            device_name = "/dev/sdf"
-            ebs = {
-              volume_size           = var.state_ebs_size_gb
-              volume_type           = "gp3"
-              iops                  = var.state_ebs_iops
-              throughput            = var.state_ebs_throughput
-              delete_on_termination = false
-            }
+    # v21 IMDS 默认 hop_limit=1(v20 是 2)。node-agent 走 IRSA 不依赖 IMDS,但保持 2 以贴合旧行为、
+    # 避免 host/pod 访问 IMDS 的意外(略放宽,已知取舍)。
+    metadata_options = {
+      http_endpoint               = "enabled"
+      http_tokens                 = "required"
+      http_put_response_hop_limit = 2
+    }
+
+    # 存储盘:
+    #   use_instance_store=true(i7i 默认):仅根盘;沙盒暂存盘用本地 NVMe 实例存储
+    #     (Nitro 自动挂载为 /dev/nvme1n1,下方 pre-bootstrap 探测并 mkfs+挂到 /var/lib/sbx)。
+    #     临时盘,随实例销毁;快照权威副本走 S3。
+    #   use_instance_store=false(.metal 方案C):额外挂一块持久 EBS(delete_on_termination=false),
+    #     存快照+rootfs,spot 终止后幸存、可跨机恢复。
+    block_device_mappings = merge(
+      {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size = 200
+            volume_type = "gp3"
           }
         }
-      )
+      },
+      var.use_instance_store ? {} : {
+        sbxdata = {
+          device_name = "/dev/sdf"
+          ebs = {
+            volume_size           = var.state_ebs_size_gb
+            volume_type           = "gp3"
+            iops                  = var.state_ebs_iops
+            throughput            = var.state_ebs_throughput
+            delete_on_termination = false
+          }
+        }
+      }
+    )
 
-      # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本,在 nodeadm 引导前执行。
-      # Firecracker 二进制 + 内核 + rootfs 预装,不重启 containerd → 不触发节点替换循环。
-      cloudinit_pre_nodeadm = [{
-        content_type = "text/x-shellscript; charset=\"us-ascii\""
-        content      = <<-EOT
+    # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本,在 nodeadm 引导前执行。
+    # Firecracker 二进制 + 内核 + rootfs 预装,不重启 containerd → 不触发节点替换循环。
+    cloudinit_pre_nodeadm = [{
+      content_type = "text/x-shellscript; charset=\"us-ascii\""
+      content      = <<-EOT
         #!/bin/bash
         # pre_bootstrap: kubelet 启动前执行
         # ⚠️ 禁止长任务(docker/dnf 大安装 → kubelet 心跳中断 → 节点替换循环)
@@ -374,13 +405,12 @@ module "eks" {
 
         echo "[pre-bootstrap] DONE $(date)"
       EOT
-      }]
+    }]
 
-      # 本组承载 sandbox,打 sandbox=true 让 node-agent DaemonSet 调度上来。
-      labels = {
-        role    = "system"
-        sandbox = "true"
-      }
+    # 本组承载 sandbox,打 sandbox=true 让 node-agent DaemonSet 调度上来。
+    labels = {
+      role    = "system"
+      sandbox = "true"
     }
   }
 }

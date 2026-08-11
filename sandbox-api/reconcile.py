@@ -43,6 +43,35 @@ RESCHEDULE_MAX_ATTEMPTS  = int(os.environ.get("RESCHEDULE_MAX_ATTEMPTS", "3"))
 RESCHEDULE_BATCH         = int(os.environ.get("RESCHEDULE_BATCH", "8"))
 RESCHEDULE_CONCURRENCY   = int(os.environ.get("RESCHEDULE_CONCURRENCY", "4"))
 
+# M2/M3:重调度时的池亲和 + 活动信号否决。
+#   池分离开时(POOL_PLACEMENT_ENABLED)重调度默认落 spot 池(重调度本就是被中断后恢复,
+#   放便宜的抢占池;真被再抢占也能再次恢复)。但【活动信号否决】:近期活跃(交互中)的沙盒
+#   veto spot → 落 protected 池,避免刚恢复的活跃会话又被 spot 抢占打断。
+#   目标池无活节点时 driver 自动回退不限池(有胜于无)。关掉池分离则 pool=None(原行为)。
+POOL_PLACEMENT_ENABLED   = os.environ.get("POOL_PLACEMENT_ENABLED", "1").lower() in ("1", "true")
+# 活跃阈值(秒):距上次活跃 < 此值视为"活跃/交互中" → 否决 spot,落 protected。默认 5 分钟。
+RESCHEDULE_ACTIVE_VETO_S = int(os.environ.get("RESCHEDULE_ACTIVE_VETO_S", "300"))
+
+
+def _reschedule_pool(rec: dict) -> str | None:
+    """M2/M3:决定重调度目标池。池分离关 → None(不限池)。
+    近期活跃(last_active_at 在 veto 窗口内)→ protected(否决 spot);否则 → spot。"""
+    if not POOL_PLACEMENT_ENABLED:
+        return None
+    from datetime import datetime, timezone
+    ts = rec.get("last_active_at") or rec.get("updated_at") or rec.get("created_at")
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            idle_s = (datetime.now(timezone.utc) - dt).total_seconds()
+            if idle_s < RESCHEDULE_ACTIVE_VETO_S:
+                return "protected"   # 活动信号否决 spot
+        except (ValueError, TypeError):
+            pass
+    return "spot"
+
 
 class Reconciler:
     """对账循环 + leader 选举。持一个 driver 引用做 runtime 探针。"""
@@ -232,8 +261,11 @@ class Reconciler:
         条件写(needs_reschedule→resuming)天然互斥:多 leader/并发只有一个抢到。"""
         sid      = rec["id"]
         attempts = int(rec.get("reschedule_attempts", 0) or 0)
+        # M2/M3:按活动信号选目标池(活跃→protected 否决 spot;空闲→spot)。
+        # 目标池无活节点时 _pick_node 内部回退不限池,不会因此重调度失败。
+        pool = _reschedule_pool(rec)
         try:
-            node = self._driver._pick_node()   # 任一活节点
+            node = self._driver._pick_node(pool=pool)   # 目标池优先,回退任一活节点
         except Exception:
             return False  # 暂无活节点,下 tick 再试(不计失败,不加 attempts)
         # 抢占式转 resuming;抢不到(已被别的 leader/请求改动)则跳过
