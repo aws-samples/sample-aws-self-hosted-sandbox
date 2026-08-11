@@ -37,6 +37,7 @@ from botocore.exceptions import ClientError
 from sandbox_api import db
 from sandbox_api.autosleep import AutoSleeper
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
+from sandbox_api.idle_detection import IdleDetector
 from sandbox_api.reconcile import Reconciler
 from sandbox_api.warm_pool import WarmPool
 
@@ -79,15 +80,7 @@ EXPOSE_TOKEN = os.environ.get("EXPOSE_TOKEN", "")
 # 的 slept 会被 /s/{id}/{port}/ 请求触发唤醒。opt-in:仅对声明了 autostop/autostart 的
 # 沙盒生效(见 _autostop_enabled / _autostart_enabled),默认关,符合"显式开"。
 AUTO_SLEEP_ENABLED   = os.environ.get("AUTO_SLEEP_ENABLED", "1").lower() in ("1", "true")
-AUTO_SLEEP_IDLE_S    = int(os.environ.get("AUTO_SLEEP_IDLE_S", "300"))   # 空闲多久自动 sleep
 AUTO_WAKE_TIMEOUT_S  = int(os.environ.get("AUTO_WAKE_TIMEOUT_S", "30"))  # 网关唤醒等待上限
-# 活跃时间写节流:热路径(每次 proxy/exec)都写 DynamoDB 会放大写量,故内存里记上次写入
-# 时刻,距上次 < ACTIVITY_TOUCH_MIN_S 则跳过写。多副本各自节流,写放大上界 = 副本数 ×
-# (1/间隔),可接受。
-ACTIVITY_TOUCH_MIN_S = int(os.environ.get("ACTIVITY_TOUCH_MIN_S", "15"))
-import threading as _th_activity
-_ACTIVITY_LAST: dict[str, float] = {}   # sid → 上次写 last_active_at 的 monotonic 时刻
-_ACTIVITY_LOCK = _th_activity.Lock()
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -152,19 +145,15 @@ def _check_auth(handler: "Handler") -> bool:
 
 # ---------- 自动休眠 / 唤醒 辅助 ----------
 
-def _touch_activity(sid: str) -> None:
-    """刷新沙盒最后活跃时间(last_active_at)。热路径调用,内存节流避免每请求都写 DynamoDB:
-    距上次写 < ACTIVITY_TOUCH_MIN_S 则跳过。失败静默(活跃时间尽力而为,不阻断请求)。"""
-    now_mono = time.monotonic()
-    with _ACTIVITY_LOCK:
-        last = _ACTIVITY_LAST.get(sid, 0.0)
-        if now_mono - last < ACTIVITY_TOUCH_MIN_S:
-            return
-        _ACTIVITY_LAST[sid] = now_mono
-    try:
-        db.force_update(sid, {"last_active_at": db._utcnow()})
-    except Exception:
-        pass
+def _persist_activity(sid: str) -> None:
+    db.force_update(sid, {"last_active_at": db._utcnow()})
+
+
+_idle_detector = IdleDetector(_persist_activity)
+
+
+def _touch_activity(sid: str, *, force: bool = False) -> None:
+    _idle_detector.touch(sid, force=force)
 
 
 def _autostop_enabled(record: dict) -> bool:
@@ -394,15 +383,19 @@ def admin_stats() -> tuple[int, dict]:
 # 解析出 (sid, port) → 查 DynamoDB 拿沙盒所在 node → 转发到该 node-agent 的
 # /proxy/{sid}/{port}/{rest}(node-agent 再转进 guest 172.18.x.2:port)。
 
-def _raw_tunnel(a, b) -> None:
+def _raw_tunnel(a, b, on_activity=None, heartbeat_s: float = 5.0) -> None:
     """两个已连接 socket 间双向透传字节,任一方关闭即结束(WebSocket 隧道用)。"""
     import select
     socks = [a, b]
     try:
         while True:
-            r, _, x = select.select(socks, [], socks, 300)
-            if x or not r:
+            r, _, x = select.select(socks, [], socks, heartbeat_s)
+            if x:
                 break
+            if not r:
+                if on_activity:
+                    on_activity()
+                continue
             for s in r:
                 try:
                     data = s.recv(65536)
@@ -411,6 +404,8 @@ def _raw_tunnel(a, b) -> None:
                 if not data:
                     return
                 (b if s is a else a).sendall(data)
+                if on_activity:
+                    on_activity()
     finally:
         for s in socks:
             try:
@@ -570,9 +565,14 @@ def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
         fresh = db.get(sid)
         if not fresh or fresh.get("state") != "running":
             return 409, {"error": "state changed"}
-        idle_s = _idle_seconds(fresh)
-        if idle_s is None or idle_s < AUTO_SLEEP_IDLE_S:
-            return 200, {"skipped": "no longer idle", "idle_s": idle_s}
+        decision = _idle_detector.decide(fresh)
+        if not decision.idle:
+            return 200, {
+                "skipped": "no longer idle",
+                "idle_s": decision.idle_seconds,
+                "blockers": list(decision.blockers),
+            }
+        idle_s = decision.idle_seconds
 
         db.update_state(sid, "suspending", "running")
         snap_info = _driver.suspend(sid, fresh)
@@ -580,8 +580,7 @@ def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
         db.write_event(sid, "slept", "running",
                        {**snap_info, "reason": "idle", "idle_s": round(idle_s, 1)})
         # 休眠后从活跃节流缓存移除(已不在 running,无需再节流)
-        with _ACTIVITY_LOCK:
-            _ACTIVITY_LAST.pop(sid, None)
+        _idle_detector.forget(sid)
         return 200, db.get(sid)
     except UnsupportedOperation as e:
         return 501, {"error": str(e)}
@@ -599,18 +598,8 @@ def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
 
 
 def _idle_seconds(record: dict) -> float | None:
-    """沙盒距今空闲秒数(now - last_active_at)。无 last_active_at 回退 created_at;都无返回 None。"""
-    from datetime import datetime, timezone
-    ts = record.get("last_active_at") or record.get("created_at")
-    if not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds()
-    except (ValueError, TypeError):
-        return None
+    """Compatibility helper for API/tests; the detector owns timestamp parsing."""
+    return _idle_detector.decide(record).idle_seconds
 
 
 def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
@@ -640,10 +629,8 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         finally:
             if _RESUME_SEM is not None:
                 _RESUME_SEM.release()
-        # resume 成功即回到活跃 —— 刷新 last_active_at 并清节流缓存,给刚唤醒的沙盒一个完整
-        # idle 周期,避免扫描 loop 因 last_active_at 仍停在休眠前而立刻又把它睡回去。
-        with _ACTIVITY_LOCK:
-            _ACTIVITY_LAST[sid] = time.monotonic()
+        # resume 成功即回到活跃,给刚唤醒的沙盒一个完整 idle 周期。
+        _idle_detector.forget(sid)
         db.update_state(sid, "running", "resuming",
                         {**driver_fields, "restore_time_s": str(restore_time),
                          "last_active_at": db._utcnow()})
@@ -697,6 +684,7 @@ def upload_file(sid: str, path: str, content_b64: str,
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
+    _touch_activity(sid)
     try:
         raw = _b64.b64decode(content_b64, validate=True)
     except Exception:
@@ -709,6 +697,7 @@ def upload_file(sid: str, path: str, content_b64: str,
            f"printf %s {_shlex.quote(content_b64)} | base64 -d > {qpath} && "
            f"echo OK $(wc -c < {qpath})")
     rc, stdout, stderr = _driver.exec(sid, record, cmd)
+    _touch_activity(sid, force=True)
     if rc != 0:
         return 500, {"error": "write failed", "stderr": stderr}
     return 200, {"id": sid, "path": path, "bytes": len(raw), "result": stdout.strip()}
@@ -721,6 +710,7 @@ def download_file(sid: str, path: str,
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
+    _touch_activity(sid)
     qpath = _shlex.quote(path)
     # 先校验存在 + 大小,再 base64 输出(避免把超大文件读进内存)
     cmd = (f"test -f {qpath} || {{ echo __NOFILE__; exit 3; }}; "
@@ -728,6 +718,7 @@ def download_file(sid: str, path: str,
            f"if [ \"$sz\" -gt {MAX_FILE_BYTES} ]; then echo __TOOBIG__; exit 4; fi; "
            f"base64 {qpath}")
     rc, stdout, stderr = _driver.exec(sid, record, cmd)
+    _touch_activity(sid, force=True)
     if "__NOFILE__" in stdout:
         return 404, {"error": "file not found in sandbox", "path": path}
     if "__TOOBIG__" in stdout:
@@ -757,9 +748,9 @@ def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, d
 # AUTO_SLEEP_ENABLED=0 可整体关闭(仍不影响手动 suspend/resume 与网关唤醒逻辑)。
 if AUTO_SLEEP_ENABLED:
     _autosleeper = AutoSleeper(
-        sleep_fn        = auto_sleep_sandbox,
-        idle_seconds_fn = _idle_seconds,
-        autostop_fn     = _autostop_enabled,
+        sleep_fn         = auto_sleep_sandbox,
+        idle_decision_fn = _idle_detector.decide,
+        autostop_fn      = _autostop_enabled,
     )
     _autosleeper.start_loop(is_leader=lambda: _reconciler.is_leader)
 
@@ -846,7 +837,7 @@ class Handler(BaseHTTPRequestHandler):
         # WebSocket / Upgrade:开原始 socket 到 node-agent,重放请求后双向透传。
         if "upgrade" in self.headers.get("Connection", "").lower() and \
            self.headers.get("Upgrade", "").lower() == "websocket":
-            return self._tunnel_ws(node_host, upstream_path)
+            return self._tunnel_ws(sid, node_host, upstream_path)
 
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -881,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
         conn.close()
         return True
 
-    def _tunnel_ws(self, node_host: str, upstream_path: str) -> bool:
+    def _tunnel_ws(self, sid: str, node_host: str, upstream_path: str) -> bool:
         """WebSocket 反代:向 node-agent 建原始 TCP,重放请求(含 Upgrade 头),再双向透传。"""
         host, _, port_s = node_host.partition(":")
         try:
@@ -896,7 +887,13 @@ class Handler(BaseHTTPRequestHandler):
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {node_host}")
         up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
-        _raw_tunnel(self.connection, up)
+        with _idle_detector.connection(sid):
+            _raw_tunnel(
+                self.connection,
+                up,
+                on_activity=lambda: _touch_activity(sid),
+                heartbeat_s=max(1.0, min(5.0, _idle_detector.idle_s / 3)),
+            )
         return True
 
     def do_GET(self):

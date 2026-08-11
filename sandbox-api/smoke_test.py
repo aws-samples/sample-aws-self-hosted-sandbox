@@ -1185,9 +1185,9 @@ class TestAutoSleep(unittest.TestCase):
             return 200, {"state": "slept"}
 
         sleeper = AutoSleeper(sleep_fn=_fake_sleep,
-                              idle_seconds_fn=app._idle_seconds,
+                              idle_decision_fn=app._idle_detector.decide,
                               autostop_fn=app._autostop_enabled)
-        # IDLE_S 用模块默认 300;idle_s=999 超过,idle_s=0 不超过
+        # detector 默认 300s;idle_s=999 超过,idle_s=0 不超过
         stats = sleeper.scan_once()
         self.assertEqual(slept_ids, ["idle-optin"])
         self.assertEqual(stats["slept"], 1)
@@ -1199,23 +1199,43 @@ class TestAutoSleep(unittest.TestCase):
         from sandbox_api import app, db
         from sandbox_api.drivers.firecracker import FirecrackerDriver
         app._driver = FirecrackerDriver()
-        # 用极小 idle 阈值,造一个空闲 5s 的沙盒
-        old_idle = app.AUTO_SLEEP_IDLE_S
-        app.AUTO_SLEEP_IDLE_S = 1
-        try:
-            cf = app._driver.create("as1", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
-            db.put({"id": "as1", "tenant_id": "t1", "state": "running",
-                    "driver": "firecracker", **cf,
-                    "last_active_at": db._utcnow_minus(60),
-                    "services": [{"port": 80, "autostop": True, "autostart": True}],
-                    "updated_at": db._utcnow()})
-            code, body = app.auto_sleep_sandbox("as1")
-            self.assertEqual(code, 200)
-            self.assertEqual(db.get("as1")["state"], "slept")   # 关键:slept 而非 suspended
-            evs = db.list_events("as1")
-            self.assertTrue(any(e["event"] == "slept" and e.get("detail", {}).get("reason") == "idle" for e in evs))
-        finally:
-            app.AUTO_SLEEP_IDLE_S = old_idle
+        cf = app._driver.create("as1", __import__("sandbox_api.driver", fromlist=["SandboxSpec"]).SandboxSpec(image="t", cpu=1, mem_mib=256))
+        db.put({"id": "as1", "tenant_id": "t1", "state": "running",
+                "driver": "firecracker", **cf,
+                "last_active_at": db._utcnow_minus(999),
+                # autostop=false keeps the background scanner out; this test invokes
+                # auto_sleep_sandbox directly to verify its state transition.
+                "services": [{"port": 80, "autostop": False, "autostart": True}],
+                "updated_at": db._utcnow()})
+        code, body = app.auto_sleep_sandbox("as1")
+        self.assertEqual(code, 200)
+        self.assertEqual(db.get("as1")["state"], "slept")   # 关键:slept 而非 suspended
+        evs = db.list_events("as1")
+        self.assertTrue(any(e["event"] == "slept" and e.get("detail", {}).get("reason") == "idle" for e in evs))
+
+    @mock_aws
+    def test_active_connection_blocks_sleep_and_refreshes_signal(self):
+        _create_tables()
+        from sandbox_api import app, db
+
+        self._mk_running("ws-active", autostop=True, idle_s=999)
+        with app._idle_detector.connection("ws-active"):
+            rec = db.get("ws-active")
+            decision = app._idle_detector.decide(rec)
+            self.assertFalse(decision.idle)
+            self.assertEqual(decision.active_connections, 1)
+            self.assertIn("active_connection", decision.blockers)
+            self.assertLess(decision.signal_age_seconds, 2)
+
+        self.assertEqual(app._idle_detector.active_connections("ws-active"), 0)
+
+    def test_missing_activity_signal_is_conservative(self):
+        from sandbox_api.idle_detection import IdleDetector
+
+        detector = IdleDetector(lambda _sid: None, idle_s=1)
+        decision = detector.decide({"id": "missing"})
+        self.assertFalse(decision.idle)
+        self.assertIn("activity_signal_missing", decision.blockers)
 
     @mock_aws
     def test_auto_sleep_skips_recently_active(self):

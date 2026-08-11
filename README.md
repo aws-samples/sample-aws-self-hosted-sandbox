@@ -121,13 +121,17 @@ running ──(空闲超 idle 阈值, 后台扫描)──► 自动 sleep ──
 
 - **opt-in，默认关**：复用 Fly 语义的 `services[].autostop` / `autostart` 字段。create 时声明 `{"port":80,"autostop":true,"autostart":true}` 才启用（或用 `meta.auto_sleep` / `meta.auto_wake`）。不声明的沙盒行为完全不变。
 - **自动休眠(`slept`)与手动挂起(`suspended`)严格区分**：这是关键设计。手动 `POST /suspend` 标 `suspended`，网关**不会**自动唤醒它；只有空闲自动休眠的 `slept` 会被请求唤醒。状态一眼可辨（Portal 徽章:`slept`=靛蓝、`suspended`=灰）。
-- **活跃信号**：经网关的 HTTP 流量（`/s/{id}/{port}/`）与 `exec` 都刷新"最后活跃时间"`last_active_at`；热路径内存节流（默认 15s 内不重复写 DynamoDB），避免写放大。
+- **多信号空闲裁决**：网关 HTTP、`exec`、文件上传/下载刷新 `last_active_at`；WebSocket 建连、断连及安静连接心跳持续刷新，并以进程内活跃连接计数即时否决休眠。缺失或非法活动时间按保守策略处理（不休眠）；热路径内存节流（默认 15s 内不重复写 DynamoDB）避免写放大。
 - **网关透明唤醒**：`/s/` 反代遇到 `slept` 沙盒 → 触发 resume 并等其回 running 再转发（首请求阻塞 ~秒级,与 fly 一致）；并发请求靠 lease 条件写互斥，只有一个真正 resume。
 - **后台扫描**：leader 门控的周期 loop（复用 reconcile/暖池同一 leader 锁，多副本不重复触发）；拿 lease 后**二次校验仍空闲**，防"扫描判定→加锁"之间刚来请求被误睡。
 - **复用现有并发保护**：自动休眠走与手动 suspend 同一套 `lease + prev_state 条件写 + 失败回滚`，快照失败回滚 `running` 绝不静默丢数据。
-- 可调 env：`AUTO_SLEEP_ENABLED`（默认 1）/ `AUTO_SLEEP_IDLE_S`（默认 300s）/ `AUTO_SLEEP_SCAN_S`（默认 30s）/ `AUTO_WAKE_TIMEOUT_S`（默认 30s）/ `ACTIVITY_TOUCH_MIN_S`（默认 15s）。实现见 `sandbox-api/autosleep.py`。
+- 可调 env：`AUTO_SLEEP_ENABLED`（默认 1）/ `AUTO_SLEEP_IDLE_S`（默认 300s）/ `AUTO_SLEEP_SCAN_S`（默认 30s）/ `AUTO_WAKE_TIMEOUT_S`（默认 30s）/ `ACTIVITY_TOUCH_MIN_S`（默认 15s）。裁决实现见 `sandbox-api/idle_detection.py`，扫描调度见 `sandbox-api/autosleep.py`。
 
 > 依赖 suspend/resume 快照能力（同暖池）。已于 2026-07-16 真机 e2e 验证通过（A0~A5，含自动/手动区分、网关透明唤醒 ~2.1s），详见 **[docs/自动休眠-真机测试报告-2026-07-16.md](docs/自动休眠-真机测试报告-2026-07-16.md)**；脚本 `scripts/autosleep_e2e.sh`。
+>
+> 2026-08-11 增加 WebSocket 多信号检测与 A6 用例；本地测试 50/50 和 AWS
+> `i7i.8xlarge` Firecracker A0-A6 E2E 均通过。早先两台 `c6g.metal` 的 EC2
+> impaired 尝试保留为基础设施故障记录。详见 **[docs/空闲检测-真机测试报告-2026-08-10.md](docs/空闲检测-真机测试报告-2026-08-10.md)**。
 
 #### 4. API 开发者友好性
 
