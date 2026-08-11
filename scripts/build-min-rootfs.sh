@@ -83,7 +83,18 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
  && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 DOCKER
-docker build --platform "$PLATFORM" -t sbx-rootfs:b "$WORK"
+if docker buildx version >/dev/null 2>&1; then
+  docker buildx build --platform "$PLATFORM" --load -t sbx-rootfs:b "$WORK"
+else
+  docker build --platform "$PLATFORM" -t sbx-rootfs:b "$WORK"
+fi
+EXPECTED_ARCH="${PLATFORM#linux/}"
+ACTUAL_ARCH=$(docker image inspect --format '{{.Architecture}}' sbx-rootfs:b)
+if [ "$ACTUAL_ARCH" != "$EXPECTED_ARCH" ]; then
+  echo "ERROR: built rootfs as $ACTUAL_ARCH, expected $EXPECTED_ARCH." >&2
+  echo "The Docker builder ignored --platform; use buildx or a native $EXPECTED_ARCH builder." >&2
+  exit 1
+fi
 CID=$(docker create --platform "$PLATFORM" sbx-rootfs:b sleep infinity)
 mkdir -p "$WORK/rootfs"
 docker export "$CID" | tar -C "$WORK/rootfs" -xf -

@@ -203,6 +203,10 @@ resource "helm_release" "karpenter" {
     name  = "controller.resources.limits.memory"
     value = "1Gi"
   }
+  set {
+    name  = "nodeSelector.workload-tier"
+    value = "system"
+  }
 }
 
 # ---------- NodePool / EC2NodeClass ----------
@@ -218,7 +222,7 @@ resource "null_resource" "karpenter_nodepools" {
 
   triggers = {
     cluster_name = var.cluster_name
-    node_arch    = var.node_arch
+    node_arch    = "arm64"
     node_role    = aws_iam_role.karpenter_node.name
   }
 
@@ -230,7 +234,7 @@ resource "null_resource" "karpenter_nodepools" {
       apiVersion: karpenter.k8s.aws/v1
       kind: EC2NodeClass
       metadata:
-        name: standard-${var.node_arch}
+        name: standard-arm64
       spec:
         amiSelectorTerms:
           - alias: al2023@latest
@@ -250,17 +254,17 @@ resource "null_resource" "karpenter_nodepools" {
       apiVersion: karpenter.sh/v1
       kind: NodePool
       metadata:
-        name: standard-${var.node_arch}
+        name: standard-arm64
       spec:
         template:
           spec:
             requirements:
-              - {key: kubernetes.io/arch, operator: In, values: ["${var.node_arch}"]}
+              - {key: kubernetes.io/arch, operator: In, values: ["arm64"]}
               - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
             nodeClassRef:
               group: karpenter.k8s.aws
               kind: EC2NodeClass
-              name: standard-${var.node_arch}
+              name: standard-arm64
         disruption:
           consolidationPolicy: WhenEmptyOrUnderutilized
           consolidateAfter: 1m

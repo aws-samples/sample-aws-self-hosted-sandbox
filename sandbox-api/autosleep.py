@@ -23,20 +23,19 @@ import time
 
 from sandbox_api import db
 
-SCAN_EVERY   = int(os.environ.get("AUTO_SLEEP_SCAN_S", "30"))   # 扫描间隔
-IDLE_S       = int(os.environ.get("AUTO_SLEEP_IDLE_S", "300"))  # 空闲多久自动 sleep
+SCAN_EVERY = int(os.environ.get("AUTO_SLEEP_SCAN_S", "30"))
 
 
 class AutoSleeper:
     """空闲扫描 loop。持一个 sleep_fn(sid)->(code, body) 委托实际休眠(app.auto_sleep_sandbox)。"""
 
-    def __init__(self, sleep_fn, idle_seconds_fn, autostop_fn):
+    def __init__(self, sleep_fn, idle_decision_fn, autostop_fn):
         # 依赖注入,避免与 app 循环 import:
         #   sleep_fn(sid)        —— 实际休眠(app.auto_sleep_sandbox),含并发保护 + 二次校验
-        #   idle_seconds_fn(rec) —— 计算空闲秒数(app._idle_seconds)
+        #   idle_decision_fn(rec) —— 多信号空闲裁决(IdleDetector.decide)
         #   autostop_fn(rec)     —— 该沙盒是否 opt-in 自动休眠(app._autostop_enabled)
         self._sleep_fn     = sleep_fn
-        self._idle_fn      = idle_seconds_fn
+        self._decision_fn  = idle_decision_fn
         self._autostop_fn  = autostop_fn
 
     def scan_once(self) -> dict:
@@ -53,8 +52,8 @@ class AutoSleeper:
             if not self._autostop_fn(rec):
                 stats["skipped"] += 1
                 continue
-            idle = self._idle_fn(rec)
-            if idle is None or idle < IDLE_S:
+            decision = self._decision_fn(rec)
+            if not decision.idle:
                 stats["skipped"] += 1
                 continue
             # 空闲达标 → 委托休眠(内部拿 lease 后还会二次校验仍空闲,防竞态)

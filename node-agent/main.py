@@ -640,11 +640,15 @@ def op_resume(body: dict) -> dict:
     # load 时 FC 会重新绑定它)。当 sid(real_id)≠ 快照来源 id 时,vsock 仍绑
     # 在来源目录,需清理来源目录的 v.sock,并在 sid 目录建 symlink 供 exec 用。
     src_dir = os.path.dirname(snap_dir)
-    vsock_bound = f"{src_dir}/v.sock"   # 按目录约定推测的 UDS 路径
-    # 权威来源:直接从快照里抠出固化的 vsock UDS 路径(暖池来源 ≠ sid 目录时,
-    # 仅靠上面的目录约定清不掉真实路径 → "Address in use")。合并成待清理集合。
+    guessed_vsock = f"{src_dir}/v.sock"
+    # 权威来源:直接从快照里抠出固化的 vsock UDS 路径。warm claim 后再次
+    # suspend 时，snap_dir 已是 real_id/snap，但设备仍绑定 warm_id/v.sock；
+    # 只按 snap_dir 推测会漏建 real_id -> warm_id symlink，导致 resume 后 exec 失联。
+    snapshot_vsocks = _vsock_uds_in_snapshot(f"{snap_dir}/vm.snapshot")
+    vsock_bound = snapshot_vsocks[0] if snapshot_vsocks else guessed_vsock
+    # 合并成待清理集合，避免 load 时因残留 socket 报 Address in use。
     stale_vsocks = {f"{d}/v.sock", vsock_bound}
-    stale_vsocks.update(_vsock_uds_in_snapshot(f"{snap_dir}/vm.snapshot"))
+    stale_vsocks.update(snapshot_vsocks)
 
     # rootfs 准备:方案C 下 rootfs 就在状态 EBS 的 {sid}/rootfs.ext4(随卷迁移,含装的软件)。
     # 回退:本地已有→直接用;快照目录里有→复制;都没有→基础镜像 CoW。

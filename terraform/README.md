@@ -1,17 +1,20 @@
 # Terraform —— Claude Code 沙盒 POC 基础设施
 
-所有 AWS 基础设施用 Terraform 管理。按 POC 阶段分目录,逐阶段 apply。
+所有 AWS 基础设施用 Terraform 管理。按阶段逐步 apply；当前主线是裸
+Firecracker，并已把 EKS system 控制面节点与 sandbox 数据面节点分离。
 
 ## 目录结构
 
 ```
 terraform/
-├── phase1/   单 Graviton .metal 主机 + Bedrock IAM 权限 + ECR  → 验 H1(裸 Firecracker + Claude Code)
-├── phase3/   EKS + Kata 节点组 + 共享 NLB/Ingress + ACM       → 验 H3(编排 + 任意端口)  [待补]
-└── (Phase 2/5 复用上面资源,无独立基础设施)
+├── phase1/                单机 Firecracker 实验环境
+├── stage1-dynamodb/       sandbox / events / tap-idx / nodes / locks 状态表
+├── phase3/                EKS + On-Demand system 节点组 + sandbox 节点组 + 持久 EBS
+└── stage2-control-plane/  控制面、node-agent、LiteLLM、Ingress 与对应 IAM/K8s 资源
 ```
 
-> Firecracker 安装、guest 内核、rootfs 构建、microVM 启动是**主机内**操作,不归 Terraform 管 —— 见 `../POC-技术文档.md` 第 3 节。Terraform 只负责 AWS 侧资源。
+> Firecracker 安装、guest 内核、rootfs 构建、microVM 启动是**主机内**操作,不归 Terraform 管 —— 见
+> [`docs/POC-技术文档.md`](../docs/POC-技术文档.md) 第 3 节。Terraform 只负责 AWS 侧资源。
 
 ## Phase 1 —— 立即可用
 
@@ -50,9 +53,21 @@ Phase 1 创建的资源:
 - 安全组:仅放行你的 IP 的 22 口(也挂了 SSM,可免 22 口用 Session Manager 登录)
 - ECR 仓库 `claude-sbx`
 
-## 选择 CPU 架构（Graviton / Intel x86）
+## EKS 控制面 / 数据面分离
 
-所有阶段都支持 `node_arch`，部署时二选一：
+`phase3` 创建两个职责明确的托管节点组：
+
+- `system_arm64`：默认 `2 × m7g.large`，固定 arm64、On-Demand，承载控制面、
+  LiteLLM、Ingress 和系统 Pod。
+- `sandbox_<arch>`：默认 1 台，只承载 node-agent 与 Firecracker microVM；
+  带 `sandbox=true` label 和 `dedicated=sandbox:NoSchedule` taint。
+
+控制面节点不使用 Spot。sandbox 节点未来可单独切 Spot，但应先完成中断消费、
+快照疏散和跨节点恢复自动化；当前 Terraform 仍使用 On-Demand。
+
+## 选择 sandbox 数据节点架构（Graviton / Intel x86）
+
+`node_arch` 只描述 sandbox 数据节点，system 节点始终为 arm64：
 
 | `node_arch` | 默认实例 | 虚拟化方式 | AMI |
 |---|---|---|---|
@@ -76,16 +91,22 @@ Phase 3 默认把沙盒节点钉在 VPC 的第一个可用区，以保证持久�
 若 ASG 报 `InsufficientInstanceCapacity`，可用
 `-var="sandbox_az_index=1"`（region-b）或 `2`（region-c）切换整个节点组所在 AZ。
 
-切到 x86 时，这些会自动随架构变化：AMI、默认实例、Karpenter NodePool 的
-`kubernetes.io/arch`、Firecracker 二进制与 CI 内核下载架构、JuiceFS 元数据 Redis 节点族
-（`t4g`→`t3`）。rootfs 与容器镜像构建须设置 `PLATFORM=linux/amd64`。
+切到 x86 时会变化的是 sandbox AMI、默认实例、Firecracker 二进制与 guest
+内核/rootfs 架构。控制面和 LiteLLM 仍调度到 arm64 system 节点。镜像应分开构建：
+
+```bash
+bash scripts/build_and_push.sh \
+  --control-plane-platform linux/arm64 \
+  --node-agent-platform linux/amd64
+```
 
 > x86 部署前需确认目标区域提供所选 i7i 规格且 `SupportedFeatures` 包含
 > `nested-virtualization`。完整命令见 `docs/deploy.md` Step 0.5。
 
-`i7i.8xlarge` 已在 `us-east-1b` 完成真实 AWS 生命周期与鉴权 E2E；宿主 KVM、
-amd64 guest、持久状态 EBS 和完整清理均通过。详见
-[`docs/i7i-e2e-test-report-2026-08-10.md`](../docs/i7i-e2e-test-report-2026-08-10.md)。
+最终验证在 `sandbox_az_index=2`（`us-east-1c`）完成：`2 × m7g.large`
+system + `1 × i7i.8xlarge` sandbox 的调度隔离、Firecracker 生命周期、
+恢复后 exec、LiteLLM Bedrock 调用、控制面 leader 故障转移和完整清理均通过。
+详见[控制面与数据面分离 i7i 真机测试报告](../docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)。
 
 ## 前置：申请 EC2 vCPU 配额
 
@@ -99,7 +120,12 @@ Phase 1 的 Terraform 给主机挂了 **Bedrock IAM 角色**(对应 POC 文档 1
 
 > ⚠️ 上线前到 Bedrock 控制台 "Model access" 开通 Anthropic 模型,并复制准确的 inference profile ID(us-east-1 通常需 `us.` 跨区前缀)。
 
-## Phase 3(待补)
+## 推荐部署顺序
 
-EKS + `.metal` 托管节点组 + Kata、共享 ingress-nginx(单 NLB)、ACM 通配符证书。
-建议确认 Phase 1(H1)通过、且 Kata+CH 在 arm64 验证可行后再写,避免提前固化未验证的选型。
+1. `stage1-dynamodb`：创建 5 张状态与协调表。
+2. 构建对应数据节点架构的 rootfs 并上传 S3，作为节点初始化输入。
+3. `phase3`：创建 EKS、system/sandbox 节点组和 sandbox 持久状态 EBS。
+4. 分别构建 arm64 控制面镜像和匹配数据节点架构的 node-agent 镜像。
+5. `stage2-control-plane`：部署控制面、node-agent、LiteLLM 和可选 Ingress。
+
+完整变量、验证和销毁步骤以 [`docs/deploy.md`](../docs/deploy.md) 为准。

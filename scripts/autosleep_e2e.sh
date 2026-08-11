@@ -8,6 +8,7 @@
 #   A3  网关透明唤醒:curl /s/{id}/80/ → 首请求触发 resume → 200 且回到 running,last_active_at 刷新
 #   A4  活跃不误睡:持续 exec 保活的沙盒,静置超过 idle 仍 running
 #   A5  手动/自动区分:手动 /suspend 的沙盒 → suspended;网关 curl 不唤醒它(409/非200)
+#   A6  WebSocket 长连接持续超过 idle 阈值不休眠;断开后才进入 slept
 #
 # 前提：
 #   1. FC 模式控制面【已部署本 feature 的镜像】(含 autosleep.py + slept 状态)
@@ -28,6 +29,7 @@ IDLE="${AUTO_SLEEP_IDLE_S:-30}"       # 与控制面部署的 AUTO_SLEEP_IDLE_S 
 NAMESPACE="sandbox-system"
 LOCAL_PORT=18000
 PF_PID=""
+WS_PID=""
 IMAGE="web"                            # 自起 :80,便于 A3 网关唤醒后验证页面
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -62,6 +64,7 @@ teardown() {
   for id in "${CREATED_IDS[@]:-}"; do
     [[ -n "$id" ]] && curl -s ${AUTH[@]+"${AUTH[@]}"} -X DELETE "${API_URL}/sandboxes/${id}" >/dev/null 2>&1
   done
+  [[ -n "$WS_PID" ]] && kill "$WS_PID" 2>/dev/null || true
   [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null || true
 }
 trap teardown EXIT
@@ -170,6 +173,47 @@ if [[ "$(jq_get state)" == "running" ]]; then
   pass "保活沙盒静置 ${KEEP}s 仍 running(未被误睡)"
 else
   fail "保活沙盒被误睡:state=$(jq_get state)"
+fi
+
+# ---- A6: WebSocket 长连接阻止休眠,断开后允许休眠 ----
+info "A6: WebSocket 长连接持续超过 idle 阈值不休眠,断开后才休眠"
+WS_CMD="setsid /usr/local/bin/python3 -c \"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',8080)); s.listen(); c,_=s.accept(); time.sleep(300)\" >/tmp/ws-hold.log 2>&1 </dev/null & echo \$! >/tmp/ws-hold.pid"
+call POST "/sandboxes/${SID2}/exec" "$(python3 -c 'import json,sys; print(json.dumps({"cmd": sys.argv[1]}))' "$WS_CMD")"
+if [[ "$CODE" != "200" ]] || ! echo "$BODY" | grep -q '"rc": 0'; then
+  fail "WebSocket 测试服务启动命令失败(code=$CODE):$BODY"
+  exit "$FAILED"
+fi
+sleep 2
+call POST "/sandboxes/${SID2}/exec" '{"cmd":"kill -0 $(cat /tmp/ws-hold.pid) && ss -ltn | grep -q \":8080 \" && echo ws-listening"}'
+if [[ "$CODE" != "200" ]] || ! echo "$BODY" | grep -q 'ws-listening'; then
+  fail "WebSocket 测试服务未监听 8080:$BODY"
+  exit "$FAILED"
+fi
+curl --http1.1 -sN --max-time "$((IDLE + 30))" \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  "${API_URL}/s/${SID2}/8080/ws" >/tmp/as-ws-client.log 2>&1 &
+WS_PID=$!
+sleep 2
+if ! kill -0 "$WS_PID" 2>/dev/null; then
+  fail "WebSocket 客户端未建立长连接:$(cat /tmp/as-ws-client.log 2>/dev/null)"
+  WS_PID=""
+  exit "$FAILED"
+fi
+sleep "$((IDLE + 8))"
+call GET "/sandboxes/${SID2}"
+if [[ "$(jq_get state)" == "running" ]]; then
+  pass "WebSocket 已连接 $((IDLE + 10))s,沙盒仍 running"
+else
+  fail "WebSocket 活跃期间被误睡:state=$(jq_get state)"
+fi
+kill "$WS_PID" 2>/dev/null || true
+wait "$WS_PID" 2>/dev/null || true
+WS_PID=""
+if wait_state "$SID2" "slept" "$((IDLE + 60))"; then
+  pass "WebSocket 断开后按 idle 阈值进入 slept"
+else
+  call GET "/sandboxes/${SID2}"
+  fail "WebSocket 断开后未进入 slept:state=$(jq_get state)"
 fi
 
 # ---- A5: 手动 suspend 不被网关唤醒 ----
