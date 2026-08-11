@@ -12,12 +12,12 @@ sandbox-api/
   warm_pool.py      # 暖池(预快照 + resume 秒级 create)
   drivers/
     firecracker.py  # FirecrackerDriver → node-agent HTTP API
-  Dockerfile        # 控制面镜像(arm64)
+  Dockerfile        # 控制面镜像(固定 arm64 system 节点)
   smoke_test.py     # 本地冒烟测试(moto mock,无需真实 AWS)
 
 node-agent/
   main.py           # on-host 执行手(tap/jailer/FC snapshot/S3)
-  Dockerfile        # node-agent 镜像(arm64)
+  Dockerfile        # node-agent 镜像(跟随 sandbox 数据节点架构)
 ```
 
 ## API 接口
@@ -52,6 +52,10 @@ python3 sandbox-api/smoke_test.py
 # EKS 集群(若未建,见 terraform/phase3)
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 
+# phase3 创建独立节点池：
+# - On-Demand Graviton system 节点：控制面、LiteLLM、Ingress
+# - c6g.metal/i7i sandbox 节点：node-agent + Firecracker
+
 # DynamoDB 表
 cd terraform/stage1-dynamodb && terraform apply
 ```
@@ -59,7 +63,9 @@ cd terraform/stage1-dynamodb && terraform apply
 ### 2. 构建并推送镜像
 
 ```bash
-bash scripts/build_and_push.sh
+bash scripts/build_and_push.sh \
+  --control-plane-platform linux/arm64 \
+  --node-agent-platform <linux/arm64|linux/amd64>
 # 输出 ECR URL 用于下一步
 ```
 
@@ -76,8 +82,9 @@ terraform apply \
 ### 4. 端到端测试
 
 ```bash
-# 需 .metal 节点 + node-agent 就绪
-bash scripts/e2e_test.sh
+# 需 sandbox 节点 + node-agent 就绪；生产配置必须传 API key。
+# 脚本覆盖 suspend/resume 后再次 exec，确认恢复后的 vsock 路径与状态可用。
+bash scripts/e2e_test.sh --api-key "$API_KEY"
 ```
 
 ## 关键环境变量
@@ -89,7 +96,9 @@ bash scripts/e2e_test.sh
 | SANDBOX_IMAGE | (必填) | 沙盒容器镜像 |
 | LITELLM_URL | http://litellm... | LiteLLM 网关(凭据隔离) |
 | SANDBOX_DOMAIN | sbx.example.com | 通配符子域名根 |
-| SNAPSHOT_S3_BUCKET | | 快照存储桶(FC 模式) |
-| FC_NODES | | node-agent IP 列表,逗号分隔 |
+| SNAPSHOT_S3_BUCKET | | rootfs 分发及未来 S3 归档预留；当前快照权威存储是持久 EBS |
+| FC_NODES | | 心跳表为空时的 fallback；只填 `sandbox=true` 节点内网 IP |
 | WARM_POOL_SIZE | 5 | 暖池沙盒数 |
 | NODE_AGENT_PORT | 8002 | node-agent 监听端口 |
+
+本地测试当前期望 `50/50 PASS`；真实 E2E 还应验证 resume 后 exec 和状态保留。

@@ -8,10 +8,6 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
 
 RUN pip install --no-cache-dir boto3
 
-# 里程碑 B: 内置 exec 私钥(POC;生产应用 K8s Secret 挂载而非打进镜像)
-COPY sbx_exec_key /root/.ssh/id_ed25519
-RUN chmod 600 /root/.ssh/id_ed25519
-
 WORKDIR /app
 COPY main.py /app/
 

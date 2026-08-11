@@ -12,7 +12,7 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
 - **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
-- **Graviton or x86**: choose `c6g.metal` on Graviton, or any nested-virtualization-capable `i7i.*` size on Intel x86 (`i7i.8xlarge` by default); see the [live i7i E2E report](docs/i7i-e2e-test-report-2026-08-10.md)
+- **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes using `c6g.metal` or nested-virtualization-capable Intel i7i (`i7i.8xlarge` by default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
@@ -60,7 +60,7 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 | **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
 | **Data sovereignty** | ✅ Stays in your AWS account | ❌ 3rd party | ❌ 3rd party | ✅ |
 | **K8s ecosystem** | ✅ Native | ❌ | ❌ | ❌ |
-| **Min. monthly cost (1 machine)** | **~$632/mo** (spot + snapshot recovery) | Managed pricing | Managed pricing | Per-call |
+| **Min. monthly cost (2 system + 1 sandbox node)** | **~$751/mo target** (sandbox Spot + On-Demand system) | Managed pricing | Managed pricing | Per-call |
 
 #### Auto-sleep / auto-wake (fly.io-style)
 
@@ -75,22 +75,23 @@ Idle sandboxes snapshot themselves to a distinct `slept` state (freeing RAM); th
 ### Architecture
 
 ```
-┌─ EKS cluster ───────────────────────────────────────────────────────────┐
-│                                                                           │
-│  Managed node group (system)      Firecracker sandbox nodes             │
-│                                   c6g.metal or i7i.*                    │
-│  ┌────────────────────────────┐   ┌──────────────────────────────────┐  │
-│  │ sandbox-control-plane      │   │  Firecracker microVM             │  │
-│  │ (Deployment, IRSA)         │──►│  node-agent DaemonSet            │  │
-│  │  FirecrackerDriver         │   │  jailer / tap / snapshot / S3    │  │
-│  │  WarmPool                  │   └──────────────────────────────────┘  │
-│  │  Stateless → DynamoDB      │                                          │
-│  └────────────────────────────┘                                          │
-│        ↑ ingress-nginx (NLB)                                             │
-│        api.sbx.<domain>  ←── production (POC: use port-forward)         │
-│                                                                           │
-│  DynamoDB   LiteLLM (Bedrock proxy)                                       │
-└──────────────────────────────────────────────────────────────────────────┘
+┌─ EKS cluster ─────────────────────────────────────────────────────────┐
+│                                                                       │
+│  system node group (On-Demand)   sandbox data node group             │
+│  Graviton m7g (2 by default)     c6g.metal or i7i.*                  │
+│  ┌───────────────────────────┐    ┌───────────────────────────────┐  │
+│  │ sandbox-control-plane     │HTTP│ Firecracker microVM           │  │
+│  │ (2 replicas, IRSA)        │───►│ node-agent DaemonSet          │  │
+│  │ FirecrackerDriver         │◄───│ jailer / tap / snapshot       │  │
+│  │ WarmPool + Reconciler     │ HB │ nodes heartbeat every 30s    │  │
+│  │ Stateless → DynamoDB      │    └───────────────────────────────┘  │
+│  └───────────────────────────┘                                       │
+│  CoreDNS / LiteLLM / Ingress     taint: dedicated=sandbox           │
+│       ↑ ingress-nginx (NLB)      (no ordinary Pods on data nodes)   │
+│       api.sbx.<domain> (POC: use port-forward)                       │
+│                                                                       │
+│  DynamoDB: sandboxes / events / tap-idx / nodes / locks             │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Quick Start (Agent Deployment Guide)
@@ -104,7 +105,7 @@ Follow these steps exactly, debugging any errors before proceeding.
 [Prerequisites]
 - AWS CLI configured (IAM permissions: EKS, EC2, IAM, DynamoDB, ECR, S3)
 - kubectl, terraform(>=1.5), helm, git installed
-- EC2 vCPU quota for the selected host (`c6g.metal`=64, `i7i.8xlarge`=32)
+- EC2 vCPU quota for the selected sandbox host (`c6g.metal`=64, `i7i.8xlarge`=32)
 
 [Step 0: Clone the repository]
 git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
@@ -116,7 +117,7 @@ cd terraform/stage1-dynamodb
 terraform init && terraform apply -auto-approve
 aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 
-[Step 2: Create EKS cluster + Firecracker sandbox node group]
+[Step 2: Create EKS cluster + separated system and sandbox node groups]
 cd ../phase3
 MY_IP=$(curl -s https://checkip.amazonaws.com)
 # Choose one:
@@ -129,15 +130,18 @@ terraform init && terraform apply -auto-approve \
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-# (No RuntimeClass / ingress-nginx / Karpenter needed; phase3 supplies the sandbox node group.)
+# phase3 creates an On-Demand arm64 system group and a dedicated sandbox group.
+# node_arch describes only the sandbox group; the system group remains arm64 On-Demand.
 
 [Step 5: Build and push matching-architecture images]
 # Note: the sandbox image repo claude-sbx is auto-created by phase3 (Step 2); only create these two:
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
-PLATFORM=$([ "$NODE_ARCH" = "amd64" ] && echo linux/amd64 || echo linux/arm64)
-bash scripts/build_and_push.sh --platform "$PLATFORM"
+NODE_AGENT_PLATFORM=$([ "$NODE_ARCH" = "amd64" ] && echo linux/amd64 || echo linux/arm64)
+bash scripts/build_and_push.sh \
+  --control-plane-platform linux/arm64 \
+  --node-agent-platform "$NODE_AGENT_PLATFORM"
 
 [Step 6: Deploy control plane + node-agent + LiteLLM]
 # FC_NODES: internal IPs of stable sandbox nodes
@@ -146,7 +150,8 @@ cd terraform/stage2-control-plane && terraform init
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
-FC_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
+FC_NODES=$(kubectl get nodes -l sandbox=true \
+  -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
 API_KEY=$(openssl rand -hex 32); LITELLM_KEY=$(openssl rand -hex 32)
 terraform apply -auto-approve \
   -var="fc_nodes=${FC_NODES}" \
@@ -181,11 +186,11 @@ kubectl rollout status deployment/litellm -n litellm --timeout=300s
 #   terraform state rm kubernetes_deployment.litellm kubernetes_deployment.control_plane
 #   then re-run terraform apply
 
-kubectl get pods -n sandbox-system   # control-plane 2/2 + node-agent (DaemonSet, one per .metal node)
+kubectl get pods -n sandbox-system   # control-plane 2/2 on system nodes + node-agent on sandbox nodes
 kubectl get pods -n litellm           # litellm 1/1
 
 # ── Recommended: local port-forward mode (no DNS/Ingress; measured ALL TESTS PASSED) ──
-bash scripts/e2e_test.sh
+bash scripts/e2e_test.sh --api-key "$API_KEY"
 # Expected: script ends with ALL TESTS PASSED (some tests skip depending on driver)
 
 # ── Production Ingress (optional) ──
@@ -275,15 +280,27 @@ cd ../stage1-dynamodb && terraform destroy -auto-approve
 # Clean up leftovers that destroy won't remove but that block a future re-create:
 aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
-# S3 snapshot bucket (optional): aws s3 rb s3://my-sandbox-snapshots-$(aws sts get-caller-identity --query Account --output text) --force --region us-east-1 2>/dev/null || true
+aws ecr delete-repository --repository-name sandbox-control-plane --force --region us-east-1 2>/dev/null || true
+aws ecr delete-repository --repository-name node-agent --force --region us-east-1 2>/dev/null || true
+# Also delete available sandbox state volumes tagged for this cluster. They intentionally use
+# delete_on_termination=false and therefore can survive node-group destruction.
+for vol in $(aws ec2 describe-volumes --region us-east-1 \
+    --filters "Name=status,Values=available" \
+      "Name=tag:eks:cluster-name,Values=claude-sbx" \
+      "Name=tag:Name,Values=sandbox_*" \
+    --query 'Volumes[].VolumeId' --output text); do
+  aws ec2 delete-volume --region us-east-1 --volume-id "$vol"
+done
+# Remove only the rootfs object uploaded by this run; do not empty a shared historical bucket.
+# aws s3 rm "s3://${S3_BUCKET}/${ROOTFS_KEY}" --region us-east-1
 ```
 
 ### Operations Prompt
 
 ```
 You are the ops engineer for this AWS sandbox platform. Platform overview:
-- EKS cluster claude-sbx, c6g.metal or i7i sandbox nodes, Firecracker microVM + node-agent DaemonSet
-- Control plane: sandbox-system namespace, Deployment 2 replicas
+- EKS cluster claude-sbx with a separate On-Demand Graviton system group and c6g.metal/i7i sandbox group
+- Control plane: sandbox-system namespace, 2 replicas pinned to system nodes
   External access: http://api.sbx.<domain> (ingress-nginx NLB; POC use port-forward)
 - State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx / nodes / locks)
 - Credential isolation: LiteLLM (litellm namespace) holds Bedrock IRSA; sandboxes have no credentials
@@ -296,7 +313,7 @@ Common ops tasks:
 3. View nodes:            kubectl get nodes -o wide
 4. View LiteLLM logs:     kubectl logs -n litellm deployment/litellm --tail=50
 5. DynamoDB item count:   aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
-6. Update images:         bash scripts/build_and_push.sh
+6. Update images:         bash scripts/build_and_push.sh --control-plane-platform linux/arm64 --node-agent-platform <sandbox-platform>
                           kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
 7. Scale node capacity:   adjust phase3 `sandbox_node_count` and terraform apply
 8. Cost optimization — bulk-suspend idle sandboxes:
@@ -313,22 +330,25 @@ Monitoring:
 
 ---
 
-### Cost Breakdown (Minimum Setup — 1 × c6g.metal, us-east-1)
+### Cost Breakdown (Minimum Setup — 2 system nodes + 1 × c6g.metal sandbox, us-east-1)
 
 | Resource | Unit Price | Monthly (730h) |
 |---|---|---|
 | c6g.metal (64 vCPU / 128 GiB) **spot** (platform target mode) | ~$0.67/hr (us-east-1a live, ~29% of on-demand) | **~$486** |
 | c6g.metal on-demand (baseline for comparison) | $2.304/hr | ~$1,682 |
+| System nodes (2 × m7g.large, On-Demand) | ~$0.0816/hr each | ~$119 |
 | EKS control plane | $0.10/hr | ~$73 |
 | DynamoDB (PAY_PER_REQUEST) | per write | <$1 |
 | Persistent state EBS (gp3 400GB / 4000 IOPS / 1000MB/s, one per node, holds memory snapshots) | $32 storage + $5 IOPS + $35 throughput | ~$72/node |
-| **Total (on-demand)** | | **~$1,828/mo** |
-| **Total (on-demand + 1-yr Savings Plan ~42% off, compute only)** | | **~$1,122/mo** |
-| **Total (spot + snapshot recovery, platform target mode)** | | **~$632/mo** |
+| **Total (on-demand)** | | **~$1,947/mo** |
+| **Total (on-demand + 1-yr Savings Plan ~42% off, compute only)** | | **~$1,191/mo** |
+| **Total (sandbox Spot + On-Demand system, target mode)** | | **~$751/mo** |
 
 > **Spot is the platform's core cost model**: c6g.metal spot ≈ 29% of on-demand (measured us-east-1 AZs $0.65–$0.74/hr, queried 2026-07);
 > when spot is reclaimed, snapshot evacuation + cross-node recovery preserves memory state (see the 50-sandbox test below). **Spot prices fluctuate** — use live quotes.
 > Without spot, on-demand can use a 1-yr Savings Plan for ~42% off. Use [AWS Pricing Calculator](https://calculator.aws) for exact figures.
+> Keep system nodes On-Demand. Move only sandbox data nodes to Spot after interruption handling,
+> snapshot evacuation, and cross-node recovery are fully automated.
 
 **Per-sandbox amortized cost (single c6g.metal, 128 GiB):**
 
@@ -351,8 +371,9 @@ Monitoring:
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| Smoke tests | **48/48 PASS** | moto mock, `sandbox-api/smoke_test.py` |
-| i7i x86 lifecycle | **ALL TESTS PASSED** | `i7i.8xlarge`, create/exec/suspend/resume/destroy/auth |
+| Smoke tests | **50/50 PASS** | moto mock, `sandbox-api/smoke_test.py` |
+| Control/data plane separation | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
+| i7i x86 lifecycle | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 
 #### Snapshot persistence & cross-node recovery (current state — please read)
 
@@ -382,7 +403,7 @@ To avoid misunderstanding vs. the implementation, the current boundaries:
 ```bash
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# Expected: 48/48 PASS
+# Expected: 50/50 PASS
 ```
 
 ---

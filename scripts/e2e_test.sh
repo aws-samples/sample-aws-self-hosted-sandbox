@@ -211,7 +211,8 @@ fi
 
 # ---- T9: exec ----
 info "T9: Exec in sandbox"
-call POST "/sandboxes/${SID}/exec" '{"cmd":"echo sandbox-ok"}'
+call POST "/sandboxes/${SID}/exec" \
+  '{"cmd":"echo sandbox-ok; printf e2e-resume-proof > /tmp/e2e-resume-proof"}'
 if [[ "$CODE" == "200" ]]; then
   STDOUT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('stdout',''))" 2>/dev/null || echo "")
   pass "POST /exec → 200 (stdout='$STDOUT')"
@@ -236,6 +237,16 @@ if [[ "$SUPPORTS_SR" == "True" ]]; then
       RT=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('restore_time_s','?'))" 2>/dev/null || echo "?")
       pass "POST /resume → 200 (restore_time=${RT}s)"
       wait_state "$SID" "running" 30
+
+      # state=running 只证明 Firecracker API load 成功；恢复后的 guest/vsock
+      # 仍可能不可用。必须再次 exec，并验证 suspend 前写入的内存/磁盘状态。
+      call POST "/sandboxes/${SID}/exec" '{"cmd":"cat /tmp/e2e-resume-proof"}'
+      POST_RESUME_STDOUT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('stdout',''))" 2>/dev/null || echo "")
+      if [[ "$CODE" == "200" && "$POST_RESUME_STDOUT" == "e2e-resume-proof" ]]; then
+        pass "POST-resume exec → 200 (state preserved)"
+      else
+        fail "POST-resume exec → $CODE: $BODY"
+      fi
     else
       fail "POST /resume → $CODE: $BODY"
     fi

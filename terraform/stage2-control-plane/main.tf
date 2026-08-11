@@ -540,6 +540,22 @@ resource "kubernetes_deployment" "control_plane" {
       metadata { labels = { app = "sandbox-control-plane", fargate = "true" } }
       spec {
         service_account_name = kubernetes_service_account.control_plane.metadata[0].name
+        # 默认固定到 On-Demand Graviton system 节点。enable_fargate=true 时由
+        # Fargate Profile 接管该 Pod，不能再要求 EC2 节点 label。
+        node_selector = var.enable_fargate ? {} : { "workload-tier" = "system" }
+        affinity {
+          pod_anti_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 100
+              pod_affinity_term {
+                topology_key = "kubernetes.io/hostname"
+                label_selector {
+                  match_labels = { app = "sandbox-control-plane" }
+                }
+              }
+            }
+          }
+        }
         container {
           name    = "api"
           image   = var.control_plane_image
@@ -596,6 +612,19 @@ resource "kubernetes_service" "control_plane" {
   }
 }
 
+resource "kubernetes_pod_disruption_budget_v1" "control_plane" {
+  metadata {
+    name      = "sandbox-control-plane"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = "sandbox-control-plane" }
+    }
+  }
+}
+
 # ---------- Kubernetes: node-agent DaemonSet(Firecracker 沙盒节点专用) ----------
 
 resource "kubernetes_daemon_set_v1" "node_agent" {
@@ -611,6 +640,12 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
         service_account_name = kubernetes_service_account.node_agent.metadata[0].name
         # 只调度到 Firecracker 沙盒节点
         node_selector = { sandbox = "true" }
+        toleration {
+          key      = "dedicated"
+          operator = "Equal"
+          value    = "sandbox"
+          effect   = "NoSchedule"
+        }
         # 需要 hostNetwork + hostPID 才能操作 tap/Firecracker
         host_network = true
         host_pid     = true
@@ -738,6 +773,10 @@ resource "helm_release" "ingress_nginx" {
   set {
     name  = "controller.ingressClassResource.default"
     value = "true"
+  }
+  set {
+    name  = "controller.nodeSelector.workload-tier"
+    value = "system"
   }
 }
 

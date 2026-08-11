@@ -20,6 +20,11 @@ node-agent，不依赖 K8s 编排沙盒本身。
 
 x86 支持所有 `i7i.*` 规格，可用 `sandbox_instance_type` 覆盖；默认选 `i7i.8xlarge`。
 
+无论选择哪种数据节点，Terraform 都会另外创建至少 2 台 On-Demand Graviton
+system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点带
+`dedicated=sandbox:NoSchedule` taint，只承载 node-agent 与 Firecracker microVM。
+`node_arch` 描述的是数据节点，不是整个 EKS 集群。
+
 > （历史上曾有可插拔的 Kata-on-EKS 后端，因无法快照/恢复、与本平台 spot 疏散核心诉求不符，已移除。
 > 本手册即 Firecracker 单一主线，无需再选 driver。）
 
@@ -42,7 +47,8 @@ x86 支持所有 `i7i.*` 规格，可用 `sandbox_instance_type` 覆盖；默认
 3. **`fc_nodes` 是 fallback，节点发现优先走 DynamoDB 心跳表**：P0 加固后 node-agent 每 30s 写 `claude-sbx-nodes` 表，控制面 `_pick_node` 优先从心跳表选活节点（按 `last_seen` 超时剔除死节点），`fc_nodes` 仅在心跳表为空时兜底。**首次部署 fc_nodes 仍建议只填稳定节点**（心跳还没写起来时靠它），但节点增减后无需再改 `fc_nodes` + 重启控制面——心跳表会自动反映。查活节点：`aws dynamodb scan --table-name claude-sbx-nodes --query 'Items[].{node:node_id.S,last_seen:last_seen.S}'`。
 4. **rootfs 必须是含 vsock agent 的 min-rootfs**：exec 走 vsock 通道，需要 `scripts/build-min-rootfs.sh` 产出的 rootfs（内含 `/sbin/vsock-exec-agent.py`，sbxinit 后台启动）。**别用 phase3 `rootfs_s3_uri` 的默认 juicefs 版**——apply phase3 时必须显式传 `-var="rootfs_s3_uri=s3://<bucket>/rootfs/min-rootfs.tar.gz"`（见 Step 1.5 + Step 2）。
 5. **节点反复 NotReady / ASG 替换循环**：`c6g.metal` 过 EC2 status check 需 5-10 分钟，而 EKS 托管节点组 ASG 默认 grace period 过短。`terraform/phase3/main.tf` 已用 `null_resource.sandbox_asg_grace_period` 固化为 900s。若仍反复替换，检查 ASG activity、EC2 status check 和 grace period。
-6. **镜像与 rootfs 架构必须一致**：Graviton 用 `linux/arm64`，i7i 用 `linux/amd64`。构建脚本通过 `PLATFORM` 选择目标架构。
+6. **异构镜像必须分别构建**：控制面固定用 `linux/arm64`；node-agent 与 rootfs 跟随 sandbox 数据节点，Graviton 用 `linux/arm64`，i7i 用 `linux/amd64`。不要用一个共享 `--platform` 把控制面也构建成 amd64。
+7. **system 节点必须保持 On-Demand**：未来可为 sandbox 数据面增加 Spot 池，但控制面、LiteLLM、Ingress 与 CoreDNS 不应跟随 Spot 中断。
 8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
@@ -66,6 +72,8 @@ export AWS_REGION=us-east-1
 export NODE_ARCH=arm64
 export SANDBOX_INSTANCE_TYPE=c6g.metal
 export SANDBOX_AZ_INDEX=0
+export SYSTEM_INSTANCE_TYPE=m7g.large
+export SYSTEM_NODE_COUNT=2
 
 # Intel x86（默认 i7i.8xlarge；其他 i7i 规格也支持）
 # export NODE_ARCH=amd64
@@ -108,11 +116,6 @@ cd ../..   # 回到仓库根
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET="my-sandbox-snapshots-${ACCT}"
 aws s3 mb "s3://${BUCKET}" --region us-east-1 2>/dev/null || true
-
-# SSH 兜底通道用的密钥（vsock 主通道不依赖它，但脚本要求存在；已被 .gitignore 忽略）
-mkdir -p .sbxkeys
-[ -f .sbxkeys/sbx_exec ] || ssh-keygen -t ed25519 -N "" -f .sbxkeys/sbx_exec -C sbx-exec
-cp .sbxkeys/sbx_exec node-agent/sbx_exec_key   # node-agent 镜像构建需要（Dockerfile COPY）
 
 # 按架构隔离 S3 key，避免 arm64 / amd64 rootfs 相互覆盖
 if [ "$NODE_ARCH" = "amd64" ]; then
@@ -164,6 +167,8 @@ terraform init && terraform apply -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
   -var="sandbox_az_index=${SANDBOX_AZ_INDEX}" \
+  -var="system_instance_type=${SYSTEM_INSTANCE_TYPE}" \
+  -var="system_node_count=${SYSTEM_NODE_COUNT}" \
   -var="rootfs_s3_uri=s3://${BUCKET}/${ROOTFS_KEY}" \
   -var="rootfs_images=web" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
@@ -200,12 +205,16 @@ ACCT=$(aws sts get-caller-identity --query Account --output text)
 aws ecr create-repository --repository-name sandbox-control-plane --region us-east-1 2>/dev/null || true
 aws ecr create-repository --repository-name node-agent --region us-east-1 2>/dev/null || true
 
-# PLATFORM 已在 Step 1.5 按 NODE_ARCH 设置
-# 前置：Step 1.5 已生成 node-agent/sbx_exec_key（Dockerfile COPY 需要），否则镜像构建失败
-bash scripts/build_and_push.sh --platform "${PLATFORM}"
+# 控制面运行在 Graviton system 节点；node-agent 跟随 sandbox 数据节点。
+bash scripts/build_and_push.sh \
+  --control-plane-platform linux/arm64 \
+  --node-agent-platform "${PLATFORM}"
 
 # 也可在目标架构 EC2 上原生构建
 ```
+
+node-agent 镜像不包含 SSH 私钥，exec 默认使用 vsock。若确需 SSH fallback，应在
+运行时通过 Kubernetes Secret 只读挂载 `/root/.ssh/id_ed25519`，不要写入镜像层。
 
 ---
 
@@ -224,8 +233,10 @@ API_KEY=$(openssl rand -hex 32)
 LITELLM_KEY=$(openssl rand -hex 32)
 echo "API_KEY: $API_KEY  （保存好，后续 curl 鉴权用）"
 
-# FC 模式关键：拿【稳定 Ready】的沙盒节点内网 IP 拼 fc_nodes
-FC_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
+# FC 模式关键：只从【稳定 Ready】的 sandbox 数据节点取内网 IP
+FC_NODES=$(kubectl get nodes -l sandbox=true \
+  -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' \
+  | sed 's/,$//')
 echo "FC_NODES=$FC_NODES  （若含 NotReady 节点，手动改成只留稳定的）"
 
 terraform apply -auto-approve \
@@ -247,7 +258,10 @@ terraform apply -auto-approve \
 # - api-keys Secret + ConfigMap（FC_NODES 经 env_from 注入控制面）
 ```
 
-> ⚠️ **FC_NODES 只填稳定节点**：控制面 `_pick_node` 串行探每个节点 `/health`，遇不可达节点阻塞最长 120s（表现为 create "卡住无响应"）。若节点抖动，先 `kubectl get nodes` 确认，只把稳定的 IP 传给 `fc_nodes`。改完可热更新：`kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
+> ⚠️ **FC_NODES 只填稳定的 sandbox 节点**：不能使用无 label 的 `kubectl get nodes`，
+> 否则会把 system 节点误当 Firecracker 宿主。控制面 `_pick_node` 串行探每个节点
+> `/health`，遇不可达节点会阻塞。改完可热更新：
+> `kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定数据节点IP>`。
 >
 > **常见问题：** Terraform `Unexpected Identity Change` 错误 → 清理 state 重试：
 > ```bash
@@ -363,9 +377,10 @@ echo "NLB: $NLB_HOST"
 
 ## Step 9: 验证部署（Firecracker）
 
-> 已验证配置：`node_arch=amd64`、`sandbox_instance_type=i7i.8xlarge`、
-> `sandbox_az_index=1`。完整宿主、guest、生命周期和清理证据见
-> [i7i 真机测试报告](i7i-e2e-test-report-2026-08-10.md)。
+> 已验证配置：On-Demand system=`2 × m7g.large`，sandbox=`i7i.8xlarge`、
+> `node_arch=amd64`、`sandbox_az_index=2`。`us-east-1a/1b` 容量不足后，
+> `us-east-1c` 创建成功。完整调度、宿主、guest、生命周期、Bedrock 和故障转移证据见
+> [控制面与数据面分离 i7i 真机测试报告](控制面数据面分离-i7i真机测试报告-2026-08-11.md)。
 
 ```bash
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
@@ -382,6 +397,8 @@ curl -s $BASE/capabilities ; echo   # {"driver":"firecracker","suspend_resume":t
 
 # 端到端测试（FC 模式）
 bash scripts/e2e_test.sh --driver firecracker --api-url "$BASE" --api-key "$API_KEY"
+# 通过标准包含 resume 后再次 exec，并读取 suspend 前写入的 marker；只看到
+# state=running 不足以证明 guest/vsock 已恢复。
 
 # 手动验证 vsock exec 在 microVM 内执行（复现实测报告 §八）
 SID=$(curl -s -X POST $BASE/sandboxes -H "Authorization: Bearer $API_KEY" \
@@ -576,6 +593,8 @@ cd ../phase3 && terraform destroy -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
   -var="sandbox_az_index=${SANDBOX_AZ_INDEX}" \
+  -var="system_instance_type=${SYSTEM_INSTANCE_TYPE}" \
+  -var="system_node_count=${SYSTEM_NODE_COUNT}" \
   -var="rootfs_s3_uri=s3://my-sandbox-snapshots-${ACCT}/${ROOTFS_KEY}" \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # VPC 删除卡住 >5min → 删 eks-cluster-sg：
@@ -591,16 +610,30 @@ cd ../phase3 && terraform destroy -auto-approve \
 # 确认 endpoint 属于本次待删除 VPC 后，删除它并重新执行 phase3 destroy：
 #   aws ec2 delete-vpc-endpoints --region "$AWS_REGION" --vpc-endpoint-ids <vpce-id>
 
-# 5. 删 DynamoDB（建议彻底删，不要保留）
+# 5. 显式删除 delete_on_termination=false 遗留的 sandbox 状态 EBS。
+#    只删已 available、且带本集群和 sandbox 节点组标签的卷。
+for vol in $(aws ec2 describe-volumes --region "$AWS_REGION" \
+    --filters "Name=status,Values=available" \
+      "Name=tag:eks:cluster-name,Values=claude-sbx" \
+      "Name=tag:Name,Values=sandbox_*" \
+    --query 'Volumes[].VolumeId' --output text); do
+  aws ec2 delete-volume --region "$AWS_REGION" --volume-id "$vol"
+done
+
+# 6. 删 DynamoDB（建议彻底删，不要保留）
 #    stage1 共 5 张表：sandboxes / events / tap-idx / nodes / locks
 #    ⚠️ 彻底删而非保留 —— 保留会遗留上一轮脏数据：旧沙盒记录(下次重建后节点 IP 全变、
 #       reconcile 起来会把它们全标 orphaned)、旧 node 心跳、locks 锁、tap_idx counter
 #       接着上次的值继续涨。重建仅需 ~10s（PAY_PER_REQUEST 空表零费用），无保留的理由。
 cd ../stage1-dynamodb && terraform destroy -auto-approve
 
-# 6. 清理残留（不清理会阻塞下次重建）
+# 7. 清理残留（不清理会阻塞下次重建）
 aws logs delete-log-group --log-group-name /aws/eks/claude-sbx/cluster --region us-east-1 2>/dev/null || true
 aws ecr delete-repository --repository-name claude-sbx --force --region us-east-1 2>/dev/null || true
+aws ecr delete-repository --repository-name sandbox-control-plane --force --region us-east-1 2>/dev/null || true
+aws ecr delete-repository --repository-name node-agent --force --region us-east-1 2>/dev/null || true
+# 只删除本轮上传的架构 rootfs；不要无条件清空可能含历史快照的共享 bucket。
+aws s3 rm "s3://${S3_BUCKET}/${ROOTFS_KEY}" --region us-east-1 2>/dev/null || true
 # aws s3 rb s3://${S3_BUCKET} --force --region us-east-1 2>/dev/null || true
 ```
 

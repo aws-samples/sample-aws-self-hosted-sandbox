@@ -1,6 +1,7 @@
-# Phase 3 基础设施 —— EKS 集群 + Firecracker 沙盒节点组 + 持久状态 EBS
+# Phase 3 基础设施 —— EKS 集群 + system 节点组 + Firecracker 沙盒节点组 + 持久状态 EBS
 #
-# 目标:用 Terraform 管理 EKS 控制平面 + 一个沙盒节点组(打 sandbox=true label)。
+# 目标:用 Terraform 管理 EKS 控制平面 + On-Demand Graviton system 节点组
+#      + 沙盒数据节点组(打 sandbox=true label/taint)。
 #       控制面 / node-agent / LiteLLM 等集群内资源由 stage2-control-plane 部署,不归此处。
 #
 # 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或
@@ -71,6 +72,26 @@ variable "sandbox_node_count" {
   description = "沙盒节点常驻台数(min=max=desired)。成本优先默认 1 台；跨机快照/spot 疏散演示需设为 2。"
 }
 
+variable "system_instance_type" {
+  type        = string
+  default     = "m7g.large"
+  description = "承载业务控制面、LiteLLM、Ingress 和集群系统 Pod 的 On-Demand Graviton 实例类型。"
+  validation {
+    condition     = can(regex("^(m|c|r)[0-9]+g[a-z]*\\.", var.system_instance_type))
+    error_message = "system_instance_type 必须是 Graviton 实例，例如 m7g.large。"
+  }
+}
+
+variable "system_node_count" {
+  type        = number
+  default     = 2
+  description = "On-Demand system 节点数。POC/测试默认 2；生产建议 3 并跨 3 AZ。"
+  validation {
+    condition     = var.system_node_count >= 2
+    error_message = "system_node_count 至少为 2，避免业务控制面与系统组件形成单节点故障域。"
+  }
+}
+
 variable "sandbox_az_index" {
   type        = number
   default     = 0
@@ -109,7 +130,7 @@ variable "endpoint_public_access_cidrs" {
 # B2(FirecrackerDriver): 节点 userData 从此 S3 URI 拉取最小可启动 rootfs.tar.gz
 variable "rootfs_s3_uri" {
   type        = string
-  description = "S3 URI of the minimal bootable arm64 rootfs tarball (B2 FC mode)"
+  description = "S3 URI of the minimal bootable rootfs tarball matching node_arch (B2 FC mode)"
   default     = ""
 }
 
@@ -195,13 +216,44 @@ module "eks" {
   # 控制平面 ENI 放私有子网;节点组单独指定公有子网(见 node group subnet_ids)
   subnet_ids = module.vpc.private_subnets
 
-  # 托管沙盒节点组:既跑系统组件（控制面 / LiteLLM），也【承载 sandbox】——
-  #   打 sandbox=true label，让 node-agent DaemonSet 调度上来，在本机直起裸 Firecracker microVM。
-  #   挂持久状态 EBS（/dev/sdf → /var/lib/sbx），存内存快照（base + Diff），spot 疏散跨机恢复。
+  # system 与 sandbox 数据面分组:
+  # - system_arm64:固定 On-Demand Graviton，承载业务控制面和集群系统 Pod。
+  # - sandbox_*:只承载 node-agent + Firecracker microVM，带 NoSchedule 污点。
   eks_managed_node_groups = {
+    system_arm64 = {
+      kubernetes_version = "1.31"
+      ami_type           = "AL2023_ARM_64_STANDARD"
+      instance_types     = [var.system_instance_type]
+      capacity_type      = "ON_DEMAND"
+
+      min_size     = var.system_node_count
+      max_size     = var.system_node_count
+      desired_size = var.system_node_count
+
+      # POC VPC 没有 NAT，system 节点暂放三个公有子网；生产应改私有子网 + VPC endpoints/NAT。
+      subnet_ids = module.vpc.public_subnets
+
+      labels = {
+        role            = "system"
+        "workload-tier" = "system"
+      }
+
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size = 50
+            volume_type = "gp3"
+          }
+        }
+      }
+    }
+
     "sandbox_${var.node_arch}" = {
-      ami_type       = local.node_arch_cfg.ami_type
-      instance_types = [local.sandbox_instance_type]
+      kubernetes_version = "1.31"
+      ami_type           = local.node_arch_cfg.ami_type
+      instance_types     = [local.sandbox_instance_type]
+      capacity_type      = "ON_DEMAND"
 
       # Intel i7i 是虚拟化实例，必须显式打开 Nitro nested virtualization 才会暴露 /dev/kvm。
       # c6g.metal 直接使用宿主 KVM，不设置该选项。
@@ -373,10 +425,19 @@ module "eks" {
       EOT
       }]
 
-      # 本组承载 sandbox(裸 Firecracker microVM),打 sandbox=true 让 node-agent DaemonSet 调度上来。
+      # 本组只承载 node-agent + 裸 Firecracker microVM。NoSchedule 防止控制面、
+      # CoreDNS、LiteLLM 等普通 Pod 在数据节点上落盘。
       labels = {
-        role    = "system"
-        sandbox = "true"
+        role            = "sandbox"
+        sandbox         = "true"
+        "workload-tier" = "data"
+      }
+      taints = {
+        dedicated_sandbox = {
+          key    = "dedicated"
+          value  = "sandbox"
+          effect = "NO_SCHEDULE"
+        }
       }
     }
   }
@@ -438,4 +499,12 @@ output "configure_kubectl" {
 
 output "ecr_repo_url" {
   value = data.aws_ecr_repository.sbx.repository_url
+}
+
+output "system_node_group_name" {
+  value = module.eks.eks_managed_node_groups["system_arm64"].node_group_id
+}
+
+output "sandbox_node_group_name" {
+  value = module.eks.eks_managed_node_groups["sandbox_${var.node_arch}"].node_group_id
 }

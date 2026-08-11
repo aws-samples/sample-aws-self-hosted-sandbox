@@ -19,15 +19,13 @@ variable "enable_juicefs" {
 
 variable "juicefs_redis_node_type" {
   type        = string
-  default     = "" # 留空时按 node_arch 选默认(arm64→cache.t4g.micro / amd64→cache.t3.micro)
-  description = "JuiceFS 元数据 Redis(ElastiCache)节点类型。留空则随 node_arch:arm64=cache.t4g.micro(Graviton),amd64=cache.t3.micro(Intel)。"
+  default     = ""
+  description = "JuiceFS 元数据 Redis(ElastiCache)节点类型。留空使用 cache.t4g.micro。"
 }
 
 locals {
-  # ElastiCache 节点族:arm64=t4g(Graviton),amd64=t3(Intel)。POC 用最小规格 micro。
-  juicefs_redis_node_type = var.juicefs_redis_node_type != "" ? var.juicefs_redis_node_type : (
-    var.node_arch == "amd64" ? "cache.t3.micro" : "cache.t4g.micro"
-  )
+  # 元数据服务与 sandbox 数据节点架构无关，默认使用最小 Graviton 规格。
+  juicefs_redis_node_type = var.juicefs_redis_node_type != "" ? var.juicefs_redis_node_type : "cache.t4g.micro"
 }
 
 # ---------- JuiceFS workspace S3 桶 ----------

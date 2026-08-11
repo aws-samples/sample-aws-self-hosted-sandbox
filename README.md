@@ -12,7 +12,7 @@
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
 - **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS（**不经 S3**），跨机恢复靠 EBS 卷幸存 + detach/attach（见下方"快照落盘与跨机恢复"说明）
-- **Graviton / x86 可选**：Graviton 使用 `c6g.metal`；Intel x86 使用支持嵌套虚拟化的 i7i 全系列，默认 `i7i.8xlarge`；[i7i 真机 E2E 已通过](docs/i7i-e2e-test-report-2026-08-10.md)
+- **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用 `c6g.metal` 或支持嵌套虚拟化的 i7i（默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
 - **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
@@ -55,22 +55,24 @@ root 可绑 80 端口、dnf 装包、嵌套 docker            ✅ 完整 root �
 
 #### 2. 成本控制：快照 = 成本杠杆
 
-**最小配置月费（us-east-1，1 台 c6g.metal）：**
+**最小配置月费（us-east-1，2 台 system + 1 台 c6g.metal sandbox）：**
 
 | 资源 | 单价 | 月费（730h） |
 |---|---|---|
 | c6g.metal（64vCPU/128GiB）**spot**（本平台目标模式）| ~$0.67/hr（us-east-1a 实时，约按需 29%）| **~$486** |
 | c6g.metal 按需（对比基线）| $2.304/hr | ~$1,682 |
+| system 节点（2 × m7g.large，On-Demand）| ~$0.0816/hr/台 | ~$119 |
 | EKS 控制面 | $0.10/hr | ~$73 |
 | DynamoDB（PAY_PER_REQUEST）| 按写入量 | <$1 |
 | 持久状态 EBS（gp3 400GB / 4000 IOPS / 1000MB/s，每节点一块，存内存快照）| $32 容量 + $5 IOPS + $35 吞吐 | ~$72/节点 |
-| **合计（按需）** | | **~$1,828/月** |
-| **合计（按需 + Savings Plan ~42% off，仅计算）**| | **~$1,122/月** |
-| **合计（spot + 快照回收，本平台目标模式）** | | **~$632/月** |
+| **合计（按需）** | | **~$1,947/月** |
+| **合计（按需 + Savings Plan ~42% off，仅计算）**| | **~$1,191/月** |
+| **合计（sandbox spot + system On-Demand，目标模式）** | | **~$751/月** |
 
 > **spot 是本平台的核心成本模型**：c6g.metal spot 约为按需的 ~29%（实测 us-east-1 各 AZ $0.65–$0.74/hr，2026-07 查询），
 > spot 被回收时靠快照疏散 + 跨机恢复保住内存状态（见下方 50 满载实测）。**spot 价格实时浮动**，以实际报价为准。
 > 若不用 spot，按需可购 1 年期 Savings Plan 降约 42%。实际价格请以 [AWS Pricing Calculator](https://calculator.aws) 为准。
+> 生产节点池应分开采购：system 节点始终使用 On-Demand；仅 sandbox 数据节点在中断恢复链路闭环后使用 Spot。
 
 **承载能力与摊算成本（单台 c6g.metal，128 GiB）：**
 
@@ -224,8 +226,8 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────┐
 │                                                                      │
-│  托管节点组（系统节点）          Firecracker 沙盒节点                │
-│                                 c6g.metal 或 i7i.*                   │
+│  system 节点组（On-Demand）      sandbox 数据节点组                 │
+│  Graviton m7g（默认 2 台）       c6g.metal 或 i7i.*                 │
 │  ┌──────────────────────────┐      ┌───────────────────────────┐   │
 │  │ sandbox-control-plane    │ HTTP │  Firecracker microVM       │   │
 │  │ (Deployment, 2 副本,IRSA)│─────►│  node-agent DaemonSet      │   │
@@ -234,7 +236,8 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 │  │  Reconciler (leader-only)│      └───────────────────────────┘   │
 │  │  无状态 → DynamoDB        │                                       │
 │  └──────────────────────────┘                                       │
-│         ↑ ingress-nginx (NLB)                                       │
+│  CoreDNS / LiteLLM / Ingress         taint: dedicated=sandbox       │
+│         ↑ ingress-nginx (NLB)        （普通 Pod 不进入数据节点）     │
 │         api.sbx.<domain>  ←── 生产外部访问（POC 推荐 port-forward）  │
 │                                                                      │
 │  DynamoDB: sandboxes / events / tap-idx / nodes(心跳) / locks(leader)│
@@ -259,8 +262,9 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 1. 认证安全：Step 6 必须传入 api_keys 和 litellm_master_key（用 openssl rand -hex 32 生成），
    不能留空——控制面无 key 时所有受保护接口返回 503。
 2. rootfs 必须含 vsock agent：Step 1.5 的 min-rootfs（exec 走 vsock 通道），phase3 apply 需显式传 rootfs_s3_uri。
-3. 节点架构二选一：Graviton=`node_arch=arm64` + `c6g.metal`；x86=`node_arch=amd64` + `i7i.8xlarge`（可覆盖任意 `i7i.*`）。
-4. 镜像和 rootfs 必须与节点架构一致：arm64 用 `linux/arm64`，x86 用 `linux/amd64`。
+3. system 节点固定为 On-Demand Graviton；`node_arch` 只描述 sandbox 数据节点：
+   Graviton=`arm64` + `c6g.metal`，x86=`amd64` + `i7i.8xlarge`（可覆盖任意 `i7i.*`）。
+4. 控制面镜像构建为 `linux/arm64`；node-agent 和 rootfs 必须与数据节点一致。
 5. 测试完成后立即执行 docs/deploy.md 中的【清理】步骤。
 
 开始前先确认：
@@ -277,8 +281,8 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 
 ```
 你是这套 AWS 沙盒平台的运维工程师。平台概况：
-- EKS 集群 claude-sbx，c6g.metal 或 i7i 沙盒节点，Firecracker microVM + node-agent DaemonSet
-- 控制面：sandbox-system namespace，Deployment 2 副本
+- EKS 集群 claude-sbx：独立 On-Demand Graviton system 节点组 + c6g.metal/i7i sandbox 数据节点组
+- 控制面：sandbox-system namespace，Deployment 2 副本，固定在 system 节点
   外部访问：http://api.sbx.<domain>（ingress-nginx NLB）
 - 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx / nodes / locks）
 - 高可用编排：控制面 leader-only reconcile loop（对账自愈）+ node-agent 心跳注册表 + DynamoDB leader 锁
@@ -292,7 +296,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 3. 查看节点：kubectl get nodes -o wide
 4. 查看 LiteLLM：kubectl logs -n litellm deployment/litellm --tail=50
 5. DynamoDB 直查：aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
-6. 镜像更新：bash scripts/build_and_push.sh，然后 kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
+6. 镜像更新：按 system/data 架构运行 `bash scripts/build_and_push.sh --control-plane-platform linux/arm64 --node-agent-platform <数据节点平台>`，然后滚动重启
 7. 节点扩容：调整 phase3 的 `sandbox_node_count` 并 terraform apply
 8. 成本优化：批量挂起空闲沙盒
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
@@ -322,7 +326,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 # 无需 AWS，本地直接跑
 pip install "moto[dynamodb]" boto3 kubernetes
 python3 sandbox-api/smoke_test.py
-# 期望：48/48 PASS
+# 期望：50/50 PASS
 ```
 
 ---
@@ -344,8 +348,8 @@ python3 sandbox-api/smoke_test.py
 
 ### 实测关键数据
 
-> i7i x86 的宿主 KVM、guest 生命周期、鉴权和资源清理证据见
-> [i7i x86 Firecracker 真机测试报告](docs/i7i-e2e-test-report-2026-08-10.md)。
+> i7i x86 的宿主 KVM、异构节点池调度、恢复后 exec、LiteLLM 与 leader 故障转移证据见
+> [控制面与数据面分离 i7i 真机测试报告](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)。
 
 | 指标 | 实测值 | 环境 |
 |---|---|---|
@@ -355,8 +359,9 @@ python3 sandbox-api/smoke_test.py
 | 单机最大并发 | 60 VM（测试截止，未到上限）| c6g.metal 128 GiB |
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
-| 冒烟测试通过率 | **48/48（ALL PASS）** | moto mock，`sandbox-api/smoke_test.py` |
-| i7i x86 生命周期 | **ALL TESTS PASSED** | `i7i.8xlarge`，create/exec/suspend/resume/destroy/auth |
+| 冒烟测试通过率 | **50/50（ALL PASS）** | moto mock，`sandbox-api/smoke_test.py` |
+| 控制面 / 数据面分离 | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
+| i7i x86 生命周期 | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |
 | FC suspend→resume | 快照落持久 EBS（不传 S3）/ resume 亚秒 | 内存态跨快照精确保留（数据保真已验证）|
 | 节点心跳注册 | 每 30s 写 nodes 表，`_pick_node` 从表选点 | 替换硬编码 FC_NODES |
