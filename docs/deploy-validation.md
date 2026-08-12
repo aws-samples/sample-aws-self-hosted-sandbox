@@ -2,7 +2,9 @@
 
 > 本文是历史 Kata 部署审计。当前 Firecracker 双架构流程以
 > [`deploy.md`](deploy.md) 为准；2026-08-10 的 i7i x86 真机验证见
-> [`i7i-e2e-test-report-2026-08-10.md`](i7i-e2e-test-report-2026-08-10.md)。
+> [`i7i-e2e-test-report-2026-08-10.md`](i7i-e2e-test-report-2026-08-10.md)；
+> 2026-08-12 的 P1 可观测性部署验证见
+> [`P1可观测性-真机测试报告-2026-08-12.md`](P1可观测性-真机测试报告-2026-08-12.md)。
 
 > 验证日期：2026-06-14 ｜ 账号：427169985960 ｜ Region：us-east-1
 > 验证方式：在真实 AWS 环境按 README「快速开始（Agent 部署指南）」逐步执行

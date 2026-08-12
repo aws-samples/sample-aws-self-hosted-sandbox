@@ -38,6 +38,18 @@ from sandbox_api import db
 from sandbox_api.autosleep import AutoSleeper
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.idle_detection import IdleDetector
+from sandbox_api.observability import (
+    RESUME_INFLIGHT,
+    RESUME_QUEUE_WAIT,
+    WAKE_RPC_DURATION,
+    log_event,
+    metrics_payload,
+    new_request_id,
+    normalize_route,
+    observed_operation,
+    record_http,
+    stale_loops,
+)
 from sandbox_api.reconcile import Reconciler
 from sandbox_api.warm_pool import WarmPool
 
@@ -91,7 +103,7 @@ _API_KEYS: set[str] = {
 }
 _ALLOW_UNAUTH = os.environ.get("ALLOW_UNAUTHENTICATED", "").lower() in ("1", "true")
 # 无需认证的路径(健康检查)
-_PUBLIC_PATHS = {"/", "/capabilities"}
+_PUBLIC_PATHS = {"/", "/capabilities", "/livez", "/readyz", "/metrics"}
 
 # API_KEY → tenant_id 映射（格式: "key:tenant_id,key2:tenant_id2" 或仅 "key"）
 # 若 key 未绑定 tenant，则该 key 的调用方视为 tenant "default"
@@ -174,6 +186,7 @@ def _autostart_enabled(record: dict) -> bool:
 
 # ---------- 业务逻辑 ----------
 
+@observed_operation("create")
 def create_sandbox(body: dict) -> tuple[int, dict]:
     idem_key = body.get("idempotency_key")
     if idem_key:
@@ -271,8 +284,11 @@ def _maybe_snapshot_base_async(sid: str) -> None:
                 if rec and rec.get("state") == "running":
                     info = snap_base(sid, rec)
                     db.write_event(sid, "base_snapshot", "running", info)
-        except Exception:
-            pass  # base 失败 → 疏散时降级 Full,不阻断
+        except Exception as exc:
+            log_event(
+                "error", "base_snapshot_failed",
+                sandbox_id=sid, error_type=type(exc).__name__,
+            )  # base 失败 → 疏散时降级 Full,不阻断
 
     _threading.Thread(target=_do, daemon=True).start()
 
@@ -376,6 +392,29 @@ def admin_stats() -> tuple[int, dict]:
     }
 
 
+def health_report(require_dependencies: bool) -> tuple[int, dict]:
+    stale = stale_loops()
+    checks: dict[str, object] = {
+        "background_loops": "ok" if not stale else {"stale": stale},
+    }
+    healthy = not stale
+    if require_dependencies:
+        try:
+            nodes = db.list_active_nodes()
+            checks["dynamodb"] = "ok"
+            checks["active_nodes"] = len(nodes)
+            if not nodes:
+                healthy = False
+        except Exception as exc:
+            checks["dynamodb"] = {"error_type": type(exc).__name__}
+            checks["active_nodes"] = 0
+            healthy = False
+    return (200 if healthy else 503), {
+        "status": "ok" if healthy else "unhealthy",
+        "checks": checks,
+    }
+
+
 # ---------- 端口暴露反代(sandbox-proxy)----------
 # 路径路由 /s/{sid}/{port}/{rest} —— 用路径(而非 Host 子域名)定位沙盒,因为:
 #   1) 先用 NLB 自带域名,挂不了通配符子域名,Host 头无法区分沙盒;
@@ -429,6 +468,8 @@ def _ensure_awake(sid: str, record: dict) -> dict:
     if record.get("state") != "slept" or not _autostart_enabled(record):
         return record
 
+    wake_started = time.monotonic()
+    wake_result = "timeout"
     # 触发唤醒。resume_sandbox 内部用 lease,并发请求只有一个抢到锁真正 resume;
     # 抢不到的直接进下面的轮询,等 leader/first 请求把它拉起来。
     try:
@@ -440,14 +481,21 @@ def _ensure_awake(sid: str, record: dict) -> dict:
     while time.monotonic() < deadline:
         cur = db.get(sid)
         if not cur:
+            wake_result = "missing"
+            WAKE_RPC_DURATION.labels(wake_result).observe(time.monotonic() - wake_started)
             return record
         state = cur.get("state")
         if state == "running":
+            wake_result = "success"
+            WAKE_RPC_DURATION.labels(wake_result).observe(time.monotonic() - wake_started)
             return cur
         if state == "failed":
+            wake_result = "failed"
+            WAKE_RPC_DURATION.labels(wake_result).observe(time.monotonic() - wake_started)
             return cur  # resume 失败,不再干等
         # resuming(本请求或并发请求正在拉起)→ 继续轮询;slept/其他态短暂窗口也再看一眼
         time.sleep(0.3)  # nosemgrep: arbitrary-sleep -- 轮询唤醒收敛
+    WAKE_RPC_DURATION.labels(wake_result).observe(time.monotonic() - wake_started)
     return db.get(sid) or record
 
 
@@ -488,6 +536,7 @@ def resolve_proxy_target(sid: str, port: int) -> tuple[int, dict] | tuple[int, s
     return 200, host, f"/proxy/{sid}/{port}"
 
 
+@observed_operation("destroy")
 def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -513,6 +562,7 @@ def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
             db.release_lease(sid, lease_id)
 
 
+@observed_operation("suspend")
 def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -545,6 +595,7 @@ def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
             db.release_lease(sid, lease_id)
 
 
+@observed_operation("auto_sleep")
 def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
     """
     自动休眠:把空闲的 running 沙盒打快照进 slept 状态(区别于手动 suspend 的 suspended)。
@@ -602,6 +653,7 @@ def _idle_seconds(record: dict) -> float | None:
     return _idle_detector.decide(record).idle_seconds
 
 
+@observed_operation("resume")
 def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -620,22 +672,29 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         db.update_state(sid, "resuming", prev)
         # 限流:同时最多 _RESUME_CONCURRENCY 个 resume 走 driver(合并+load 的 EBS I/O 重)。
         # 排队期间沙盒停在 resuming(可观测),不额外占资源。t0 只计真正 resume 不含排队。
+        queue_started = time.monotonic()
         if _RESUME_SEM is not None:
             _RESUME_SEM.acquire()
+        queue_wait = time.monotonic() - queue_started
+        RESUME_QUEUE_WAIT.observe(queue_wait)
+        RESUME_INFLIGHT.inc()
         try:
             t0 = time.monotonic()
             driver_fields = _driver.resume(sid, record)
             restore_time  = round(time.monotonic() - t0, 4)
         finally:
+            RESUME_INFLIGHT.dec()
             if _RESUME_SEM is not None:
                 _RESUME_SEM.release()
         # resume 成功即回到活跃,给刚唤醒的沙盒一个完整 idle 周期。
         _idle_detector.forget(sid)
         db.update_state(sid, "running", "resuming",
                         {**driver_fields, "restore_time_s": str(restore_time),
+                         "resume_queue_wait_s": str(round(queue_wait, 4)),
                          "last_active_at": db._utcnow()})
         db.write_event(sid, "resumed", prev,
-                       {"restore_time_s": restore_time})
+                       {"restore_time_s": restore_time,
+                        "resume_queue_wait_s": round(queue_wait, 4)})
         return 200, db.get(sid)
     except UnsupportedOperation as e:
         return 501, {"error": str(e)}
@@ -651,6 +710,7 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
             db.release_lease(sid, lease_id)
 
 
+@observed_operation("exec")
 def exec_sandbox(sid: str, cmd: str, caller_tenant: str | None = None) -> tuple[int, dict]:
     record = db.get(sid)
     if not record:
@@ -759,10 +819,54 @@ if AUTO_SLEEP_ENABLED:
 
 class Handler(BaseHTTPRequestHandler):
 
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.request_id = new_request_id(self.headers.get("X-Request-ID"))
+        return parsed
+
+    def handle_one_request(self) -> None:
+        started = time.monotonic()
+        self._response_status = 500
+        self.command = None
+        self.path = None
+        try:
+            super().handle_one_request()
+        finally:
+            if getattr(self, "command", None) and getattr(self, "path", None):
+                duration = time.monotonic() - started
+                route = record_http(
+                    self.command, self.path, self._response_status, duration
+                )
+                if route not in {"/livez", "/readyz", "/metrics"}:
+                    log_event(
+                        "info", "http_request",
+                        method=self.command,
+                        route=route,
+                        status=self._response_status,
+                        duration_ms=round(duration * 1000, 3),
+                    )
+
+    def send_response(self, code: int, message=None) -> None:
+        self._response_status = code
+        super().send_response(code, message)
+
+    def end_headers(self) -> None:
+        if request_id := getattr(self, "request_id", ""):
+            self.send_header("X-Request-ID", request_id)
+        super().end_headers()
+
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -776,6 +880,15 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             n = 0
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def _send_internal_error(self, exc: Exception) -> None:
+        log_event(
+            "error", "request_failed",
+            method=getattr(self, "command", ""),
+            route=normalize_route(getattr(self, "path", "")),
+            error_type=type(exc).__name__,
+        )
+        self._send(500, {"error": str(exc)})
 
     def _parts(self) -> list[str]:
         return urlparse(self.path).path.strip("/").split("/")
@@ -848,6 +961,7 @@ class Handler(BaseHTTPRequestHandler):
         hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailers", "transfer-encoding", "upgrade", "host"}
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+        fwd["X-Request-ID"] = getattr(self, "request_id", "")
 
         try:
             conn = http.client.HTTPConnection(node_host, timeout=30)
@@ -882,10 +996,11 @@ class Handler(BaseHTTPRequestHandler):
             return True
         lines = [f"{self.command} {upstream_path} HTTP/1.1"]
         for k, v in self.headers.items():
-            if k.lower() == "host":
+            if k.lower() in {"host", "x-request-id"}:
                 continue
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {node_host}")
+        lines.append(f"X-Request-ID: {getattr(self, 'request_id', '')}")
         up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         with _idle_detector.connection(sid):
             _raw_tunnel(
@@ -904,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._handle_get()
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            self._send_internal_error(e)
 
     def do_POST(self):
         if self._maybe_proxy():
@@ -914,7 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._handle_post()
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            self._send_internal_error(e)
 
     def do_DELETE(self):
         if self._maybe_proxy():
@@ -924,7 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._handle_delete()
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            self._send_internal_error(e)
 
     def do_PUT(self):
         # /s/ 反代优先;否则走鉴权 + PUT 业务(文件上传)
@@ -935,7 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._handle_put()
         except Exception as e:
-            self._send(500, {"error": str(e)})
+            self._send_internal_error(e)
 
     # web 应用常用的其余 method —— 仅服务 /s/ 反代
     def _proxy_only(self):
@@ -949,6 +1064,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_get(self):
         p = self._parts()
+
+        if p == ["metrics"]:
+            body, content_type = metrics_payload()
+            return self._send_bytes(200, body, content_type)
+
+        if p == ["livez"]:
+            code, result = health_report(require_dependencies=False)
+            return self._send(code, result)
+
+        if p == ["readyz"]:
+            code, result = health_report(require_dependencies=True)
+            return self._send(code, result)
 
         # GET /capabilities
         if p == ["capabilities"]:

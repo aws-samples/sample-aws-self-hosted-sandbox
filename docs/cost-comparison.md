@@ -4,6 +4,9 @@
 > 区域：AWS = us-east-1（与 us-west-2 同价，见 §6）；Fly.io = 北美/欧洲（ams 基准）。
 > 币种：USD。数据日期：2026-06-30。
 > 本文 §1~§5 为**计算成本**；**带宽**为独立大变量，见 §7。
+> 本文是固定采用 `c6g.metal` 的 1000 沙盒容量模型，不是 AWS 实例选型清单。嵌套虚拟化
+> 4xlarge / 8xlarge 与 Bare Metal 的当前月价、1 年 EC2 Instance Savings Plan All Upfront
+> 对比见 [`../README.md`](../README.md#沙盒节点实例选择与月度价格us-east-1)。
 
 ---
 

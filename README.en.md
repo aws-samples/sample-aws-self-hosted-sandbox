@@ -8,16 +8,17 @@
 
 ### Overview
 
-A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and native Kubernetes integration.
+A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and a Kubernetes-managed platform control plane.
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
 - **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
-- **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes using `c6g.metal` or nested-virtualization-capable Intel i7i (`i7i.8xlarge` by default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
+- **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes, using either bare-metal hosts or nested-virtualization-capable Intel x86 instances (`i7i.8xlarge` is the current default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
 - **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
+- **Platform observability**: low-cardinality Prometheus metrics, structured logs, five alert classes, an eight-panel dashboard, and SHA-256 snapshot verification; optional SigV4 remote-write to AMP with private AMG queries
 
 ### Use Cases
 
@@ -58,8 +59,9 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 | **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |
 | **Auto-sleep / auto-wake** | ✅ Idle → `slept`; gateway request transparently resumes (opt-in via `autostop`/`autostart`) | ✅ | ✅ auto_stop/auto_start | ❌ |
 | **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
+| **Observability** | ✅ Prometheus/Alertmanager/Grafana; optional AMP + AMG | Managed | Managed | CloudWatch |
 | **Data sovereignty** | ✅ Stays in your AWS account | ❌ 3rd party | ❌ 3rd party | ✅ |
-| **K8s ecosystem** | ✅ Native | ❌ | ❌ | ❌ |
+| **K8s ecosystem** | Platform services run on EKS; sandboxes are not Pods | ❌ | ❌ | ❌ |
 | **Min. monthly cost (2 system + 1 sandbox node)** | **~$751/mo target** (sandbox Spot + On-Demand system) | Managed pricing | Managed pricing | Per-call |
 
 #### Auto-sleep / auto-wake (fly.io-style)
@@ -72,6 +74,45 @@ Idle sandboxes snapshot themselves to a distinct `slept` state (freeing RAM); th
 - Reuses the same `lease + conditional-write + rollback` concurrency guard as manual suspend; scan loop is leader-gated (shares the reconcile/warm-pool leader lock) and re-checks idleness after acquiring the lease to avoid racing a fresh request.
 - Tunables: `AUTO_SLEEP_ENABLED` / `AUTO_SLEEP_IDLE_S` (default 300s) / `AUTO_SLEEP_SCAN_S` / `AUTO_WAKE_TIMEOUT_S` / `ACTIVITY_TOUCH_MIN_S`. Implementation in `sandbox-api/autosleep.py`; e2e in `scripts/autosleep_e2e.sh`. Real-machine verified 2026-07-16 (see `docs/自动休眠-真机测试报告-2026-07-16.md`).
 
+### Why a Sandbox Is Not a Pod
+
+Kubernetes manages the **platform services**, not each user's execution environment. Ingress, the API
+control plane, LiteLLM, and node-agent run as Pods. User code runs inside Firecracker microVMs that
+node-agent starts as host processes on the sandbox nodes. In short: **Kubernetes schedules the managers;
+the sandbox control plane schedules the microVMs.**
+
+For a create request, `sandbox-control-plane` selects a data node from node-agent heartbeats and remaining
+capacity, writes the sandbox state to DynamoDB, and calls that node's node-agent. The node-agent prepares
+the rootfs, TAP network, and vsock, assigns vCPU and memory, and starts Firecracker. kube-scheduler sees
+one node-agent DaemonSet Pod per data node; it does not create a Pod, PVC, Service, or CRD for every sandbox.
+
+| Dimension | Regular Pod | Firecracker sandbox in this project |
+|---|---|---|
+| Kubernetes identity | Each instance is a Pod, usually created by a Deployment, Job, or another controller | The sandbox is a DynamoDB record managed by the control plane and node-agent; no matching Pod exists |
+| Placement | kube-scheduler uses requests, affinity, taints, and other cluster policies | The control plane selects a sandbox node from node-agent heartbeats, free memory, and VM count |
+| Isolation boundary | Containers use namespaces and cgroups and normally share the node kernel | KVM supplies a virtual hardware boundary; every microVM boots its own guest kernel |
+| Lifecycle | kubelet pulls an image, starts containers, and recreates them according to Pod policy | node-agent calls Firecracker APIs for create, snapshot, suspend, resume, and destroy |
+| Networking | CNI assigns a Pod IP; Services and Ingress route to the Pod | Each guest uses its own TAP `/30`; traffic follows `Ingress → control plane → node-agent → guest` |
+| Stateful data | Commonly attached through PV/PVC resources coordinated by Kubernetes | Each sandbox has its own rootfs and memory snapshots on the host-mounted persistent state EBS volume |
+| Observability | `kubectl`, Pod conditions, probes, and container logs expose the workload directly | Kubernetes sees node-agent only; the platform must report VM state, snapshot latency, and guest health |
+| Scale unit | A user environment normally adds at least one Pod and related API objects | One node-agent manages many microVMs without mapping sandbox count directly to Kubernetes object count |
+
+This split gives long-lived, suspendable environments a lifecycle that is not defined by Pod recreation.
+An idle sandbox can write a Firecracker snapshot, release VMM memory, and later continue from the same
+guest state. The node can also pack workloads according to their real working sets. Kubernetes still
+handles replicas, rolling updates, service discovery, and failover for the platform components.
+
+The trade-off is that the platform must implement capabilities Kubernetes would otherwise provide:
+placement, the instance state machine, network proxying, health checks, garbage collection, and recovery.
+The current implementation also has two important boundaries:
+
+- Firecracker processes are children of node-agent and run inside the node-agent Pod's cgroup. "Not a Pod"
+  means a sandbox is not an independently scheduled Kubernetes object; it does not mean it is unaffected
+  by node-agent or host lifecycle. Drain sandboxes safely before restarting or upgrading node-agent.
+- Persistent state EBS in the same Availability Zone is currently authoritative. Cross-node EBS
+  detach/attach has been verified, but automatic Spot evacuation and recovery are not yet a closed loop.
+  This design must not be described as automatic cross-AZ rescheduling.
+
 ### Architecture
 
 ```
@@ -79,20 +120,46 @@ Idle sandboxes snapshot themselves to a distinct `slept` state (freeing RAM); th
 │                                                                       │
 │  system node group (On-Demand)   sandbox data node group             │
 │  Graviton m7g (2 by default)     c6g.metal or i7i.*                  │
-│  ┌───────────────────────────┐    ┌───────────────────────────────┐  │
-│  │ sandbox-control-plane     │HTTP│ Firecracker microVM           │  │
-│  │ (2 replicas, IRSA)        │───►│ node-agent DaemonSet          │  │
-│  │ FirecrackerDriver         │◄───│ jailer / tap / snapshot       │  │
-│  │ WarmPool + Reconciler     │ HB │ nodes heartbeat every 30s    │  │
-│  │ Stateless → DynamoDB      │    └───────────────────────────────┘  │
-│  └───────────────────────────┘                                       │
+│  ┌───────────────────────────┐    ┌────────────────────────────────┐ │
+│  │ sandbox-control-plane     │HTTP│ node-agent Pod (DaemonSet)     │ │
+│  │ (2 replicas, IRSA)        │───►│ hostNetwork / privileged       │ │
+│  │ FirecrackerDriver         │◄───│ heartbeat / tap / snapshots    │ │
+│  │ WarmPool + Reconciler     │ HB ├────────────────────────────────┤ │
+│  │ Stateless → DynamoDB      │    │ Host Firecracker processes     │ │
+│  └───────────────────────────┘    │  ├ microVM A (not a Pod)       │ │
+│                                   │  ├ microVM B (not a Pod)       │ │
+│                                   │  └ microVM N (not a Pod)       │ │
+│                                   └────────────────────────────────┘ │
 │  CoreDNS / LiteLLM / Ingress     taint: dedicated=sandbox           │
 │       ↑ ingress-nginx (NLB)      (no ordinary Pods on data nodes)   │
 │       api.sbx.<domain> (POC: use port-forward)                       │
 │                                                                       │
 │  DynamoDB: sandboxes / events / tap-idx / nodes / locks             │
+│  Prometheus / Alertmanager / Grafana ──SigV4 remote-write──► AMP    │
+│                                                    AMG ──PrivateLink─┘│
 └───────────────────────────────────────────────────────────────────────┘
 ```
+
+### Observability
+
+`terraform/stage2-control-plane/observability.tf` supports three deployment levels:
+
+1. `enable_observability_stack=true` installs in-cluster Prometheus, Alertmanager, and Grafana,
+   and discovers the control plane and node-agent automatically.
+2. `enable_amp_remote_write=true` creates an AMP workspace and configures Prometheus IRSA +
+   SigV4 remote-write. Level 1 must also be enabled.
+3. Supplying an existing AMG workspace, VPC, subnets, and security group grants the workspace
+   minimum AMP query permissions and creates an `aps-workspaces` Interface Endpoint. Terraform
+   does not create the AMG workspace or datasource.
+
+The stack includes five alert classes (wake latency, snapshot integrity, capacity, orphan growth,
+and control-plane degradation) plus the eight-panel `Sandbox Platform` dashboard. Metrics do not
+use sandbox IDs as labels. Snapshot restore verifies a SHA-256 manifest and rejects corrupted state.
+
+The real AWS test passed with 29/29 healthy targets, zero remote-write failures, AMP control-plane
+and node-agent series, AMG datasource health `OK`, an AMG query returning two control-plane replicas,
+and a zero-drift Terraform plan. See [deployment Step 6.2](docs/deploy.md#step-62-部署可观测性p1推荐)
+and the [P1 observability E2E report](docs/P1可观测性-真机测试报告-2026-08-12.md).
 
 ### Quick Start (Agent Deployment Guide)
 
@@ -305,6 +372,7 @@ You are the ops engineer for this AWS sandbox platform. Platform overview:
 - State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx / nodes / locks)
 - Credential isolation: LiteLLM (litellm namespace) holds Bedrock IRSA; sandboxes have no credentials
 - Snapshots: persistent state EBS (base + Diff incremental memory snapshots), spot evacuation + cross-node recovery
+- Observability: Prometheus/Alertmanager/Grafana in the monitoring namespace; optional AMP + AMG
 
 Common ops tasks:
 1. List sandboxes:    curl http://api.sbx.<domain>/sandboxes?tenant_id=<id>
@@ -320,11 +388,17 @@ Common ops tasks:
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
    done
+9. View monitoring Pods: kubectl get pods -n monitoring
+10. Access local Grafana: kubectl -n monitoring port-forward svc/sandbox-monitoring-grafana 3000:80
+11. View managed endpoints: terraform -chdir=terraform/stage2-control-plane output amp_workspace_id && terraform -chdir=terraform/stage2-control-plane output managed_grafana_endpoint
 
 Monitoring:
-- node-agent memory: kubectl exec -n sandbox-system daemonset/node-agent -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/health').read().decode())"
+- Targets and remote-write: all `up` series should be 1; `prometheus_remote_storage_samples_failed_total` should be 0
+- Node capacity: `fcnode_free_memory_bytes`, `fcnode_scratch_bytes`
+- Lifecycle: `fc_operation_duration_seconds`, `fc_resume_stage_duration_seconds`
+- Snapshot safety: `fc_snapshot_verify_total`, `fc_snapshot_errors_total`
+- Reconcile health: `background_loop_runs_total`, `reconcile_actions_total`
 - DynamoDB write latency: AWS Console → DynamoDB → Metrics → SuccessfulRequestLatency
-- Node utilization: kubectl top nodes
 - LiteLLM request volume: kubectl logs -n litellm deployment/litellm | grep "INFO:"
 ```
 
@@ -332,16 +406,16 @@ Monitoring:
 
 ### Cost Breakdown (Minimum Setup — 2 system nodes + 1 × c6g.metal sandbox, us-east-1)
 
-| Resource | Unit Price | Monthly (730h) |
+| Resource | Monthly Unit Price | Monthly (730h) |
 |---|---|---|
-| c6g.metal (64 vCPU / 128 GiB) **spot** (platform target mode) | ~$0.67/hr (us-east-1a live, ~29% of on-demand) | **~$486** |
-| c6g.metal on-demand (baseline for comparison) | $2.304/hr | ~$1,682 |
-| System nodes (2 × m7g.large, On-Demand) | ~$0.0816/hr each | ~$119 |
-| EKS control plane | $0.10/hr | ~$73 |
+| c6g.metal (64 vCPU / 128 GiB) **spot** (platform target mode) | ~$486/mo (us-east-1a, queried 2026-07, ~29% of on-demand) | **~$486** |
+| c6g.metal on-demand (baseline for comparison) | ~$1,588/mo | ~$1,588 |
+| System nodes (2 × m7g.large, On-Demand) | ~$59.50/mo each | ~$119 |
+| EKS control plane | ~$73/mo | ~$73 |
 | DynamoDB (PAY_PER_REQUEST) | per write | <$1 |
 | Persistent state EBS (gp3 400GB / 4000 IOPS / 1000MB/s, one per node, holds memory snapshots) | $32 storage + $5 IOPS + $35 throughput | ~$72/node |
-| **Total (on-demand)** | | **~$1,947/mo** |
-| **Total (on-demand + 1-yr Savings Plan ~42% off, compute only)** | | **~$1,191/mo** |
+| **Total (on-demand)** | | **~$1,853/mo** |
+| **Total (1-year EC2 Instance Savings Plan, All Upfront, compute only)** | | **~$1,199/mo** |
 | **Total (sandbox Spot + On-Demand system, target mode)** | | **~$751/mo** |
 
 > **Spot is the platform's core cost model**: c6g.metal spot ≈ 29% of on-demand (measured us-east-1 AZs $0.65–$0.74/hr, queried 2026-07);
@@ -350,13 +424,65 @@ Monitoring:
 > Keep system nodes On-Demand. Move only sandbox data nodes to Spot after interruption handling,
 > snapshot evacuation, and cross-node recovery are fully automated.
 
+**Sandbox host options and monthly pricing (us-east-1):**
+
+The prices below assume Linux/UNIX and 730 hours per month. Savings Plan prices use a **1-year EC2
+Instance Savings Plan with All Upfront payment**. "Effective monthly" divides the one-time upfront
+payment by 12 for comparison with On-Demand. EBS, the EKS control plane, and network transfer are not
+included. Prices were queried on 2026-08-12; verify current figures with
+[AWS Pricing Calculator](https://calculator.aws).
+
+**Nested virtualization (Intel x86, 4xlarge):**
+
+| Instance | vCPU | Memory | Local NVMe | On-Demand / mo | 1-year SP effective / mo | All Upfront total |
+|---|---:|---:|---:|---:|---:|---:|
+| `c8i.4xlarge` | 16 | 32 GiB | None | **$547** | **$338** | $4,055 |
+| `m8i.4xlarge` | 16 | 64 GiB | None | **$618** | **$382** | $4,579 |
+| `r8i.4xlarge` | 16 | 128 GiB | None | **$811** | **$501** | $6,011 |
+| `i7i.4xlarge` | 16 | 128 GiB | 1 × 3.75 TB | **$1,102** | **$668** | $8,012 |
+
+**Nested virtualization (Intel x86, 8xlarge):**
+
+| Instance | vCPU | Memory | Local NVMe | On-Demand / mo | 1-year SP effective / mo | All Upfront total |
+|---|---:|---:|---:|---:|---:|---:|
+| `c8i.8xlarge` | 32 | 64 GiB | None | **$1,095** | **$676** | $8,109 |
+| `m8i.8xlarge` | 32 | 128 GiB | None | **$1,236** | **$763** | $9,159 |
+| `r8i.8xlarge` | 32 | 256 GiB | None | **$1,623** | **$1,002** | $12,021 |
+| `i7i.8xlarge` | 32 | 256 GiB | 2 × 3.75 TB | **$2,205** | **$1,335** | $16,024 |
+
+All virtualized instances above support `nested_virtualization=enabled`. Because persistent EBS is
+authoritative in the current architecture, local NVMe is not required. `r8i.8xlarge` is the closest
+non-NVMe alternative to `i7i.8xlarge` by vCPU and memory.
+
+**Bare Metal:**
+
+| Instance | Architecture | vCPU | Memory | Local NVMe | On-Demand / mo | 1-year SP effective / mo | All Upfront total |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `c6g.metal` | ARM64 | 64 | 128 GiB | None | **$1,588** | **$934** | $11,208 |
+| `c6gd.metal` | ARM64 | 64 | 128 GiB | 2 × 1.9 TB | **$1,794** | **$1,055** | $12,659 |
+| `c7g.metal` | ARM64 | 64 | 128 GiB | None | **$1,694** | **$1,042** | $12,500 |
+| `c7gd.metal` | ARM64 | 64 | 128 GiB | 2 × 1.9 TB | **$2,119** | **$1,247** | $14,959 |
+| `m7g.metal` | ARM64 | 64 | 256 GiB | None | **$1,906** | **$1,177** | $14,123 |
+| `r7g.metal` | ARM64 | 64 | 512 GiB | None | **$2,502** | **$1,545** | $18,536 |
+| `c7i.metal-24xl` | x86_64 | 96 | 192 GiB | None | **$3,127** | **$1,931** | $23,170 |
+| `m8i.metal-48xl` | x86_64 | 192 | 768 GiB | None | **$7,417** | **$4,579** | $54,953 |
+| `i4i.metal` | x86_64 | 128 | 1,024 GiB | 8 × 3.75 TB | **$8,017** | **$4,855** | $58,263 |
+
+> These are AWS instance candidates capable of hosting Firecracker, not the current Terraform allowlist.
+> This repository currently enables and has tested ARM64 `c6g.metal` and x86 `i7i.*`. Before using
+> `c8i`, `m8i`, `r8i`, or another Bare Metal family, extend Terraform validation and complete an E2E
+> test for that architecture.
+
 **Per-sandbox amortized cost (single c6g.metal, 128 GiB):**
 
 | Mode | Memory per sandbox | Sandboxes | Amortized cost |
 |---|---|---|---|
 | 24×7 active workload | 1.5 GiB | ~75 | **~$23/sandbox·mo** |
-| **Snapshot idle recovery** | ~50 MB (idle footprint) | **400+** | **~$4/sandbox·mo** |
+| **Snapshot idle recovery** | ~50 MB (idle footprint) | **400+ (modeled)** | **~$4/sandbox·mo (modeled)** |
 | Savings Plan + snapshot recovery | — | same | **~$2–3/sandbox·mo** |
+
+`400+` and the corresponding per-sandbox cost are capacity-model outputs derived from the measured
+single-VM idle footprint and a concurrency assumption. A 400-microVM saturated-node test has not been run.
 
 > **vCPU / Memory Overcommit further reduces per-sandbox cost:** Firecracker microVMs support CPU oversubscription — idle sandboxes consume nearly zero CPU, and active sandboxes are burst-oriented. Measured idle footprint is only ~50 MB per VM (far below the allocated 1.5 GiB), which means you can provision more sandboxes than raw memory math suggests and fill the machine based on actual working-set, not allocation. Combined with snapshot-based idle recovery, the effective sandbox density — and thus per-sandbox cost — can be significantly lower than the table above. The right overcommit ratio depends on your workload profile and should be validated through load testing.
 
@@ -371,7 +497,7 @@ Monitoring:
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| Smoke tests | **50/50 PASS** | moto mock, `sandbox-api/smoke_test.py` |
+| Smoke tests | **control plane 53/53 + node-agent 5/5 PASS** | moto mocks plus observability/integrity tests |
 | Control/data plane separation | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 lifecycle | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 
@@ -401,9 +527,10 @@ To avoid misunderstanding vs. the implementation, the current boundaries:
 ### Local Smoke Test (No AWS Required)
 
 ```bash
-pip install "moto[dynamodb]" boto3 kubernetes
+python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
-# Expected: 50/50 PASS
+python3 node-agent/observability_test.py
+# Expected: control plane 53/53 + node-agent 5/5 PASS
 ```
 
 ---

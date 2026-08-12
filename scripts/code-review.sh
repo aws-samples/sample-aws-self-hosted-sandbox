@@ -12,6 +12,10 @@
 #
 set -uo pipefail
 
+# Treat large multilingual diffs as bytes. Bash's multibyte string replacement
+# can otherwise spend minutes just checking whether a diff is empty.
+export LC_ALL=C
+
 # ---- 配置（可用环境变量覆盖）-------------------------------------------------
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"   # 用 sonnet 控制速度/成本，可设为 opus
@@ -26,7 +30,7 @@ else
   SCOPE="暂存区改动"
 fi
 
-if [[ -z "${DIFF//[$' \t\n']/}" ]]; then
+if [[ -z "$(printf '%s' "$DIFF" | tr -d '[:space:]')" ]]; then
   echo "[code-review] 没有检测到改动，跳过。"
   exit 0
 fi

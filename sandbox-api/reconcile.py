@@ -24,6 +24,13 @@ import time
 import uuid
 
 from sandbox_api import db
+from sandbox_api.observability import (
+    RECONCILE_ACTIONS,
+    log_event,
+    record_loop,
+    register_loop,
+    set_leader,
+)
 
 # 对账关注的"活跃"状态(终态 destroying/failed/orphaned/needs_reschedule 不管)
 # slept = 自动休眠(与手动 suspended 同样有 S3/EBS 快照),对账时按同等方式处理。
@@ -54,24 +61,35 @@ class Reconciler:
         return self._is_leader
 
     def _refresh_leadership(self) -> None:
+        was_leader = self._is_leader
         rvn = db.acquire_leader_lock(LEADER_LOCK_ID, self._owner, LEADER_TTL_S)
         self._is_leader = rvn is not None
         self._rvn       = rvn
+        set_leader(self._is_leader, self._is_leader != was_leader)
 
     # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
 
     def start_loop(self) -> None:
+        register_loop("reconcile", RECONCILE_EVERY)
+
         def _loop():
             while True:
                 try:
                     self._refresh_leadership()
                     if self._is_leader:
                         self.reconcile_once()
-                except Exception:
+                        record_loop("reconcile", "success")
+                    else:
+                        record_loop("reconcile", "skipped")
+                except Exception as exc:
                     # 对账失败不能让线程死掉,下 tick 重试
-                    pass
+                    record_loop("reconcile", "error")
+                    log_event(
+                        "error", "background_loop_failed",
+                        loop="reconcile", error_type=type(exc).__name__,
+                    )
                 time.sleep(RECONCILE_EVERY)  # nosemgrep: arbitrary-sleep -- 对账周期
 
         threading.Thread(target=_loop, daemon=True).start()
@@ -135,6 +153,7 @@ class Reconciler:
                             {"reconcile_reason": reason})
             db.write_event(sid, "reconciled", prev_state,
                            {"new_state": new_state, "reason": reason, "node": node})
+            RECONCILE_ACTIONS.labels(new_state, reason).inc()
         except Exception:
             # 条件写失败 = 状态已被 API 路径改动,放弃本次(下 tick 重判)
             pass

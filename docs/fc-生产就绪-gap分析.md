@@ -5,6 +5,16 @@
 > 目的：盘点 FC driver 从"POC happy-path 跑通(e2e 14/14 PASS)"到"大规模生产就绪"之间缺的编排/运维能力，按优先级排列，逐项给出代码位置、Kata(K8s) 对照、修复方向。
 >
 > **核心判断**：FC 的 suspend/resume 机制已验证可用，但其编排层是一个"跑通了主流程的 POC"，而非生产系统。差距不在"FC 能不能用"，而在"FC 周围要补一整圈 Kata 靠 K8s **白送**、而这里必须**自建**的运维层"。选 FC = 承诺自建一个 mini 编排系统。
+>
+> **状态更新（2026-08-12）**：本文是基于 commit `e8129f8` 的历史 gap 基线，不是当前
+> 缺口清单。其 P0 项中的 reconcile、节点心跳发现、leader 选举和快照落盘确认，以及 P1
+> 的 auto-sleep/auto-wake、可观测性、快照 SHA-256 校验、P2 的端口暴露均已实现；
+> 集群内 Prometheus/Alertmanager/Grafana 与 AMP/AMG 查询链路已通过真实 AWS E2E。
+> 当前采用持久 EBS 作为快照权威来源，
+> 不再走本文假设的 S3 上传主路径。正文保留用于说明问题来源，现状请以
+> [`README.md`](../README.md) 和
+> [`docs/生产架构方案借鉴与优化.md`](生产架构方案借鉴与优化.md) 为准；可观测性证据见
+> [`P1可观测性-真机测试报告-2026-08-12.md`](P1可观测性-真机测试报告-2026-08-12.md)。
 
 ---
 
@@ -22,7 +32,7 @@
 | **P2** | 网络编排全自研 + sbxinit 硬编码 IP | 对外暴露沙盒服务基本空白；tap_idx≠1 时 SSH 通道连不上 | `node-agent/main.py:72-96` |
 | **P2** | create 乐观写 running | 无真正就绪信号(两 driver 共有) | `app.py:159-160` |
 | **P2** | jailer 隔离默认关闭 | `USE_BARE_FC=1` → 无 chroot/seccomp/cgroup 限制 | `node-agent/main.py:133-135` |
-| **P2** | 可观测性缺失 | 日志被静音、无 metrics/tracing → 出事无排障抓手 | `app.py:318-319`, `main.py:626` |
+| **P2** | 可观测性缺失（历史；P1 指标/告警/AMP+AMG 已完成） | 当时日志被静音、无 metrics/tracing | `app.py:318-319`, `main.py:626` |
 
 ---
 

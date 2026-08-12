@@ -6,6 +6,7 @@
 
 # Tool runtime artifacts
 .playwright-mcp/
+node_modules/
 
 # Python
 __pycache__/

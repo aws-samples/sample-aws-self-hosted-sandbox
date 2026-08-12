@@ -2,6 +2,10 @@
 
 > 📌 **历史存档**:本文是 POC 各阶段的实测记录(某时间点快照),含 Kata 编排(H3)等**已从项目移除**的方案。
 > Kata driver 因无法快照/恢复已删除,当前项目为裸 Firecracker 单一后端(见 README.md)。此文仅作历史参考,不再回改。
+> 后续 P1 可观测性（Prometheus/Alertmanager/Grafana、AMP/AMG、快照 SHA-256 校验）
+> 已于 2026-08-12 通过真实 AWS E2E，见
+> [`P1可观测性-真机测试报告-2026-08-12.md`](P1可观测性-真机测试报告-2026-08-12.md)；
+> 本文“下一阶段”的旧条目不作追溯改写。
 
 > 实测日期:2026-06-11 ~ 06-12 · 区域:us-east-1 · 验证方式:全程经 AWS SSM
 > 机型:H1/H4/快照初轮用 `c7g.metal`,H3/JuiceFS/跨机轮用 `c6g.metal`(两者同为 Graviton 64vCPU/128GiB,结论通用)

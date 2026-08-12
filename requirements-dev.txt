@@ -1,0 +1,4 @@
+boto3
+kubernetes
+moto[dynamodb]
+prometheus-client

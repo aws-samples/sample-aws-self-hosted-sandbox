@@ -32,7 +32,7 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 
 ## 前提条件
 
-- AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3）
+- AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3；启用托管可观测性时还需要 APS/AMP、Amazon Managed Grafana 和 VPC Endpoint 权限）
 - 已安装：kubectl, terraform (≥1.5), helm, git, docker
 - EC2 vCPU 服务配额：Graviton `c6g.metal` 需要 64 vCPU；x86 默认 `i7i.8xlarge` 需要 32 vCPU
 - x86 部署区域必须提供 i7i 且支持 nested virtualization；部署前按 Step 0.5 查询
@@ -52,6 +52,8 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
+11. **Helm/Kubernetes 认证依赖 AWS CLI**：stage2 provider 使用 `aws eks get-token` 动态刷新凭据，避免 15 分钟 EKS token 在长时间 Helm upgrade 中过期。执行 Terraform 的环境必须能从 `PATH` 调用 `aws`，且当前身份可访问目标集群。
+12. **可观测性分两层**：`enable_observability_stack=true` 安装集群内 Prometheus、Alertmanager 和 Grafana；`enable_amp_remote_write=true` 在此基础上创建 AMP 并 remote-write。AMG 是可选的**现有 workspace**，Terraform 只配置其查询 IAM 与 PrivateLink，不创建 AMG workspace，也不会自动创建 AMG datasource。
 
 ---
 
@@ -273,6 +275,140 @@ terraform apply -auto-approve \
 
 ---
 
+## Step 6.2: 部署可观测性（P1，推荐）
+
+控制面与 node-agent 均暴露低基数 `/metrics`，并提供 `/livez`、`/readyz`。指标不包含
+`sandbox_id`，避免实例规模直接放大 Prometheus series。快照生成 SHA-256 manifest，
+恢复前校验；校验失败会拒绝恢复并增加错误指标。
+
+### 模式 A：集群内 Prometheus + Alertmanager + Grafana
+
+先设置 Terraform 环境变量，再重新执行 Step 6 的完整 `terraform apply`，保持原参数值不变：
+
+```bash
+export TF_VAR_enable_observability_stack=true
+export TF_VAR_grafana_admin_password="$(openssl rand -base64 32 | tr -d '\n')"
+
+# 重新执行 Step 6 的 terraform apply；无需再追加 -var。
+```
+
+`grafana_admin_password` 至少 16 字符，通过 Helm `set_sensitive` 传入。不要打印密码或提交
+tfvars/state；后续 apply 应复用原值，可从 `monitoring/sandbox-monitoring-grafana` Secret
+读取到当前 shell，而不是重新生成。
+
+```bash
+export TF_VAR_grafana_admin_password="$(
+  kubectl get secret sandbox-monitoring-grafana -n monitoring \
+    -o jsonpath='{.data.admin-password}' | base64 --decode
+)"
+```
+
+Terraform 安装并配置：
+
+- `kube-prometheus-stack`（chart 固定版本见 `observability_chart_version`）
+- control-plane ServiceMonitor 与 node-agent PodMonitor
+- 5 类告警：唤醒体验、快照完整性、节点容量、孤儿增长、控制面退化
+- `Sandbox Platform` Dashboard：8 个低基数面板
+- Prometheus 3 天本地 retention；组件固定到 system 节点，node-exporter 容忍 sandbox taint
+
+访问方式：
+
+```bash
+terraform output prometheus_port_forward
+terraform output grafana_port_forward
+terraform output alertmanager_port_forward
+
+kubectl -n monitoring port-forward svc/sandbox-monitoring-prometheus 9090:9090
+# 新终端验证 targets 与 remote-write 前的本地采集
+curl -fsS http://127.0.0.1:9090/api/v1/targets | \
+  jq '{active:(.data.activeTargets|length),up:([.data.activeTargets[]|select(.health=="up")]|length)}'
+```
+
+### 模式 B：增加 Amazon Managed Service for Prometheus（AMP）
+
+AMP 依赖模式 A，不能单独启用：
+
+```bash
+export TF_VAR_enable_amp_remote_write=true
+
+# 现在逐字重新执行 Step 6 的完整 terraform apply，然后查看输出：
+
+terraform output amp_workspace_id
+terraform output amp_query_endpoint
+```
+
+Terraform 会创建 AMP workspace、Prometheus IRSA role 和最小
+`aps:RemoteWrite` policy，并给 Prometheus 配置 SigV4 remote-write。Prometheus Pod
+template annotation 会在角色或配置变化时触发受控滚动。
+
+```bash
+# 本地 Prometheus 中确认 remote-write 无失败；先执行上面的 port-forward
+curl -fsSG http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=sum(prometheus_remote_storage_samples_failed_total)' | jq
+curl -fsSG http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=sum(prometheus_remote_storage_samples_total)' | jq
+
+# IRSA 必须同时存在于 Prometheus 容器
+POD=$(kubectl get pod -n monitoring -l app.kubernetes.io/name=prometheus \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl get pod "$POD" -n monitoring -o json | jq \
+  '[.spec.containers[].env[]?|select(.name=="AWS_ROLE_ARN" or .name=="AWS_WEB_IDENTITY_TOKEN_FILE")|.name]'
+```
+
+### 模式 C：让现有 Amazon Managed Grafana（AMG）查询 AMP
+
+先创建或选择一个 `ACTIVE` AMG workspace，并配置 VPC 连接。将 workspace ID、VPC、
+AMG 使用的子网和安全组传给同一次 apply：
+
+```bash
+export TF_VAR_managed_grafana_workspace_id="g-xxxxxxxxxx"
+export TF_VAR_managed_grafana_vpc_id="vpc-id"
+export TF_VAR_managed_grafana_subnet_ids='["subnet-a","subnet-b"]'
+export TF_VAR_managed_grafana_security_group_id="amg-workspace-sg"
+
+# 现在逐字重新执行 Step 6 的完整 terraform apply，然后查看输出：
+
+terraform output managed_grafana_endpoint
+terraform output managed_grafana_amp_vpc_endpoint_id
+```
+
+Terraform 会把 AMP 查询权限附加到 AMG workspace role，并在 AMG VPC 创建
+`aps-workspaces` Interface Endpoint。Endpoint 专用安全组只允许 AMG workspace SG
+或该 VPC CIDR 的 TCP/443。若不传 `managed_grafana_vpc_id`，不会创建 PrivateLink。
+
+最后在 AMG 中创建 Prometheus datasource（可用 AWS Console 的 workspace
+`Data sources` 页面）：
+
+| 设置 | 值 |
+|---|---|
+| Name / UID | `Sandbox AMP` / `sandbox-amp` |
+| URL | `terraform output -raw amp_query_endpoint` |
+| SigV4 auth | Enabled |
+| SigV4 region | 与 `var.region` 相同 |
+| Authentication provider | Workspace IAM role / default AWS SDK credentials |
+| Default datasource | Enabled（Dashboard 查询未硬编码 datasource UID） |
+
+保存后 `Save & test` 必须返回 `Successfully queried the Prometheus API`。导出 Terraform
+生成的 Dashboard JSON，再从 AMG 的 `Dashboards → New → Import` 导入：
+
+```bash
+kubectl get configmap sandbox-platform-dashboard -n monitoring \
+  -o jsonpath='{.data.sandbox-platform\.json}' > /tmp/sandbox-platform.json
+```
+
+导入后至少验证：
+
+```promql
+count(up{namespace="sandbox-system",service="sandbox-control-plane"})
+count(up{namespace="sandbox-system",job="monitoring/sandbox-node-agent"})
+```
+
+AMG API 自动化测试如果临时创建 service account/token，必须在测试结束后立即删除；
+不要把 token 写入日志、文档或 shell history。2026-08-12 的真实 AWS 验证证据见
+[P1 可观测性真机测试报告](P1可观测性-真机测试报告-2026-08-12.md)。
+
+---
+
 ## Step 6.5: 启用沙盒端口暴露（可选，vibe coding / web 预览需要）
 
 让沙盒内的 web 服务（如 :80 / :3000）能从集群外访问。链路：
@@ -491,6 +627,23 @@ aws dynamodb delete-item --table-name claude-sbx-sandboxes --key '{"id":{"S":"dr
 
 > 完整 P0 真机测试报告见 **[docs/P0编排加固-真机测试报告-2026-07-07.md](P0编排加固-真机测试报告-2026-07-07.md)**。
 
+**验证 P1 可观测性**（若执行了 Step 6.2）：
+
+```bash
+kubectl get pods -n monitoring
+kubectl get prometheus sandbox-monitoring-prometheus -n monitoring -o json | \
+  jq '{availableReplicas:.status.availableReplicas,podAnnotations:.spec.podMetadata.annotations}'
+kubectl get prometheusrules -n monitoring
+
+# 期望：所有 monitoring Pod Ready；Prometheus availableReplicas=1；
+# 启用 AMP 时 podAnnotations 含 sandbox.platform/amp-remote-write-role。
+```
+
+完整验收还应覆盖：29/29 targets（数量随集群规模变化）、remote-write failed=0、
+AMP 查询到 2 个控制面和每个 node-agent、AMG datasource health=`OK`、Dashboard
+存在，以及 `terraform plan -detailed-exitcode` 返回 0。详见
+[P1 可观测性真机测试报告](P1可观测性-真机测试报告-2026-08-12.md)。
+
 > **排障：**
 > - **create/exec 全 503 `control plane not configured`** → 没配 API_KEYS。测试环境快速放行：`kubectl set env deployment/sandbox-control-plane -n sandbox-system ALLOW_UNAUTHENTICATED=1`（生产严禁）。
 > - **create 卡住无响应（~90-120s）** → `_pick_node` 探到不可达节点的 `/health` 阻塞。P0 后正常情况节点来自心跳表（死节点按 last_seen 自动剔除），但若心跳表为空回退到 `FC_NODES` 且里面有抖动节点会阻塞。先查心跳表 `aws dynamodb scan --table-name claude-sbx-nodes`；若心跳未起，临时改 `kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定IP>`。
@@ -558,7 +711,8 @@ kubectl delete ingress sandbox-proxy -n sandbox-system --ignore-not-found
 helm uninstall ingress-nginx -n ingress-nginx 2>/dev/null || true
 #    （下面 stage2 destroy 传 create_ingress_nginx=false，terraform 里本就无此 NLB 记录，故手动删）
 
-# 1. 删 stage2（var 要与 apply 时一致，含 fc_nodes）
+# 1. 删 stage2（var 必须与 apply 时一致，含 fc_nodes 和所有可观测性开关）。
+#    最稳妥做法是 destroy 复用 apply 时的同一份 tfvars。
 cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=placeholder" \
@@ -570,6 +724,17 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="create_ingress_nginx=false" \
   -var="api_keys=placeholder" \
   -var="litellm_master_key=placeholder"
+
+# 若启用了模式 A/B/C，上面的 destroy 还必须带同一组：
+#   -var="enable_observability_stack=true"
+#   -var="grafana_admin_password=<至少16字符的占位值>"
+#   -var="enable_amp_remote_write=true"
+#   -var="managed_grafana_workspace_id=<原 workspace id>"
+#   -var="managed_grafana_vpc_id=<原 vpc id>"
+#   -var='managed_grafana_subnet_ids=["<原subnet-a>","<原subnet-b>"]'
+#   -var="managed_grafana_security_group_id=<原 AMG SG>"
+# 这会删除 Terraform 创建的 AMP、查询 IAM policy 和 Interface Endpoint；
+# 不会删除外部已有的 AMG workspace。销毁前先导出需保留的 Dashboard。
 
 # ⚠️ 若卡在删 sandbox-system namespace（node-agent pod 在 NotReady 节点上无法优雅终止）：
 #   kubectl delete pods -n sandbox-system --all --force --grace-period=0

@@ -6,9 +6,9 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
     awscli iproute2 iptables openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir boto3
+RUN pip install --no-cache-dir boto3 prometheus-client
 
 WORKDIR /app
-COPY main.py /app/
+COPY main.py observability.py /app/
 
 CMD ["python3", "/app/main.py"]

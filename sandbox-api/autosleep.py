@@ -17,11 +17,11 @@ AutoSleeper — 空闲自动休眠扫描 loop(auto-sleep,对齐 fly.io)。
 from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 
 from sandbox_api import db
+from sandbox_api.observability import log_event, record_loop, register_loop
 
 SCAN_EVERY = int(os.environ.get("AUTO_SLEEP_SCAN_S", "30"))
 
@@ -40,7 +40,7 @@ class AutoSleeper:
 
     def scan_once(self) -> dict:
         """扫一遍 running 沙盒,把空闲且 opt-in 的休眠。返回计数,便于测试/可观测。"""
-        stats = {"checked": 0, "slept": 0, "skipped": 0}
+        stats = {"checked": 0, "slept": 0, "skipped": 0, "errors": 0}
         for rec in db.list_by_states(["running"]):
             stats["checked"] += 1
             sid = rec["id"]
@@ -63,20 +63,38 @@ class AutoSleeper:
                     stats["slept"] += 1
                 else:
                     stats["skipped"] += 1
+                    if code >= 500:
+                        stats["errors"] += 1
             except Exception as e:
-                print(f"[autosleep] sleep {sid} failed: {e!r}", file=sys.stderr, flush=True)
+                log_event(
+                    "error", "autosleep_sandbox_failed",
+                    sandbox_id=sid, error_type=type(e).__name__,
+                )
                 stats["skipped"] += 1
+                stats["errors"] += 1
         return stats
 
     def start_loop(self, is_leader=None) -> None:
         """后台扫描 loop。is_leader:可选无参 callable,返回 True 才扫描(leader 门控)。"""
+        register_loop("autosleep", SCAN_EVERY)
+
         def _loop():
             while True:
                 try:
                     if is_leader is None or is_leader():
-                        self.scan_once()
-                except Exception:
-                    pass  # 扫描失败不让线程死,下 tick 重试
+                        stats = self.scan_once()
+                        record_loop(
+                            "autosleep",
+                            "error" if stats["errors"] else "success",
+                        )
+                    else:
+                        record_loop("autosleep", "skipped")
+                except Exception as exc:
+                    record_loop("autosleep", "error")
+                    log_event(
+                        "error", "background_loop_failed",
+                        loop="autosleep", error_type=type(exc).__name__,
+                    )
                 time.sleep(SCAN_EVERY)  # nosemgrep: arbitrary-sleep -- 自动休眠扫描周期
 
         threading.Thread(target=_loop, daemon=True).start()

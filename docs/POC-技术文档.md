@@ -4,6 +4,9 @@
 > Kata driver 因无法快照/恢复已删除,当前项目为裸 Firecracker 单一后端(见 README.md)。此文仅作历史参考,不再回改。
 > 当前架构与部署以 [`README.md`](../README.md)、[`docs/deploy.md`](deploy.md) 和
 > [控制面与数据面分离 i7i 真机测试报告](控制面数据面分离-i7i真机测试报告-2026-08-11.md) 为准。
+> 2026-08-12 已完成的 Prometheus/Alertmanager/Grafana、AMP/AMG 和快照完整性验证见
+> [P1 可观测性真机测试报告](P1可观测性-真机测试报告-2026-08-12.md)；正文旧 roadmap
+> 中的“P1 可观测性待完成”仅保留为历史状态。
 
 > 目标读者:负责在 AWS 上搭建最小可行原型(POC)、验证可行性的工程师
 > 版本日期:2026-06-11

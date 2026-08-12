@@ -10,7 +10,7 @@ terraform/
 ├── phase1/                单机 Firecracker 实验环境
 ├── stage1-dynamodb/       sandbox / events / tap-idx / nodes / locks 状态表
 ├── phase3/                EKS + On-Demand system 节点组 + sandbox 节点组 + 持久 EBS
-└── stage2-control-plane/  控制面、node-agent、LiteLLM、Ingress 与对应 IAM/K8s 资源
+└── stage2-control-plane/  控制面、node-agent、LiteLLM、Ingress、可观测性与对应 IAM/K8s 资源
 ```
 
 > Firecracker 安装、guest 内核、rootfs 构建、microVM 启动是**主机内**操作,不归 Terraform 管 —— 见
@@ -108,6 +108,38 @@ system + `1 × i7i.8xlarge` sandbox 的调度隔离、Firecracker 生命周期�
 恢复后 exec、LiteLLM Bedrock 调用、控制面 leader 故障转移和完整清理均通过。
 详见[控制面与数据面分离 i7i 真机测试报告](../docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)。
 
+## Stage 2 可观测性
+
+`stage2-control-plane/observability.tf` 提供两个显式开关：
+
+| 开关 | 资源 |
+|---|---|
+| `enable_observability_stack=true` | 集群内 Prometheus、Alertmanager、Grafana、ServiceMonitor/PodMonitor、5 类告警、8 面板 Dashboard |
+| `enable_amp_remote_write=true` | AMP workspace、Prometheus remote-write IRSA/SigV4；要求上一个开关同时为 `true` |
+
+可选传入已有 AMG workspace：
+
+```hcl
+managed_grafana_workspace_id       = "g-xxxxxxxxxx"
+managed_grafana_vpc_id             = "vpc-..."
+managed_grafana_subnet_ids         = ["subnet-a", "subnet-b"]
+managed_grafana_security_group_id  = "sg-..."
+```
+
+Terraform 会给 AMG workspace role 增加最小 AMP 查询权限，并在其 VPC 创建
+`aps-workspaces` Interface Endpoint；不会创建或删除 AMG workspace，也不自动创建
+AMG datasource。完整参数、Datasource 设置和验证命令见
+[`docs/deploy.md` Step 6.2](../docs/deploy.md#step-62-部署可观测性p1推荐)。
+
+Prometheus 与 node-agent 的指标不使用 sandbox ID 标签。Grafana admin password 通过
+Helm `set_sensitive` 注入，不放进普通 values。Kubernetes 和 Helm provider 使用
+`aws eks get-token` exec credential，长时间 apply 可以刷新 EKS token；运行 Terraform
+的环境必须能从 `PATH` 调用 AWS CLI。
+
+真实 AWS 验证覆盖 29/29 targets、AMP remote-write、AMG datasource/query、
+快照损坏告警和 Terraform 零漂移，见
+[P1 可观测性真机测试报告](../docs/P1可观测性-真机测试报告-2026-08-12.md)。
+
 ## 前置：申请 EC2 vCPU 配额
 
 `c6g.metal` 需要 64 vCPU，`i7i.8xlarge` 需要 32 vCPU。若 apply 报
@@ -126,6 +158,6 @@ Phase 1 的 Terraform 给主机挂了 **Bedrock IAM 角色**(对应 POC 文档 1
 2. 构建对应数据节点架构的 rootfs 并上传 S3，作为节点初始化输入。
 3. `phase3`：创建 EKS、system/sandbox 节点组和 sandbox 持久状态 EBS。
 4. 分别构建 arm64 控制面镜像和匹配数据节点架构的 node-agent 镜像。
-5. `stage2-control-plane`：部署控制面、node-agent、LiteLLM 和可选 Ingress。
+5. `stage2-control-plane`：部署控制面、node-agent、LiteLLM、可选 Ingress 和可选可观测性栈。
 
 完整变量、验证和销毁步骤以 [`docs/deploy.md`](../docs/deploy.md) 为准。

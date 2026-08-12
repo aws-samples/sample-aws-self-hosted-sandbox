@@ -10,13 +10,13 @@ Warm Pool — 对外隐藏冷启动,让 create 永远秒级完成。
 from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 import uuid
 
 from sandbox_api import db
 from sandbox_api.driver import SandboxSpec, ServiceSpec
+from sandbox_api.observability import log_event, record_loop, register_loop
 
 POOL_SIZE    = int(os.environ.get("WARM_POOL_SIZE", "5"))
 REFILL_EVERY = int(os.environ.get("WARM_POOL_REFILL_S", "30"))
@@ -75,8 +75,10 @@ class WarmPool:
         except Exception as e:
             # resume 失败:该 warm 快照/VM 可能已损坏,删掉避免反复领到坏实例;
             # 打印异常(不静默吞)——否则暖池全回退冷建时无从排查(可观测性)。
-            print(f"[warm_pool] claim resume failed for {warm_id}, "
-                  f"fallback to cold create: {e!r}", file=sys.stderr, flush=True)
+            log_event(
+                "error", "warm_pool_claim_failed",
+                sandbox_id=warm_id, error_type=type(e).__name__,
+            )
             db.delete(warm_id)
             return False
 
@@ -84,11 +86,12 @@ class WarmPool:
     # replenish — 后台补充暖池水位
     # ------------------------------------------------------------------
 
-    def replenish(self) -> None:
+    def replenish(self) -> dict[str, int]:
         current = db.count_warm(self._driver_name)
         need    = POOL_SIZE - current
+        stats = {"created": 0, "errors": 0}
         if need <= 0:
-            return
+            return stats
 
         for _ in range(need):
             warm_id = f"warm-{uuid.uuid4().hex[:8]}"
@@ -124,11 +127,18 @@ class WarmPool:
                     "driver":      self._driver_name,
                     "snapshot_s3": snap_info.get("snapshot_s3", ""),
                 })
-            except Exception:
+                stats["created"] += 1
+            except Exception as exc:
+                stats["errors"] += 1
+                log_event(
+                    "error", "warm_pool_replenish_failed",
+                    sandbox_id=warm_id, error_type=type(exc).__name__,
+                )
                 try:
                     db.delete(warm_id)
                 except Exception:
                     pass
+        return stats
 
     def start_replenish_loop(self, is_leader=None) -> None:
         """
@@ -137,13 +147,25 @@ class WarmPool:
         Reconciler 的 leader 门控注入,避免多副本重复补池互相打架(gap P1-4)。
         None(默认)= 单副本/测试,始终补充。
         """
+        register_loop("warm_pool", REFILL_EVERY)
+
         def _loop():
             while True:
                 try:
                     if is_leader is None or is_leader():
-                        self.replenish()
-                except Exception:
-                    pass
+                        stats = self.replenish()
+                        record_loop(
+                            "warm_pool",
+                            "error" if stats["errors"] else "success",
+                        )
+                    else:
+                        record_loop("warm_pool", "skipped")
+                except Exception as exc:
+                    record_loop("warm_pool", "error")
+                    log_event(
+                        "error", "background_loop_failed",
+                        loop="warm_pool", error_type=type(exc).__name__,
+                    )
                 time.sleep(REFILL_EVERY)  # nosemgrep: arbitrary-sleep -- 暖池补充周期
 
         t = threading.Thread(target=_loop, daemon=True)

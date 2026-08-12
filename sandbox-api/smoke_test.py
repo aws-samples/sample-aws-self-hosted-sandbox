@@ -63,6 +63,7 @@ os.environ.update({
 class _AgentStub(BaseHTTPRequestHandler):
     """最小 node-agent stub:记录调用、返回合理假数据。"""
     calls: list[tuple[str, str, dict]] = []
+    request_ids: list[str] = []
 
     def log_message(self, *_): pass
 
@@ -81,6 +82,7 @@ class _AgentStub(BaseHTTPRequestHandler):
     def do_POST(self):
         b = self._body()
         _AgentStub.calls.append(("POST", self.path, b))
+        _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
         sid = b.get("id", "unknown")
         if self.path == "/vm/create":
             return self._send(200, {"state": "running", "ip": "172.18.1.2"})
@@ -99,6 +101,7 @@ class _AgentStub(BaseHTTPRequestHandler):
 
     def do_GET(self):
         _AgentStub.calls.append(("GET", self.path, {}))
+        _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
         if self.path == "/health":
             return self._send(200, {"node_id": "mock-node", "free_mem_mib": 90000, "vm_count": 0})
         if self.path.startswith("/vm/"):
@@ -506,6 +509,7 @@ class TestAPIEndToEnd(unittest.TestCase):
             code, body = c("POST", f"/sandboxes/{sid}/resume")
             self.assertEqual(code, 200)
             self.assertEqual(body["state"], "running")
+            self.assertIn("resume_queue_wait_s", body)
 
             # DELETE /sandboxes/{id}
             code, body = c("DELETE", f"/sandboxes/{sid}")
@@ -515,6 +519,25 @@ class TestAPIEndToEnd(unittest.TestCase):
             # 删除后 GET → 404
             code, _ = c("GET", f"/sandboxes/{sid}")
             self.assertEqual(code, 404)
+
+            # 指标标签使用归一化 route，不能泄露 sandbox id。
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/metrics", timeout=5
+            ) as response:
+                metrics = response.read().decode()
+            self.assertIn("http_requests_total", metrics)
+            self.assertNotIn(sid, metrics)
+
+            # 控制面生成的 request id 会返回客户端并透传到 node-agent。
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/capabilities",
+                headers={"X-Request-ID": "test-correlation-id"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                self.assertEqual(
+                    response.headers["X-Request-ID"], "test-correlation-id"
+                )
+            self.assertTrue(any(_AgentStub.request_ids))
 
         finally:
             srv.shutdown()
@@ -1019,8 +1042,46 @@ class TestNodeRegistry(unittest.TestCase):
         self.assertEqual({n["node_id"] for n in active}, {"live"})
 
 
+class TestObservability(unittest.TestCase):
+    @mock_aws
+    def test_readiness_requires_an_active_node(self):
+        _create_tables()
+        from sandbox_api import app, db
+
+        code, body = app.health_report(require_dependencies=True)
+        self.assertEqual(code, 503)
+        self.assertEqual(body["checks"]["active_nodes"], 0)
+
+        db.heartbeat_node("nodeA", "10.0.1.5", 8000, 1)
+        code, body = app.health_report(require_dependencies=True)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["checks"]["active_nodes"], 1)
+
+    def test_metric_routes_are_low_cardinality(self):
+        from sandbox_api.observability import normalize_route
+
+        self.assertEqual(
+            normalize_route("/sandboxes/private-id/resume?token=secret"),
+            "/sandboxes/{id}/resume",
+        )
+        self.assertEqual(
+            normalize_route("/s/private-id/8080/path/to/file?token=secret"),
+            "/s/{id}/{port}/{path}",
+        )
+
+
 class TestLeaderLock(unittest.TestCase):
     """leader 锁抢占/续租/过期(P1-4)。"""
+
+    @mock_aws
+    def test_lock_backend_errors_are_not_reported_as_contention(self):
+        _create_tables()
+        from botocore.exceptions import ClientError
+        from sandbox_api import db
+
+        with patch.object(db, "LOCKS_TABLE", "missing-locks-table"):
+            with self.assertRaises(ClientError):
+                db.acquire_leader_lock("reconciler", "ownerA", ttl_s=30)
 
     @mock_aws
     def test_only_one_leader(self):
@@ -1318,7 +1379,8 @@ if __name__ == "__main__":
     for cls in [TestDB, TestFirecrackerDriver,
                 TestAPIEndToEnd, TestAdminAggregates, TestCustomImage, TestPortExposure,
                 TestFileTransfer, TestWarmPool, TestAPIAuth,
-                TestNodeRegistry, TestLeaderLock, TestReconcile, TestAutoSleep]:
+                TestNodeRegistry, TestObservability, TestLeaderLock,
+                TestReconcile, TestAutoSleep]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

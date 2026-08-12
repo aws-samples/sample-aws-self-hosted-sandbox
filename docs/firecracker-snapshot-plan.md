@@ -3,7 +3,9 @@
 > **本方案（下文简称"Firecracker 快照方案"）** 目标：把控制面从 kata driver 切到
 > firecracker driver，使 `/sandboxes/{id}/suspend` 真正打内存快照（传 S3）、
 > `/resume` 在另一节点恢复（文档 §五 实测 1.2s）。
-> 状态：**设计，待评审**。
+> 状态：**历史实施方案，主路径已落地**。Firecracker 已成为当前唯一 driver，Kata 路径已
+> 删除；节点发现、快照格式和状态存储也已在后续实现中演进。本文保留最初切换方案，
+> 当前部署步骤以 [`deploy.md`](deploy.md) 和 [`../README.md`](../README.md) 为准。
 >
 > 术语说明：本文档早期用内部代号 "B2" 指代该方案，现统一改为"Firecracker 快照方案"。
 
@@ -129,4 +131,3 @@ POST /sandboxes/{id}/exec     → 内存标记还在 → 证明内存级续跑 �
 guest init 启动后往一个固定地址（如 tmpfs 文件 + 进程持续递增的计数器）写状态；
 suspend 前记录值，resume 后读出——若续上（而非从头），证明内存级恢复成功。
 node-agent 无 exec 时，通过 guest 串口日志（vm.log）或一个会把计数写到可观测位置的方式确认。
-

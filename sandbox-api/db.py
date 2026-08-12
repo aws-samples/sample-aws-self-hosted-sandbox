@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
 
 SANDBOXES_TABLE = os.environ.get("DYNAMODB_TABLE", "sandboxes")
 EVENTS_TABLE    = os.environ.get("DYNAMODB_EVENTS_TABLE", "sandbox_events")
@@ -249,8 +250,10 @@ def acquire_leader_lock(lock_id: str, owner: str, ttl_s: int = 30) -> int | None
             ReturnValues="UPDATED_NEW",
         )
         return int(resp["Attributes"]["rvn"])
-    except Exception:
-        return None
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
 
 
 def renew_leader_lock(lock_id: str, owner: str, ttl_s: int = 30) -> int | None:

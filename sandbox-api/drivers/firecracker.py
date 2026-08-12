@@ -18,6 +18,7 @@ import urllib.request
 from typing import Any
 
 from sandbox_api import db
+from sandbox_api.observability import current_request_id
 from sandbox_api.driver import Capabilities, SandboxSpec, UnsupportedOperation
 
 # node-agent 监听端口(DaemonSet hostNetwork 模式)
@@ -181,6 +182,7 @@ class FirecrackerDriver:
             # 透传 node-agent 的恢复指标(P1 网络收敛结果 + 恢复/合并耗时),便于观测/验证。
             "restore_time_s":  resp.get("restore_time_s"),
             "merge_time_s":    resp.get("merge_time_s"),
+            "restore_mode":    resp.get("restore_mode"),
             "net_fix_ok":      resp.get("net_fix_ok"),
         }
 
@@ -293,6 +295,8 @@ class FirecrackerDriver:
         url  = f"http://{host}{path}"
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"}
+        if request_id := current_request_id():
+            headers["X-Request-ID"] = request_id
         req  = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:

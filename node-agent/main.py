@@ -23,6 +23,7 @@ node-agent — 每台 .metal 节点上的 on-host 执行手。
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,23 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+from observability import (
+    FC_RESUME_INFLIGHT,
+    NODE_HEARTBEAT_ERRORS,
+    log_event,
+    metrics_payload,
+    new_request_id,
+    normalize_route,
+    record_fc_operation,
+    record_http,
+    record_restore_mode,
+    record_resume_stage,
+    record_snapshot_error,
+    record_snapshot_transfer,
+    record_snapshot_verify,
+    refresh_node_metrics,
+)
 
 # ---------- 配置 ----------
 LISTEN_PORT  = int(os.environ.get("NODE_AGENT_PORT", "8002"))
@@ -118,6 +136,8 @@ JUICEFS_FS_NAME    = "sbxfs"                      # JuiceFS 文件系统名（�
 _VMS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 _VM_OP_LOCKS: dict[str, threading.RLock] = {}
+_HEARTBEAT_LAST_SUCCESS = 0.0
+_HEARTBEAT_LAST_ITERATION = time.monotonic()
 
 os.makedirs(SBX_BASE, exist_ok=True)
 
@@ -324,6 +344,7 @@ def _s3_upload_sync(local_dir: str, s3_prefix: str, retries: int = 3) -> None:
     """
     if not s3_prefix:
         return
+    started = time.monotonic()
     last_err: Exception | None = None
     for attempt in range(retries):
         r = subprocess.run(
@@ -332,11 +353,16 @@ def _s3_upload_sync(local_dir: str, s3_prefix: str, retries: int = 3) -> None:
             capture_output=True, text=True,
         )
         if r.returncode == 0:
+            record_snapshot_transfer(
+                "upload", "success", time.monotonic() - started
+            )
             return
         last_err = RuntimeError(
             f"aws s3 sync rc={r.returncode}: {r.stderr.strip()[:500]}")
         if attempt < retries - 1:
             time.sleep(2 ** attempt)  # nosemgrep: arbitrary-sleep -- 上传重试退避
+    record_snapshot_transfer("upload", "error", time.monotonic() - started)
+    record_snapshot_error("upload")
     raise last_err or RuntimeError("s3 upload failed")
 
 
@@ -345,11 +371,104 @@ def _s3_download(s3_prefix: str, local_dir: str) -> None:
     if not s3_prefix:
         return
     os.makedirs(local_dir, exist_ok=True)
-    subprocess.run(
-        ["aws", "s3", "sync", s3_prefix, local_dir,
-         "--region", AWS_REGION, "--quiet"],
-        check=True,
-    )
+    started = time.monotonic()
+    try:
+        subprocess.run(
+            ["aws", "s3", "sync", s3_prefix, local_dir,
+             "--region", AWS_REGION, "--quiet"],
+            check=True,
+        )
+        record_snapshot_transfer(
+            "download", "success", time.monotonic() - started
+        )
+    except Exception:
+        record_snapshot_transfer(
+            "download", "error", time.monotonic() - started
+        )
+        record_snapshot_error("download")
+        raise
+
+
+_SNAPSHOT_MANIFEST = "integrity.json"
+_SNAPSHOT_FILES = (
+    "vm.snapshot",
+    "vm.mem",
+    "vm.snapshot.base",
+    "vm.mem.base",
+)
+
+
+class SnapshotIntegrityError(RuntimeError):
+    pass
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_snapshot_manifest(snap_dir: str) -> dict:
+    files = {}
+    for name in _SNAPSHOT_FILES:
+        path = os.path.join(snap_dir, name)
+        if os.path.isfile(path):
+            files[name] = {
+                "size": os.path.getsize(path),
+                "sha256": _sha256_file(path),
+            }
+    if "vm.snapshot" not in files or "vm.mem" not in files:
+        raise SnapshotIntegrityError("snapshot is missing required files")
+    manifest = {"version": 1, "algorithm": "sha256", "files": files}
+    target = os.path.join(snap_dir, _SNAPSHOT_MANIFEST)
+    temporary = f"{target}.tmp"
+    with open(temporary, "w", encoding="ascii") as stream:
+        json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    return manifest
+
+
+def _verify_snapshot_manifest(snap_dir: str) -> dict:
+    target = os.path.join(snap_dir, _SNAPSHOT_MANIFEST)
+    try:
+        with open(target, encoding="ascii") as stream:
+            manifest = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise SnapshotIntegrityError("snapshot integrity manifest is unavailable") from exc
+    if manifest.get("version") != 1 or manifest.get("algorithm") != "sha256":
+        raise SnapshotIntegrityError("snapshot integrity manifest is unsupported")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise SnapshotIntegrityError("snapshot integrity manifest is empty")
+    for name, expected in files.items():
+        if name not in _SNAPSHOT_FILES or not isinstance(expected, dict):
+            raise SnapshotIntegrityError("snapshot integrity manifest is invalid")
+        path = os.path.join(snap_dir, name)
+        if not os.path.isfile(path):
+            raise SnapshotIntegrityError(f"snapshot file is missing: {name}")
+        if os.path.getsize(path) != expected.get("size"):
+            raise SnapshotIntegrityError(f"snapshot size mismatch: {name}")
+        if _sha256_file(path) != expected.get("sha256"):
+            raise SnapshotIntegrityError(f"snapshot checksum mismatch: {name}")
+    if "vm.snapshot" not in files or "vm.mem" not in files:
+        raise SnapshotIntegrityError("snapshot manifest omits required files")
+    return manifest
+
+
+def _record_snapshot_verification(snap_dir: str) -> dict:
+    started = time.monotonic()
+    try:
+        manifest = _verify_snapshot_manifest(snap_dir)
+        record_snapshot_verify("success", time.monotonic() - started)
+        return manifest
+    except Exception:
+        record_snapshot_verify("error", time.monotonic() - started)
+        record_snapshot_error("verify")
+        raise
 
 
 # ---------- 操作实现 ----------
@@ -521,6 +640,18 @@ def op_suspend(body: dict) -> dict:
             }, timeout=SNAP_TIMEOUT)
     dt = time.monotonic() - t0
 
+    # suspend 只有在完整性清单落盘并立即回读通过后才算成功。失败时 VMM
+    # 仍只是 Paused，先恢复运行再把错误交给控制面回滚状态。
+    try:
+        _write_snapshot_manifest(snap_dir)
+        _record_snapshot_verification(snap_dir)
+    except Exception:
+        try:
+            _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
+        except Exception:
+            pass
+        raise
+
     # 方案C:快照写在持久状态 EBS 上(snap_dir),spot 终止后卷幸存,
     # 故【不传 S3】——删掉最慢的 S3 传输,是 120s 窗口内跑满 50 个的关键。
     # snapshot/create 同步完成即已落 EBS,数据已持久 → 可安全 kill VMM。
@@ -629,8 +760,13 @@ def op_resume(body: dict) -> dict:
     # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
     # s3_prefix 恒为空 → 这段兜底当前【不会触发】,为未来可选的 S3 归档预留。
     # 现实的跨机恢复靠持久状态 EBS 卷幸存 + attach 到新节点(卷已 attach 则本地就有快照)。
+    restore_mode = "local"
     if not os.path.exists(f"{snap_dir}/vm.snapshot") and s3_prefix:
         _s3_download(s3_prefix, snap_dir)
+        restore_mode = "s3"
+
+    # 在合并内存和启动新 Firecracker 进程前校验，损坏快照不会进入 guest。
+    _record_snapshot_verification(snap_dir)
 
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
@@ -797,6 +933,7 @@ def op_resume(body: dict) -> dict:
 
     return {"restore_time_s": round(dt, 4), "ip": guest_ip,
             "merge_time_s": round(merge_time, 4),
+            "restore_mode": restore_mode,
             "net_fix_ok": net_fix_ok,
             "juicefs_mode": JUICEFS_ENABLED}
 
@@ -904,6 +1041,64 @@ def op_health() -> dict:
     return {"node_id": NODE_ID, "free_mem_mib": mem, "vm_count": count}
 
 
+def _scratch_bytes() -> tuple[int, int]:
+    try:
+        stat = os.statvfs(SBX_BASE)
+        return stat.f_bavail * stat.f_frsize, stat.f_blocks * stat.f_frsize
+    except OSError:
+        return 0, 0
+
+
+def _refresh_metrics() -> None:
+    with _LOCK:
+        states: dict[str, int] = {}
+        for vm in _VMS.values():
+            state = vm.get("state", "unknown")
+            states[state] = states.get(state, 0) + 1
+    scratch_free, scratch_total = _scratch_bytes()
+    refresh_node_metrics(
+        NODE_ID,
+        states,
+        _free_mem_mib() * 1024 * 1024,
+        scratch_free,
+        scratch_total,
+    )
+
+
+def health_report(require_dependencies: bool) -> tuple[int, dict]:
+    checks: dict[str, object] = {"http": "ok"}
+    heartbeat_loop_age = time.monotonic() - _HEARTBEAT_LAST_ITERATION
+    heartbeat_loop_ok = heartbeat_loop_age <= max(30, HEARTBEAT_EVERY_S * 3)
+    checks["heartbeat_loop"] = heartbeat_loop_ok
+    healthy = heartbeat_loop_ok
+    if require_dependencies:
+        checks["kvm"] = os.path.exists("/dev/kvm")
+        checks["firecracker"] = os.path.isfile(FC_BIN) and os.access(FC_BIN, os.X_OK)
+        checks["state_path"] = os.path.isdir(SBX_BASE) and os.access(SBX_BASE, os.W_OK)
+        heartbeat_age = (
+            time.monotonic() - _HEARTBEAT_LAST_SUCCESS
+            if _HEARTBEAT_LAST_SUCCESS else None
+        )
+        checks["heartbeat_age_seconds"] = (
+            round(heartbeat_age, 3) if heartbeat_age is not None else None
+        )
+        heartbeat_ok = (
+            heartbeat_age is not None
+            and heartbeat_age <= max(30, HEARTBEAT_EVERY_S * 3)
+        )
+        checks["heartbeat"] = heartbeat_ok
+        healthy = healthy and all((
+            checks["kvm"],
+            checks["firecracker"],
+            checks["state_path"],
+            heartbeat_ok,
+        ))
+    return (200 if healthy else 503), {
+        "status": "ok" if healthy else "unhealthy",
+        "checks": checks,
+    }
+
+
 def _free_mem_mib() -> int:
     try:
         with open("/proc/meminfo") as f:
@@ -941,6 +1136,7 @@ def _heartbeat_once() -> None:
     用 aws CLI 子进程(与 S3 快照上传同款依赖),不引入 boto3 —— node-agent 镜像
     只保证装了 awscli,容器里 python3 版本可能与 boto3 安装目标不一致(实测踩坑)。
     """
+    global _HEARTBEAT_LAST_SUCCESS
     from datetime import datetime, timezone
     with _LOCK:
         vm_count = len(_VMS)
@@ -958,17 +1154,22 @@ def _heartbeat_once() -> None:
          "--item", json.dumps(item)],
         check=True, capture_output=True, text=True,
     )
+    _HEARTBEAT_LAST_SUCCESS = time.monotonic()
 
 
 def start_heartbeat_loop() -> None:
     def _loop():
-        import sys
+        global _HEARTBEAT_LAST_ITERATION
         while True:
+            _HEARTBEAT_LAST_ITERATION = time.monotonic()
             try:
                 _heartbeat_once()
             except Exception as e:
-                # 心跳失败不阻断执行面,但打到 stderr 便于排障(勿静默吞)
-                print(f"[heartbeat] failed: {e}", file=sys.stderr, flush=True)
+                NODE_HEARTBEAT_ERRORS.labels(NODE_ID).inc()
+                log_event(
+                    "error", "heartbeat_failed",
+                    error_type=type(e).__name__,
+                )
             time.sleep(HEARTBEAT_EVERY_S)  # nosemgrep: arbitrary-sleep -- 心跳周期
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -1203,6 +1404,43 @@ def _check_caller_allowed(client_ip: str) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.request_id = new_request_id(self.headers.get("X-Request-ID"))
+        return parsed
+
+    def handle_one_request(self) -> None:
+        started = time.monotonic()
+        self._response_status = 500
+        self.command = None
+        self.path = None
+        try:
+            super().handle_one_request()
+        finally:
+            if getattr(self, "command", None) and getattr(self, "path", None):
+                duration = time.monotonic() - started
+                route = record_http(
+                    self.command, self.path, self._response_status, duration
+                )
+                if route not in {"/livez", "/readyz", "/health", "/metrics"}:
+                    log_event(
+                        "info", "http_request",
+                        method=self.command,
+                        route=route,
+                        status=self._response_status,
+                        duration_ms=round(duration * 1000, 3),
+                    )
+
+    def send_response(self, code: int, message=None) -> None:
+        self._response_status = code
+        super().send_response(code, message)
+
+    def end_headers(self) -> None:
+        if request_id := getattr(self, "request_id", ""):
+            self.send_header("X-Request-ID", request_id)
+        super().end_headers()
+
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False, default=str).encode()
         self.send_response(code)
@@ -1211,7 +1449,45 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *_): pass
+
+    def _run_vm_operation(self, operation: str, fn):
+        started = time.monotonic()
+        result = "error"
+        snapshot_type = ""
+        if operation == "resume":
+            FC_RESUME_INFLIGHT.inc()
+        try:
+            response = fn()
+            result = "success"
+            snapshot_type = response.get("snapshot_type", "")
+            if operation == "resume":
+                record_restore_mode(response.get("restore_mode", "unknown"))
+                for field, stage in (
+                    ("merge_time_s", "memory_merge"),
+                    ("restore_time_s", "snapshot_load"),
+                ):
+                    if response.get(field) is not None:
+                        record_resume_stage(
+                            stage, result, float(response[field])
+                        )
+            return response
+        finally:
+            if operation == "resume":
+                FC_RESUME_INFLIGHT.dec()
+            record_fc_operation(
+                operation,
+                result,
+                time.monotonic() - started,
+                snapshot_type,
+            )
 
     def _body(self) -> dict:
         try:
@@ -1315,12 +1591,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self._maybe_proxy():
                 return
-        # /health 对所有来源开放（存活探针）
-        if path != "/health" and not self._check_access():
+        # 健康检查和指标不经过执行面 CIDR 校验；它们不含租户数据。
+        if path not in {"/health", "/livez", "/readyz", "/metrics"} and not self._check_access():
             return
         try:
             if path == "/health":
                 return self._send(200, op_health())
+            if path == "/livez":
+                code, result = health_report(require_dependencies=False)
+                return self._send(code, result)
+            if path == "/readyz":
+                code, result = health_report(require_dependencies=True)
+                return self._send(code, result)
+            if path == "/metrics":
+                _refresh_metrics()
+                body, content_type = metrics_payload()
+                return self._send_bytes(200, body, content_type)
             if path == "/reclaim/status":
                 return self._send(200, _RECLAIM_STATE)
             parts = path.strip("/").split("/")
@@ -1330,6 +1616,11 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError:
             self._send(404, {"error": "not found"})
         except Exception as e:
+            log_event(
+                "error", "request_failed",
+                method="GET", route=normalize_route(path),
+                error_type=type(e).__name__,
+            )
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
@@ -1347,17 +1638,23 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with op_lock:
                         if path == "/vm/create":
-                            return self._send(200, op_create(body))
+                            return self._send(200, self._run_vm_operation(
+                                "create", lambda: op_create(body)))
                         if path == "/vm/destroy":
-                            return self._send(200, op_destroy(body))
+                            return self._send(200, self._run_vm_operation(
+                                "destroy", lambda: op_destroy(body)))
                         if path == "/vm/snapshot_base":
-                            return self._send(200, op_snapshot_base(body))
+                            return self._send(200, self._run_vm_operation(
+                                "snapshot_base", lambda: op_snapshot_base(body)))
                         if path == "/vm/suspend":
-                            return self._send(200, op_suspend(body))
+                            return self._send(200, self._run_vm_operation(
+                                "suspend", lambda: op_suspend(body)))
                         if path == "/vm/resume":
-                            return self._send(200, op_resume(body))
+                            return self._send(200, self._run_vm_operation(
+                                "resume", lambda: op_resume(body)))
                         if path == "/vm/exec":
-                            return self._send(200, op_exec(body))
+                            return self._send(200, self._run_vm_operation(
+                                "exec", lambda: op_exec(body)))
                 finally:
                     if path == "/vm/destroy":
                         _drop_vm_op_lock(sid, op_lock)
@@ -1378,6 +1675,11 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError:
             self._send(404, {"error": "not found"})
         except Exception as e:
+            log_event(
+                "error", "request_failed",
+                method="POST", route=normalize_route(path),
+                error_type=type(e).__name__,
+            )
             self._send(500, {"error": str(e)})
 
     # 反代需要覆盖 web 常用的其余 method(PUT/DELETE/PATCH/HEAD/OPTIONS)。

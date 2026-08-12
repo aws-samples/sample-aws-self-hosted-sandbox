@@ -12,10 +12,11 @@
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
 - **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS（**不经 S3**），跨机恢复靠 EBS 卷幸存 + detach/attach（见下方"快照落盘与跨机恢复"说明）
-- **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用 `c6g.metal` 或支持嵌套虚拟化的 i7i（默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
+- **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（当前默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
 - **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
+- **平台可观测性**：低基数 Prometheus 指标、结构化日志、5 类告警、8 面板 Dashboard、快照 SHA-256 校验；可选 SigV4 remote-write 到 AMP 并由 AMG 私网查询
 
 ### 适用场景
 
@@ -57,16 +58,16 @@ root 可绑 80 端口、dnf 装包、嵌套 docker            ✅ 完整 root �
 
 **最小配置月费（us-east-1，2 台 system + 1 台 c6g.metal sandbox）：**
 
-| 资源 | 单价 | 月费（730h） |
+| 资源 | 月单价 | 月费（730h） |
 |---|---|---|
-| c6g.metal（64vCPU/128GiB）**spot**（本平台目标模式）| ~$0.67/hr（us-east-1a 实时，约按需 29%）| **~$486** |
-| c6g.metal 按需（对比基线）| $2.304/hr | ~$1,682 |
-| system 节点（2 × m7g.large，On-Demand）| ~$0.0816/hr/台 | ~$119 |
-| EKS 控制面 | $0.10/hr | ~$73 |
+| c6g.metal（64vCPU/128GiB）**spot**（本平台目标模式）| ~$486/月（us-east-1a 2026-07 查询，约按需 29%）| **~$486** |
+| c6g.metal 按需（对比基线）| ~$1,588/月 | ~$1,588 |
+| system 节点（2 × m7g.large，On-Demand）| ~$59.50/月/台 | ~$119 |
+| EKS 控制面 | ~$73/月 | ~$73 |
 | DynamoDB（PAY_PER_REQUEST）| 按写入量 | <$1 |
 | 持久状态 EBS（gp3 400GB / 4000 IOPS / 1000MB/s，每节点一块，存内存快照）| $32 容量 + $5 IOPS + $35 吞吐 | ~$72/节点 |
-| **合计（按需）** | | **~$1,947/月** |
-| **合计（按需 + Savings Plan ~42% off，仅计算）**| | **~$1,191/月** |
+| **合计（按需）** | | **~$1,853/月** |
+| **合计（1 年 EC2 Instance Savings Plan All Upfront，仅计算）**| | **~$1,199/月** |
 | **合计（sandbox spot + system On-Demand，目标模式）** | | **~$751/月** |
 
 > **spot 是本平台的核心成本模型**：c6g.metal spot 约为按需的 ~29%（实测 us-east-1 各 AZ $0.65–$0.74/hr，2026-07 查询），
@@ -74,14 +75,61 @@ root 可绑 80 端口、dnf 装包、嵌套 docker            ✅ 完整 root �
 > 若不用 spot，按需可购 1 年期 Savings Plan 降约 42%。实际价格请以 [AWS Pricing Calculator](https://calculator.aws) 为准。
 > 生产节点池应分开采购：system 节点始终使用 On-Demand；仅 sandbox 数据节点在中断恢复链路闭环后使用 Spot。
 
+**沙盒节点实例选择与月度价格（us-east-1）：**
+
+以下价格按 Linux/UNIX、730 小时/月计算。Savings Plan 使用 **1 年 EC2 Instance
+Savings Plan、All Upfront**；“等效月价”是一次性预付总额除以 12，便于与按需月价横向比较。
+价格不含 EBS、EKS 控制面和网络流量，查询于 2026-08-12，实际价格以
+[AWS Pricing Calculator](https://calculator.aws) 为准。
+
+**嵌套虚拟化（Intel x86，4xlarge）：**
+
+| 实例 | vCPU | 内存 | 本地 NVMe | 按需月价 | 1 年 SP 等效月价 | All Upfront 总额 |
+|---|---:|---:|---:|---:|---:|---:|
+| `c8i.4xlarge` | 16 | 32 GiB | 无 | **$547** | **$338** | $4,055 |
+| `m8i.4xlarge` | 16 | 64 GiB | 无 | **$618** | **$382** | $4,579 |
+| `r8i.4xlarge` | 16 | 128 GiB | 无 | **$811** | **$501** | $6,011 |
+| `i7i.4xlarge` | 16 | 128 GiB | 1 × 3.75 TB | **$1,102** | **$668** | $8,012 |
+
+**嵌套虚拟化（Intel x86，8xlarge）：**
+
+| 实例 | vCPU | 内存 | 本地 NVMe | 按需月价 | 1 年 SP 等效月价 | All Upfront 总额 |
+|---|---:|---:|---:|---:|---:|---:|
+| `c8i.8xlarge` | 32 | 64 GiB | 无 | **$1,095** | **$676** | $8,109 |
+| `m8i.8xlarge` | 32 | 128 GiB | 无 | **$1,236** | **$763** | $9,159 |
+| `r8i.8xlarge` | 32 | 256 GiB | 无 | **$1,623** | **$1,002** | $12,021 |
+| `i7i.8xlarge` | 32 | 256 GiB | 2 × 3.75 TB | **$2,205** | **$1,335** | $16,024 |
+
+上述虚拟化实例均支持 `nested_virtualization=enabled`。当前 EBS-first 状态存储架构
+不依赖本地 NVMe，因此 `r8i.8xlarge` 是规格上最接近 `i7i.8xlarge` 的无本地盘选择。
+
+**Bare Metal：**
+
+| 实例 | 架构 | vCPU | 内存 | 本地 NVMe | 按需月价 | 1 年 SP 等效月价 | All Upfront 总额 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `c6g.metal` | ARM64 | 64 | 128 GiB | 无 | **$1,588** | **$934** | $11,208 |
+| `c6gd.metal` | ARM64 | 64 | 128 GiB | 2 × 1.9 TB | **$1,794** | **$1,055** | $12,659 |
+| `c7g.metal` | ARM64 | 64 | 128 GiB | 无 | **$1,694** | **$1,042** | $12,500 |
+| `c7gd.metal` | ARM64 | 64 | 128 GiB | 2 × 1.9 TB | **$2,119** | **$1,247** | $14,959 |
+| `m7g.metal` | ARM64 | 64 | 256 GiB | 无 | **$1,906** | **$1,177** | $14,123 |
+| `r7g.metal` | ARM64 | 64 | 512 GiB | 无 | **$2,502** | **$1,545** | $18,536 |
+| `c7i.metal-24xl` | x86_64 | 96 | 192 GiB | 无 | **$3,127** | **$1,931** | $23,170 |
+| `m8i.metal-48xl` | x86_64 | 192 | 768 GiB | 无 | **$7,417** | **$4,579** | $54,953 |
+| `i4i.metal` | x86_64 | 128 | 1,024 GiB | 8 × 3.75 TB | **$8,017** | **$4,855** | $58,263 |
+
+> 上表列出 AWS 上可运行 Firecracker 的候选机型，不等于当前 Terraform 的实例白名单。
+> 当前仓库已开放并真机验证的是 ARM64 `c6g.metal` 和 x86 `i7i.*`；使用
+> `c8i` / `m8i` / `r8i` 或其他 Bare Metal 机型前，需要扩展 Terraform 校验并完成对应架构的 E2E。
+
 **承载能力与摊算成本（单台 c6g.metal，128 GiB）：**
 
 | 运行模式 | 每沙盒内存 | 可承载沙盒数 | 摊算成本（按需） |
 |---|---|---|---|
 | 24×7 活跃工作集 | 1.5 GiB | ~75 个 | **~$23/沙盒·月** |
-| **快照空闲回收** | ~50 MB（空载驻留）| **400+ 个** | **~$4/沙盒·月** |
+| **快照空闲回收** | ~50 MB（空载驻留）| **400+ 个（模型推导）** | **~$4/沙盒·月（模型推导）** |
 | Savings Plan + 快照回收 | — | 同上 | **~$2–3/沙盒·月** |
 
+- `400+` 和对应摊算成本来自单 VM 空载足迹与并发假设推导，尚未完成单节点 400 台满载实测。
 - **resume 延迟 1.2s 实测**，用户无感知，快照挂起对用户透明
 - 单台机器即可支撑小规模 SaaS，多台横向扩展线性增长（节点间无共享状态）
 
@@ -131,7 +179,7 @@ running ──(空闲超 idle 阈值, 后台扫描)──► 自动 sleep ──
 
 > 依赖 suspend/resume 快照能力（同暖池）。已于 2026-07-16 真机 e2e 验证通过（A0~A5，含自动/手动区分、网关透明唤醒 ~2.1s），详见 **[docs/自动休眠-真机测试报告-2026-07-16.md](docs/自动休眠-真机测试报告-2026-07-16.md)**；脚本 `scripts/autosleep_e2e.sh`。
 >
-> 2026-08-11 增加 WebSocket 多信号检测与 A6 用例；本地测试 50/50 和 AWS
+> 2026-08-11 增加 WebSocket 多信号检测与 A6 用例；当时本地测试 50/50 和 AWS
 > `i7i.8xlarge` Firecracker A0-A6 E2E 均通过。早先两台 `c6g.metal` 的 EC2
 > impaired 尝试保留为基础设施故障记录。详见 **[docs/空闲检测-真机测试报告-2026-08-10.md](docs/空闲检测-真机测试报告-2026-08-10.md)**。
 
@@ -216,10 +264,49 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 | **快照 suspend/resume** | ✅ 实测 1.2s | ✅ | ✅ | ❌ |
 | **凭据隔离** | ✅ LiteLLM IRSA（已落地）| ✅ | ✅ | N/A |
 | **控制面自愈** | ✅ reconcile + leader + 心跳发现 | ✅ ~20s sync loop | ✅ 去中心化 flyd | ✅ 托管 |
+| **可观测性** | ✅ Prometheus/Alertmanager/Grafana；可选 AMP + AMG | 托管 | 托管 | CloudWatch |
 | **数据主权** | ✅ 数据留 AWS 账号内 | ❌ 第三方 | ❌ 第三方 | ✅ |
-| **K8s 生态集成** | ✅ 原生 | ❌ | ❌ | ❌ |
+| **K8s 生态集成** | 平台组件运行在 EKS；sandbox 不建 Pod | ❌ | ❌ | ❌ |
 
 ---
+
+### 为什么每个 sandbox 不是一个 Pod
+
+本项目使用 Kubernetes 管理**平台服务**，但不把每个用户 sandbox 注册成 Kubernetes
+工作负载。Ingress、控制面、LiteLLM 和 node-agent 都是 Pod；真正执行用户代码的
+Firecracker microVM 则是 sandbox 节点上的宿主机进程。可以把这个边界概括为：
+**Kubernetes 调度管理器，平台自己的控制面调度 microVM。**
+
+创建 sandbox 时，请求先到 `sandbox-control-plane`。控制面根据 node-agent 心跳和剩余
+容量选择数据节点、在 DynamoDB 建立状态记录，再调用该节点上的 node-agent。node-agent
+随后在宿主机上准备 rootfs、TAP 网络和 vsock，分配 vCPU/内存并启动 Firecracker。
+kube-scheduler 只看见每个数据节点上的一个 node-agent DaemonSet Pod，不会为每个
+sandbox 创建 Pod、PVC、Service 或 CRD。
+
+| 维度 | 普通 Pod | 本项目的 Firecracker sandbox |
+|---|---|---|
+| Kubernetes 对象 | 每个实例都是 Pod，可由 Deployment/Job 等控制器创建 | sandbox 记录在 DynamoDB，由控制面和 node-agent 管理；Kubernetes 中没有对应 Pod |
+| 放置决策 | kube-scheduler 根据 requests、affinity、taint 等选择节点 | 控制面根据 node-agent 心跳、可用内存和 VM 数量选择 sandbox 节点 |
+| 隔离边界 | 容器依赖 namespace/cgroup，通常与节点共享宿主内核 | KVM 提供虚拟硬件边界，每个 microVM 启动独立 guest 内核 |
+| 启停语义 | kubelet 拉取镜像并启动容器；异常后按 Pod 策略重建 | node-agent 调 Firecracker API 执行 create、snapshot、suspend、resume、destroy |
+| 网络 | CNI 分配 Pod IP，Service/Ingress 路由到 Pod | 每个 guest 连接独立 TAP `/30` 网段，经 `Ingress → 控制面 → node-agent → guest` 代理访问 |
+| 状态存储 | 常见做法是容器层加 PV/PVC，生命周期由 Kubernetes 协调 | 每个 sandbox 使用独立 rootfs 和内存快照，文件落在宿主机挂载的持久状态 EBS |
+| 可观测性 | `kubectl`、Pod condition、probe 和容器日志直接可见 | Kubernetes 只看见 node-agent；VM 状态、快照耗时和 guest 健康由平台自行采集 |
+| 规模单位 | 一份用户环境通常至少增加一个 Pod 及相关 API 对象 | 单个 node-agent 在一台节点上管理多台 microVM，避免把 sandbox 数量直接映射成 Pod 数量 |
+
+这样设计的主要目的不是绕开 Kubernetes，而是让长期存活、可挂起的用户环境拥有独立于
+Pod 重建语义的生命周期。空闲 sandbox 可以写入 Firecracker 快照并释放 VMM 内存，恢复时
+继续使用原有 guest 状态；节点内也能按真实工作集对 CPU 和内存做更细的装箱。与此同时，
+Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障接管。
+
+这条路径也意味着平台要承担原本由 Kubernetes 提供的一部分能力：节点选择、实例状态机、
+网络代理、健康检查、资源回收和恢复编排都必须由控制面实现。当前实现还有两个明确边界：
+
+- Firecracker 是 node-agent 启动的子进程，并运行在 node-agent Pod 的 cgroup 中；因此
+  “sandbox 不是 Pod”表示它不是独立的 Kubernetes 调度对象，并不表示它完全不受
+  node-agent Pod 或宿主节点生命周期影响。升级或重启 node-agent 前仍需执行安全疏散。
+- sandbox 状态目前以同可用区持久 EBS 为权威来源。跨节点 detach/attach 已验证，但 Spot
+  中断后的自动疏散与恢复尚未完全闭环，不能把它描述成任意跨可用区自动重调度。
 
 ### 架构概览
 
@@ -228,22 +315,49 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 │                                                                      │
 │  system 节点组（On-Demand）      sandbox 数据节点组                 │
 │  Graviton m7g（默认 2 台）       c6g.metal 或 i7i.*                 │
-│  ┌──────────────────────────┐      ┌───────────────────────────┐   │
-│  │ sandbox-control-plane    │ HTTP │  Firecracker microVM       │   │
-│  │ (Deployment, 2 副本,IRSA)│─────►│  node-agent DaemonSet      │   │
-│  │  FirecrackerDriver       │◄─────│   ├ jailer / tap / snapshot│   │
-│  │  WarmPool                │ 心跳 │   └ 每 30s 上报 nodes 表  │   │
-│  │  Reconciler (leader-only)│      └───────────────────────────┘   │
-│  │  无状态 → DynamoDB        │                                       │
-│  └──────────────────────────┘                                       │
+│  ┌──────────────────────────┐      ┌────────────────────────────┐  │
+│  │ sandbox-control-plane    │ HTTP │ node-agent Pod (DaemonSet) │  │
+│  │ (Deployment, 2 副本,IRSA)│─────►│  hostNetwork / privileged  │  │
+│  │  FirecrackerDriver       │◄─────│  心跳 / tap / 快照 / 代理  │  │
+│  │  WarmPool                │ 心跳 ├────────────────────────────┤  │
+│  │  Reconciler (leader-only)│      │ 宿主机 Firecracker 进程     │  │
+│  │  无状态 → DynamoDB        │      │  ├ microVM A（不是 Pod）    │  │
+│  └──────────────────────────┘      │  ├ microVM B（不是 Pod）    │  │
+│                                    │  └ microVM N（不是 Pod）    │  │
+│                                    └────────────────────────────┘  │
 │  CoreDNS / LiteLLM / Ingress         taint: dedicated=sandbox       │
 │         ↑ ingress-nginx (NLB)        （普通 Pod 不进入数据节点）     │
 │         api.sbx.<domain>  ←── 生产外部访问（POC 推荐 port-forward）  │
 │                                                                      │
 │  DynamoDB: sandboxes / events / tap-idx / nodes(心跳) / locks(leader)│
 │  LiteLLM(Bedrock代理)                                                │
+│  Prometheus / Alertmanager / Grafana ──SigV4 remote-write──► AMP    │
+│                                                    AMG ──PrivateLink─┘│
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+### 可观测性
+
+`terraform/stage2-control-plane/observability.tf` 提供三档部署：
+
+1. `enable_observability_stack=true`：集群内 Prometheus、Alertmanager、Grafana，
+   自动抓取 control-plane 与 node-agent。
+2. `enable_amp_remote_write=true`：创建 AMP workspace，通过 Prometheus IRSA + SigV4
+   remote-write；要求第 1 档同时开启。
+3. 传入已有 AMG workspace/VPC/subnet/SG：附加最小 AMP 查询权限，并创建
+   `aps-workspaces` Interface Endpoint。Terraform 不创建 AMG workspace 或 datasource。
+
+平台当前包含 5 类告警（唤醒时延、快照完整性、容量、孤儿增长、控制面退化）和
+`Sandbox Platform` 8 面板 Dashboard。指标不使用 sandbox ID 标签；快照恢复前校验
+SHA-256 manifest，损坏时拒绝恢复并触发指标/告警。
+
+真实 AWS 环境已验证 29/29 targets、AMP remote-write 失败为 0、AMP 查询到控制面与
+node-agent、AMG datasource health=`OK`、AMG PromQL 返回 2 个控制面副本，以及
+Terraform `No changes`。部署参数和验证命令见
+[完整部署手册 Step 6.2](docs/deploy.md#step-62-部署可观测性p1推荐)，证据见
+[P1 可观测性真机测试报告](docs/P1可观测性-真机测试报告-2026-08-12.md)。
 
 ---
 
@@ -288,6 +402,7 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 - 高可用编排：控制面 leader-only reconcile loop（对账自愈）+ node-agent 心跳注册表 + DynamoDB leader 锁
 - 凭据隔离：LiteLLM（litellm namespace）持有 Bedrock IRSA，沙盒无凭据
 - 快照：持久状态 EBS（base + Diff 增量内存快照），spot 疏散跨机恢复
+- 可观测性：monitoring namespace 的 Prometheus/Alertmanager/Grafana；可选 AMP + AMG
 
 常见运维操作：
 1. 查看所有沙盒：curl http://api.sbx.<domain>/sandboxes?tenant_id=<id>
@@ -309,13 +424,18 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
     （rvn 持续自增 = leader 在正常续租；owner 变更 = 发生了故障转移）
 11. 排查孤儿沙盒：aws dynamodb scan --table-name claude-sbx-sandboxes --filter-expression "#s = :o" --expression-attribute-names '{"#s":"state"}' --expression-attribute-values '{":o":{"S":"orphaned"}}'
     （state=orphaned 是 reconcile 检出的漂移记录，reconcile_reason 字段说明原因）
+12. 查看监控组件：kubectl get pods -n monitoring
+13. 本地访问 Grafana：kubectl -n monitoring port-forward svc/sandbox-monitoring-grafana 3000:80
+14. 查看 AMP/AMG 输出：terraform -chdir=terraform/stage2-control-plane output amp_workspace_id && terraform -chdir=terraform/stage2-control-plane output managed_grafana_endpoint
 
 监控关注点：
-- node-agent 内存水位：kubectl exec -n sandbox-system daemonset/node-agent -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8002/health').read().decode())"
+- Prometheus targets 与 remote-write：`up` 应全为 1，`prometheus_remote_storage_samples_failed_total` 应为 0
+- node-agent 容量：`fcnode_free_memory_bytes`、`fcnode_scratch_bytes`
+- 生命周期：`fc_operation_duration_seconds`、`fc_resume_stage_duration_seconds`
+- 快照安全：`fc_snapshot_verify_total`、`fc_snapshot_errors_total`
 - DynamoDB 写入延迟：AWS Console → DynamoDB → Metrics → SuccessfulRequestLatency
-- 节点利用率：kubectl top nodes
 - LiteLLM 请求量：kubectl logs -n litellm deployment/litellm | grep "INFO:"
-- reconcile 健康：控制面日志无 reconcile 异常 + locks 表 rvn 持续自增
+- reconcile 健康：`background_loop_runs_total`、`reconcile_actions_total` 和 locks 表 rvn
 ```
 
 ---
@@ -324,9 +444,10 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 
 ```bash
 # 无需 AWS，本地直接跑
-pip install "moto[dynamodb]" boto3 kubernetes
+python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
-# 期望：50/50 PASS
+python3 node-agent/observability_test.py
+# 期望：控制面 53/53 + node-agent 5/5 PASS
 ```
 
 ---
@@ -359,7 +480,7 @@ python3 sandbox-api/smoke_test.py
 | 单机最大并发 | 60 VM（测试截止，未到上限）| c6g.metal 128 GiB |
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
-| 冒烟测试通过率 | **50/50（ALL PASS）** | moto mock，`sandbox-api/smoke_test.py` |
+| 冒烟测试通过率 | **控制面 53/53 + node-agent 5/5（ALL PASS）** | moto mock + 可观测性/完整性测试 |
 | 控制面 / 数据面分离 | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 生命周期 | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |

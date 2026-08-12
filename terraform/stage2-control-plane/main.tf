@@ -147,19 +147,26 @@ variable "node_arch" {
 provider "aws" { region = var.region }
 
 data "aws_eks_cluster" "main" { name = var.cluster_name }
-data "aws_eks_cluster_auth" "main" { name = var.cluster_name }
 
 provider "kubernetes" {
   host                   = data.aws_eks_cluster.main.endpoint
   cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.main.token
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", var.cluster_name, "--region", var.region]
+  }
 }
 
 provider "helm" {
   kubernetes {
     host                   = data.aws_eks_cluster.main.endpoint
     cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.main.token
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", var.cluster_name, "--region", var.region]
+    }
   }
 }
 
@@ -574,19 +581,23 @@ resource "kubernetes_deployment" "control_plane" {
           }
           readiness_probe {
             http_get {
-              path = "/"
+              path = "/readyz"
               port = 8000
             }
             initial_delay_seconds = 5
             period_seconds        = 10
+            timeout_seconds       = 3
+            failure_threshold     = 3
           }
           liveness_probe {
             http_get {
-              path = "/"
+              path = "/livez"
               port = 8000
             }
             initial_delay_seconds = 15
             period_seconds        = 20
+            timeout_seconds       = 3
+            failure_threshold     = 3
           }
         }
       }
@@ -600,10 +611,12 @@ resource "kubernetes_service" "control_plane" {
   metadata {
     name      = "sandbox-control-plane"
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+    labels    = { app = "sandbox-control-plane" }
   }
   spec {
     selector = { app = "sandbox-control-plane" }
     port {
+      name        = "metrics"
       port        = 80
       target_port = 8000
       protocol    = "TCP"
@@ -656,6 +669,7 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           image_pull_policy = "Always"
           command           = ["python3", "/app/main.py"]
           port {
+            name           = "metrics"
             container_port = 8002
             host_port      = 8002
           }
@@ -706,8 +720,8 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/var/lib/sbx"
           }
           volume_mount {
-            name       = "fc-bins"
-            mount_path = "/usr/local/bin"
+            name       = "firecracker-bin"
+            mount_path = "/usr/local/bin/firecracker"
             read_only  = true
           }
           # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
@@ -723,6 +737,26 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
           }
+          readiness_probe {
+            http_get {
+              path = "/readyz"
+              port = 8002
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 10
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
+          liveness_probe {
+            http_get {
+              path = "/livez"
+              port = 8002
+            }
+            initial_delay_seconds = 20
+            period_seconds        = 20
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
         }
         volume {
           name = "dev"
@@ -736,8 +770,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           }
         }
         volume {
-          name = "fc-bins"
-          host_path { path = "/usr/local/bin" }
+          name = "firecracker-bin"
+          host_path {
+            path = "/usr/local/bin/firecracker"
+            type = "File"
+          }
         }
         volume {
           name = "fc-assets"
