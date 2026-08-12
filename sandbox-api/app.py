@@ -200,14 +200,18 @@ POOL_PLACEMENT_ENABLED = os.environ.get("POOL_PLACEMENT_ENABLED", "1").lower() i
 
 def _placement_pool(body: dict, spec: "SandboxSpec") -> str | None:
     """决定新建沙盒的目标池。返回 "spot"/"protected",或 None(不限池)。
-    优先级:请求体 pool > meta.pool > DEFAULT_CREATE_POOL。非法值回退默认。"""
+    优先级:请求体 pool > meta.pool > DEFAULT_CREATE_POOL。
+    非法值【回退默认池】(而非静默变成不限池 None)—— 避免用户 typo 的 pool 被无声吞掉,
+    也避免误走暖池路径;默认池本身也非法时才退化为不限池 None。"""
     if not POOL_PLACEMENT_ENABLED:
         return None
-    cand = (body.get("pool")
-            or (spec.meta or {}).get("pool")
-            or DEFAULT_CREATE_POOL or "")
-    cand = str(cand).strip().lower()
-    return cand if cand in ("spot", "protected") else None
+    explicit = body.get("pool") or (spec.meta or {}).get("pool")
+    cand = str(explicit or DEFAULT_CREATE_POOL or "").strip().lower()
+    if cand in ("spot", "protected"):
+        return cand
+    # 显式传了非法值(或默认池配置非法)→ 回退默认池;默认也非法则不限池。
+    dflt = str(DEFAULT_CREATE_POOL or "").strip().lower()
+    return dflt if dflt in ("spot", "protected") else None
 
 
 def create_sandbox(body: dict) -> tuple[int, dict]:
