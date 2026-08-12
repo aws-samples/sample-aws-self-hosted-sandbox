@@ -38,11 +38,11 @@ export function FileTransfer({ sid, running }: { sid: string; running: boolean }
           body: JSON.stringify({ content_b64: b64 }),
         },
       );
-      const j = (await res.json()) as ApiCallResult<{ bytes?: number }>;
+      const j = (await res.json()) as ApiCallResult<{ bytes?: number; error?: string }>;
       setMsg(
         j.ok
           ? `✓ 已上传 ${f.name} → ${dest}(${j.body?.bytes ?? "?"} 字节,${j.elapsed_ms}ms)`
-          : `✗ 上传失败:${j.error || (j.body as any)?.error || j.status}`,
+          : `✗ 上传失败:${j.error || j.body?.error || j.status}`,
       );
     } catch (e) {
       setMsg(`✗ ${e instanceof Error ? e.message : String(e)}`);
@@ -63,9 +63,12 @@ export function FileTransfer({ sid, running }: { sid: string; running: boolean }
         `/api/sandboxes/${sid}/files?path=${encodeURIComponent(downloadPath)}`,
         { cache: "no-store" },
       );
-      const j = (await res.json()) as ApiCallResult<{ content_b64?: string }>;
+      const j = (await res.json()) as ApiCallResult<{
+        content_b64?: string;
+        error?: string;
+      }>;
       if (!j.ok || !j.body?.content_b64) {
-        setMsg(`✗ 下载失败:${j.error || (j.body as any)?.error || j.status}`);
+        setMsg(`✗ 下载失败:${j.error || j.body?.error || j.status}`);
         return;
       }
       // base64 → Blob → 触发浏览器下载

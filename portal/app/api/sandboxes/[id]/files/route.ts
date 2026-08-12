@@ -6,11 +6,12 @@ import { callApi, toResponse } from "../../../_lib/client";
 
 export async function GET(
   req: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params;
   const path = new URL(req.url).searchParams.get("path") || "";
   return toResponse(
-    await callApi(`/sandboxes/${params.id}/files?path=${encodeURIComponent(path)}`, {
+    await callApi(`/sandboxes/${id}/files?path=${encodeURIComponent(path)}`, {
       timeoutMs: 60_000,
     }),
   );
@@ -18,12 +19,13 @@ export async function GET(
 
 export async function PUT(
   req: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params;
   const path = new URL(req.url).searchParams.get("path") || "";
   const body = await req.json().catch(() => ({}));
   return toResponse(
-    await callApi(`/sandboxes/${params.id}/files?path=${encodeURIComponent(path)}`, {
+    await callApi(`/sandboxes/${id}/files?path=${encodeURIComponent(path)}`, {
       method: "PUT",
       body,
       timeoutMs: 60_000,

@@ -6,9 +6,9 @@ const ALLOWED = new Set(["suspend", "resume", "exec"]);
 
 export async function POST(
   req: Request,
-  { params }: { params: { id: string; action: string } },
+  { params }: { params: Promise<{ id: string; action: string }> },
 ) {
-  const { id, action } = params;
+  const { id, action } = await params;
   if (!ALLOWED.has(action)) {
     return Response.json(
       { ok: false, status: 400, error: `unsupported action: ${action}` },

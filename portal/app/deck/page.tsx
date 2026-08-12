@@ -9,7 +9,7 @@ export default function DeckPage() {
   const n = SLIDES.length;
 
   const go = useCallback(
-    (next: number) => setI((cur) => Math.max(0, Math.min(n - 1, next))),
+    (next: number) => setI(Math.max(0, Math.min(n - 1, next))),
     [n]
   );
 

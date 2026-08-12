@@ -13,7 +13,8 @@
 
 ## 本地运行
 
-前置:已能 `kubectl` 访问部署了 `sandbox-control-plane` 的集群,并拿到 admin(`default`)API Key。
+前置:Node.js 20.9+；已能 `kubectl` 访问部署了 `sandbox-control-plane` 的集群,并拿到
+admin(`default`)API Key。
 
 ```bash
 # 1. 把真实控制面通到本机(单独开一个终端保持运行)
