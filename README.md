@@ -16,7 +16,7 @@
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
 - **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
-- **平台可观测性**：低基数 Prometheus 指标、结构化日志、5 类告警、8 面板 Dashboard、快照 SHA-256 校验；可选 SigV4 remote-write 到 AMP 并由 AMG 私网查询
+- **平台可观测性**：低基数 Prometheus 指标、CloudWatch 集中 JSON 日志、OpenTelemetry/X-Ray 跨组件 tracing、5 类告警、8 面板 Dashboard、快照 SHA-256 校验；支持 AMP remote-write 与 AMG 自动配置
 
 ### 适用场景
 
@@ -333,6 +333,7 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
 │  LiteLLM(Bedrock代理)                                                │
 │  Prometheus / Alertmanager / Grafana ──SigV4 remote-write──► AMP    │
 │                                                    AMG ──PrivateLink─┘│
+│  Fluent Bit ──► CloudWatch Logs    OTLP ──► ADOT ──► X-Ray          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -340,24 +341,26 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
 
 ### 可观测性
 
-`terraform/stage2-control-plane/observability.tf` 提供三档部署：
+`terraform/stage2-control-plane/observability.tf` 与 `p2_observability.tf` 提供四档部署：
 
 1. `enable_observability_stack=true`：集群内 Prometheus、Alertmanager、Grafana，
    自动抓取 control-plane 与 node-agent。
 2. `enable_amp_remote_write=true`：创建 AMP workspace，通过 Prometheus IRSA + SigV4
    remote-write；要求第 1 档同时开启。
 3. 传入已有 AMG workspace/VPC/subnet/SG：附加最小 AMP 查询权限，并创建
-   `aps-workspaces` Interface Endpoint。Terraform 不创建 AMG workspace 或 datasource。
+   `aps-workspaces` Interface Endpoint。Terraform 不创建 AMG workspace。
+4. `enable_p2_observability=true`：部署 Fluent Bit/CloudWatch Logs、ADOT/X-Ray，并使用
+   15 分钟临时 AMG token 幂等配置 `sandbox-amp` datasource 和 Dashboard，退出即清理凭据。
 
 平台当前包含 5 类告警（唤醒时延、快照完整性、容量、孤儿增长、控制面退化）和
 `Sandbox Platform` 8 面板 Dashboard。指标不使用 sandbox ID 标签；快照恢复前校验
 SHA-256 manifest，损坏时拒绝恢复并触发指标/告警。
 
-真实 AWS 环境已验证 29/29 targets、AMP remote-write 失败为 0、AMP 查询到控制面与
-node-agent、AMG datasource health=`OK`、AMG PromQL 返回 2 个控制面副本，以及
-Terraform `No changes`。部署参数和验证命令见
+真实 AWS 环境还验证了固定 correlation ID 在 CloudWatch 同时命中 control-plane 与
+node-agent、同一 trace 在 X-Ray 中包含跨组件父子 segment、AMG datasource
+health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 [完整部署手册 Step 6.2](docs/deploy.md#step-62-部署可观测性p1推荐)，证据见
-[P1 可观测性真机测试报告](docs/P1可观测性-真机测试报告-2026-08-12.md)。
+[P2 可观测性真机测试报告](docs/P2可观测性-真机测试报告-2026-08-12.md)。
 
 ---
 
@@ -447,7 +450,7 @@ Terraform `No changes`。部署参数和验证命令见
 python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
 python3 node-agent/observability_test.py
-# 期望：控制面 53/53 + node-agent 5/5 PASS
+# 期望：控制面 53/53 + node-agent 8/8 PASS
 ```
 
 ---
@@ -480,7 +483,7 @@ python3 node-agent/observability_test.py
 | 单机最大并发 | 60 VM（测试截止，未到上限）| c6g.metal 128 GiB |
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
-| 冒烟测试通过率 | **控制面 53/53 + node-agent 5/5（ALL PASS）** | moto mock + 可观测性/完整性测试 |
+| 冒烟测试通过率 | **控制面 53/53 + node-agent 8/8（ALL PASS）** | moto mock + tracing/可观测性/完整性测试 |
 | 控制面 / 数据面分离 | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 生命周期 | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |

@@ -110,12 +110,13 @@ system + `1 × i7i.8xlarge` sandbox 的调度隔离、Firecracker 生命周期�
 
 ## Stage 2 可观测性
 
-`stage2-control-plane/observability.tf` 提供两个显式开关：
+`stage2-control-plane/observability.tf` 与 `p2_observability.tf` 提供三个显式开关：
 
 | 开关 | 资源 |
 |---|---|
 | `enable_observability_stack=true` | 集群内 Prometheus、Alertmanager、Grafana、ServiceMonitor/PodMonitor、5 类告警、8 面板 Dashboard |
 | `enable_amp_remote_write=true` | AMP workspace、Prometheus remote-write IRSA/SigV4；要求上一个开关同时为 `true` |
+| `enable_p2_observability=true` | CloudWatch Logs、Fluent Bit、ADOT/X-Ray、AMG datasource/Dashboard 自动配置；要求前两个开关为 `true` |
 
 可选传入已有 AMG workspace：
 
@@ -127,8 +128,9 @@ managed_grafana_security_group_id  = "sg-..."
 ```
 
 Terraform 会给 AMG workspace role 增加最小 AMP 查询权限，并在其 VPC 创建
-`aps-workspaces` Interface Endpoint；不会创建或删除 AMG workspace，也不自动创建
-AMG datasource。完整参数、Datasource 设置和验证命令见
+`aps-workspaces` Interface Endpoint；不会创建或删除 AMG workspace。启用 P2 后，
+`configure-managed-grafana.sh` 使用 15 分钟 token 幂等配置 datasource/Dashboard 并立即清理。
+完整参数和验证命令见
 [`docs/deploy.md` Step 6.2](../docs/deploy.md#step-62-部署可观测性p1推荐)。
 
 Prometheus 与 node-agent 的指标不使用 sandbox ID 标签。Grafana admin password 通过
@@ -139,6 +141,8 @@ Helm `set_sensitive` 注入，不放进普通 values。Kubernetes 和 Helm provi
 真实 AWS 验证覆盖 29/29 targets、AMP remote-write、AMG datasource/query、
 快照损坏告警和 Terraform 零漂移，见
 [P1 可观测性真机测试报告](../docs/P1可观测性-真机测试报告-2026-08-12.md)。
+P2 集中日志、tracing 与 AMG 自动化证据见
+[P2 可观测性真机测试报告](../docs/P2可观测性-真机测试报告-2026-08-12.md)。
 
 ## 前置：申请 EC2 vCPU 配额
 

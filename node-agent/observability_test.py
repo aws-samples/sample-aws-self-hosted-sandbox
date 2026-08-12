@@ -100,6 +100,63 @@ class TestNodeAgentObservability(unittest.TestCase):
         self.assertIn('fc_snapshot_errors_total{phase="upload"} 0.0', metrics)
         self.assertIn('fc_snapshot_errors_total{phase="download"} 0.0', metrics)
         self.assertIn('fc_snapshot_errors_total{phase="verify"} 0.0', metrics)
+        self.assertIn(
+            'fc_snapshot_legacy_migrations_total{result="error"} 0.0', metrics
+        )
+
+    def test_legacy_snapshot_gets_manifest_before_restore(self):
+        snap_dir = pathlib.Path(self.tmp.name) / "legacy-snapshot"
+        snap_dir.mkdir()
+        (snap_dir / "vm.snapshot").write_bytes(b"snapshot-metadata")
+        (snap_dir / "vm.mem").write_bytes(b"memory-state")
+
+        manifest = self.main._record_snapshot_verification(str(snap_dir))
+
+        self.assertTrue((snap_dir / "integrity.json").is_file())
+        self.assertIn("vm.snapshot", manifest["files"])
+        metrics, _ = self.main.metrics_payload()
+        self.assertIn(
+            'fc_snapshot_legacy_migrations_total{result="success"}',
+            metrics.decode(),
+        )
+
+    def test_base_snapshot_hash_is_cached_and_invalidated(self):
+        snap_dir = pathlib.Path(self.tmp.name) / "cached-snapshot"
+        snap_dir.mkdir()
+        (snap_dir / "vm.snapshot").write_bytes(b"snapshot-metadata")
+        (snap_dir / "vm.mem").write_bytes(b"memory-state")
+        base = snap_dir / "vm.mem.base"
+        base.write_bytes(b"base-memory")
+
+        with patch.object(
+            self.main, "_sha256_file", wraps=self.main._sha256_file
+        ) as sha256:
+            self.main._write_snapshot_manifest(str(snap_dir))
+            self.main._write_snapshot_manifest(str(snap_dir))
+            base_calls = [
+                call for call in sha256.call_args_list
+                if call.args[0] == str(base)
+            ]
+            self.assertEqual(len(base_calls), 1)
+
+            base.write_bytes(b"changed-base-memory")
+            self.main._write_snapshot_manifest(str(snap_dir))
+            base_calls = [
+                call for call in sha256.call_args_list
+                if call.args[0] == str(base)
+            ]
+            self.assertEqual(len(base_calls), 2)
+
+    def test_destroy_clears_base_snapshot_hash_cache(self):
+        sandbox_dir = pathlib.Path(self.tmp.name) / "destroy-cache"
+        base = sandbox_dir / "snap" / "vm.mem.base"
+        self.main._BASE_HASH_CACHE[str(base)] = (
+            (1, 2, 3, 4, 5), "cached-digest"
+        )
+
+        self.main._clear_base_hash_cache(str(sandbox_dir))
+
+        self.assertNotIn(str(base), self.main._BASE_HASH_CACHE)
 
     def test_http_observability_endpoints(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), self.main.Handler)

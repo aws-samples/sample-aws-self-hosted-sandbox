@@ -523,8 +523,10 @@ resource "kubernetes_config_map" "control_plane" {
     # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
     NLB_HOSTNAME = var.nlb_hostname
     # B2(FirecrackerDriver): 控制面靠 FC_NODES(逗号分隔的节点内网 IP)找 node-agent
-    FC_NODES       = var.fc_nodes
-    FC_KERNEL_PATH = "/opt/sbx/vmlinux"
+    FC_NODES                    = var.fc_nodes
+    FC_KERNEL_PATH              = "/opt/sbx/vmlinux"
+    OTEL_SERVICE_NAME           = "sandbox-control-plane"
+    OTEL_EXPORTER_OTLP_ENDPOINT = local.p2_enabled ? local.otlp_http_endpoint : ""
   }
 }
 
@@ -544,7 +546,12 @@ resource "kubernetes_deployment" "control_plane" {
     replicas = var.control_plane_replicas
     selector { match_labels = { app = "sandbox-control-plane" } }
     template {
-      metadata { labels = { app = "sandbox-control-plane", fargate = "true" } }
+      metadata {
+        labels = { app = "sandbox-control-plane", fargate = "true" }
+        annotations = {
+          "sandbox.platform/config-sha256" = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+        }
+      }
       spec {
         service_account_name = kubernetes_service_account.control_plane.metadata[0].name
         # 默认固定到 On-Demand Graviton system 节点。enable_fargate=true 时由
@@ -707,6 +714,14 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "DYNAMODB_NODES_TABLE"
             value = local.dynamodb_nodes
+          }
+          env {
+            name  = "OTEL_SERVICE_NAME"
+            value = "sandbox-node-agent"
+          }
+          env {
+            name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+            value = local.p2_enabled ? local.otlp_http_endpoint : ""
           }
           security_context {
             privileged = true

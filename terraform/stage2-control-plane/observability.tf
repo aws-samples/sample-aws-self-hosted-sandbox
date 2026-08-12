@@ -125,12 +125,6 @@ resource "aws_iam_role_policy" "managed_grafana_amp_query" {
   })
 }
 
-data "aws_vpc" "managed_grafana" {
-  count = var.enable_amp_remote_write && var.managed_grafana_vpc_id != "" ? 1 : 0
-
-  id = var.managed_grafana_vpc_id
-}
-
 resource "aws_security_group" "managed_grafana_amp_endpoint" {
   count = var.enable_amp_remote_write && var.managed_grafana_vpc_id != "" ? 1 : 0
 
@@ -144,7 +138,6 @@ resource "aws_security_group" "managed_grafana_amp_endpoint" {
     to_port         = 443
     protocol        = "tcp"
     security_groups = [var.managed_grafana_security_group_id]
-    cidr_blocks     = [data.aws_vpc.managed_grafana[0].cidr_block]
   }
 
   egress {

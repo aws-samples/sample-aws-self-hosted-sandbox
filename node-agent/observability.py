@@ -3,11 +3,19 @@ from __future__ import annotations
 
 import contextvars
 import json
+import os
 import sys
 import time
 import uuid
 from urllib.parse import urlparse
 
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 HTTP_REQUESTS = Counter(
@@ -59,6 +67,11 @@ FC_SNAPSHOT_ERRORS = Counter(
     "Snapshot failures by phase.",
     ("phase",),
 )
+FC_SNAPSHOT_LEGACY_MIGRATIONS = Counter(
+    "fc_snapshot_legacy_migrations_total",
+    "Legacy snapshots migrated to an integrity manifest.",
+    ("result",),
+)
 FC_VMS = Gauge(
     "fc_vms",
     "Firecracker VMs managed by this node.",
@@ -99,6 +112,8 @@ def _initialize_snapshot_metric_series() -> None:
         FC_SNAPSHOT_VERIFY_DURATION.labels(result)
     for phase in ("upload", "download", "verify"):
         FC_SNAPSHOT_ERRORS.labels(phase).inc(0)
+    for result in ("success", "error"):
+        FC_SNAPSHOT_LEGACY_MIGRATIONS.labels(result).inc(0)
 
 
 _initialize_snapshot_metric_series()
@@ -106,6 +121,21 @@ _initialize_snapshot_metric_series()
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default=""
 )
+
+
+def _configure_tracing() -> trace.Tracer:
+    provider = TracerProvider(
+        resource=Resource.create({
+            "service.name": os.environ.get("OTEL_SERVICE_NAME", "sandbox-node-agent")
+        })
+    )
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+    return trace.get_tracer("sandbox-platform")
+
+
+_tracer = _configure_tracing()
 
 
 def new_request_id(value: str | None = None) -> str:
@@ -119,11 +149,18 @@ def current_request_id() -> str:
 
 
 def log_event(level: str, event: str, **fields) -> None:
+    span_context = trace.get_current_span().get_span_context()
     record = {
         "ts": time.time(),
         "level": level,
         "event": event,
         "request_id": current_request_id() or None,
+        "trace_id": (
+            format(span_context.trace_id, "032x") if span_context.is_valid else None
+        ),
+        "span_id": (
+            format(span_context.span_id, "016x") if span_context.is_valid else None
+        ),
         **fields,
     }
     print(
@@ -155,6 +192,34 @@ def record_http(method: str, path: str, status: int, duration: float) -> str:
     return route
 
 
+def start_server_span(headers, method: str, path: str):
+    carrier = {key.lower(): value for key, value in headers.items()}
+    parent = propagate.extract(carrier)
+    route = normalize_route(path)
+    span = _tracer.start_span(
+        f"{method} {route}",
+        context=parent,
+        kind=SpanKind.SERVER,
+        attributes={"http.request.method": method, "http.route": route},
+    )
+    token = otel_context.attach(trace.set_span_in_context(span, parent))
+    return span, token
+
+
+def finish_server_span(span, token, status: int) -> None:
+    if span is None:
+        return
+    span.set_attribute("http.response.status_code", status)
+    if status >= 500:
+        span.set_status(Status(StatusCode.ERROR))
+    span.end()
+    otel_context.detach(token)
+
+
+def inject_trace_headers(headers: dict[str, str]) -> None:
+    propagate.inject(headers)
+
+
 def record_fc_operation(
     operation: str, result: str, duration: float, snapshot_type: str = ""
 ) -> None:
@@ -180,6 +245,10 @@ def record_snapshot_verify(result: str, duration: float) -> None:
 
 def record_snapshot_error(phase: str) -> None:
     FC_SNAPSHOT_ERRORS.labels(phase).inc()
+
+
+def record_snapshot_legacy_migration(result: str) -> None:
+    FC_SNAPSHOT_LEGACY_MIGRATIONS.labels(result).inc()
 
 
 def refresh_node_metrics(

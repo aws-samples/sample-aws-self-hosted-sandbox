@@ -18,7 +18,7 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
 - **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
-- **Platform observability**: low-cardinality Prometheus metrics, structured logs, five alert classes, an eight-panel dashboard, and SHA-256 snapshot verification; optional SigV4 remote-write to AMP with private AMG queries
+- **Platform observability**: low-cardinality Prometheus metrics, centralized JSON logs in CloudWatch, cross-component OpenTelemetry/X-Ray traces, five alert classes, an eight-panel dashboard, SHA-256 snapshot verification, AMP remote-write, and automated AMG configuration
 
 ### Use Cases
 
@@ -137,29 +137,31 @@ The current implementation also has two important boundaries:
 │  DynamoDB: sandboxes / events / tap-idx / nodes / locks             │
 │  Prometheus / Alertmanager / Grafana ──SigV4 remote-write──► AMP    │
 │                                                    AMG ──PrivateLink─┘│
+│  Fluent Bit ──► CloudWatch Logs    OTLP ──► ADOT ──► X-Ray          │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Observability
 
-`terraform/stage2-control-plane/observability.tf` supports three deployment levels:
+`observability.tf` and `p2_observability.tf` support four deployment levels:
 
 1. `enable_observability_stack=true` installs in-cluster Prometheus, Alertmanager, and Grafana,
    and discovers the control plane and node-agent automatically.
 2. `enable_amp_remote_write=true` creates an AMP workspace and configures Prometheus IRSA +
    SigV4 remote-write. Level 1 must also be enabled.
-3. Supplying an existing AMG workspace, VPC, subnets, and security group grants the workspace
-   minimum AMP query permissions and creates an `aps-workspaces` Interface Endpoint. Terraform
-   does not create the AMG workspace or datasource.
+3. Supplying an existing AMG workspace, VPC, subnets, and security group grants minimum AMP query
+   permissions and creates an `aps-workspaces` Interface Endpoint. Terraform does not create AMG.
+4. `enable_p2_observability=true` deploys Fluent Bit/CloudWatch Logs and ADOT/X-Ray, then uses a
+   15-minute AMG token to upsert the datasource and dashboard. Temporary credentials are deleted.
 
 The stack includes five alert classes (wake latency, snapshot integrity, capacity, orphan growth,
 and control-plane degradation) plus the eight-panel `Sandbox Platform` dashboard. Metrics do not
 use sandbox IDs as labels. Snapshot restore verifies a SHA-256 manifest and rejects corrupted state.
 
-The real AWS test passed with 29/29 healthy targets, zero remote-write failures, AMP control-plane
-and node-agent series, AMG datasource health `OK`, an AMG query returning two control-plane replicas,
-and a zero-drift Terraform plan. See [deployment Step 6.2](docs/deploy.md#step-62-部署可观测性p1推荐)
-and the [P1 observability E2E report](docs/P1可观测性-真机测试报告-2026-08-12.md).
+The real AWS test also found the same correlation ID in control-plane and node-agent CloudWatch
+logs, reconstructed their parent/child trace in X-Ray, verified AMG datasource health `OK`, and
+left zero temporary AMG accounts. See [deployment Step 6.2](docs/deploy.md#step-62-部署可观测性p1推荐)
+and the [P2 observability E2E report](docs/P2可观测性-真机测试报告-2026-08-12.md).
 
 ### Quick Start (Agent Deployment Guide)
 
@@ -497,7 +499,7 @@ single-VM idle footprint and a concurrency assumption. A 400-microVM saturated-n
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
 | LiteLLM → Bedrock latency | ~1-2s | claude-haiku-4-5 |
-| Smoke tests | **control plane 53/53 + node-agent 5/5 PASS** | moto mocks plus observability/integrity tests |
+| Smoke tests | **control plane 53/53 + node-agent 8/8 PASS** | moto mocks plus tracing, observability, and integrity tests |
 | Control/data plane separation | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 lifecycle | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 
@@ -530,7 +532,7 @@ To avoid misunderstanding vs. the implementation, the current boundaries:
 python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
 python3 node-agent/observability_test.py
-# Expected: control plane 53/53 + node-agent 5/5 PASS
+# Expected: control plane 53/53 + node-agent 8/8 PASS
 ```
 
 ---

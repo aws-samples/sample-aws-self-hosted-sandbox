@@ -3,7 +3,8 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # 依赖
-RUN pip install --no-cache-dir boto3 kubernetes prometheus-client
+RUN pip install --no-cache-dir boto3 kubernetes prometheus-client \
+    opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
 # 复制源码(以 sandbox_api 包名暴露)
 COPY . /app/sandbox_api/

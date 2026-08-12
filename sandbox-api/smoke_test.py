@@ -64,6 +64,7 @@ class _AgentStub(BaseHTTPRequestHandler):
     """最小 node-agent stub:记录调用、返回合理假数据。"""
     calls: list[tuple[str, str, dict]] = []
     request_ids: list[str] = []
+    traceparents: list[str] = []
 
     def log_message(self, *_): pass
 
@@ -83,6 +84,7 @@ class _AgentStub(BaseHTTPRequestHandler):
         b = self._body()
         _AgentStub.calls.append(("POST", self.path, b))
         _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
+        _AgentStub.traceparents.append(self.headers.get("traceparent", ""))
         sid = b.get("id", "unknown")
         if self.path == "/vm/create":
             return self._send(200, {"state": "running", "ip": "172.18.1.2"})
@@ -102,6 +104,7 @@ class _AgentStub(BaseHTTPRequestHandler):
     def do_GET(self):
         _AgentStub.calls.append(("GET", self.path, {}))
         _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
+        _AgentStub.traceparents.append(self.headers.get("traceparent", ""))
         if self.path == "/health":
             return self._send(200, {"node_id": "mock-node", "free_mem_mib": 90000, "vm_count": 0})
         if self.path.startswith("/vm/"):
@@ -538,6 +541,7 @@ class TestAPIEndToEnd(unittest.TestCase):
                     response.headers["X-Request-ID"], "test-correlation-id"
                 )
             self.assertTrue(any(_AgentStub.request_ids))
+            self.assertTrue(any(_AgentStub.traceparents))
 
         finally:
             srv.shutdown()

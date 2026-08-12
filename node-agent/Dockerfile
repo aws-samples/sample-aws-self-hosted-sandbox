@@ -6,7 +6,8 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
     awscli iproute2 iptables openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir boto3 prometheus-client
+RUN pip install --no-cache-dir boto3 prometheus-client \
+    opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
 WORKDIR /app
 COPY main.py observability.py /app/

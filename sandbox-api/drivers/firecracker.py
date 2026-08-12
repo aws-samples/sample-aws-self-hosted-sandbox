@@ -18,7 +18,11 @@ import urllib.request
 from typing import Any
 
 from sandbox_api import db
-from sandbox_api.observability import current_request_id
+from sandbox_api.observability import (
+    current_request_id,
+    inject_trace_headers,
+    traced_client_request,
+)
 from sandbox_api.driver import Capabilities, SandboxSpec, UnsupportedOperation
 
 # node-agent 监听端口(DaemonSet hostNetwork 模式)
@@ -294,13 +298,19 @@ class FirecrackerDriver:
         host = node if ":" in node else f"{node}:{NODE_AGENT_PORT}"
         url  = f"http://{host}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        headers = {"Content-Type": "application/json"}
-        if request_id := current_request_id():
-            headers["X-Request-ID"] = request_id
-        req  = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            body_txt = e.read().decode(errors="replace")
-            raise RuntimeError(f"node-agent {method} {path} → {e.code}: {body_txt}") from e
+        with traced_client_request(method, f"node-agent{path}"):
+            headers = {"Content-Type": "application/json"}
+            if request_id := current_request_id():
+                headers["X-Request-ID"] = request_id
+            inject_trace_headers(headers)
+            req = urllib.request.Request(
+                url, data=data, headers=headers, method=method
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                body_txt = e.read().decode(errors="replace")
+                raise RuntimeError(
+                    f"node-agent {method} {path} → {e.code}: {body_txt}"
+                ) from e

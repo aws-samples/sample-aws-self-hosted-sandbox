@@ -32,7 +32,7 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 
 ## 前提条件
 
-- AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3；启用托管可观测性时还需要 APS/AMP、Amazon Managed Grafana 和 VPC Endpoint 权限）
+- AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3；启用托管可观测性时还需要 APS/AMP、Amazon Managed Grafana、CloudWatch Logs、X-Ray 和 VPC Endpoint 权限）
 - 已安装：kubectl, terraform (≥1.5), helm, git, docker
 - EC2 vCPU 服务配额：Graviton `c6g.metal` 需要 64 vCPU；x86 默认 `i7i.8xlarge` 需要 32 vCPU
 - x86 部署区域必须提供 i7i 且支持 nested virtualization；部署前按 Step 0.5 查询
@@ -53,7 +53,7 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
 11. **Helm/Kubernetes 认证依赖 AWS CLI**：stage2 provider 使用 `aws eks get-token` 动态刷新凭据，避免 15 分钟 EKS token 在长时间 Helm upgrade 中过期。执行 Terraform 的环境必须能从 `PATH` 调用 `aws`，且当前身份可访问目标集群。
-12. **可观测性分两层**：`enable_observability_stack=true` 安装集群内 Prometheus、Alertmanager 和 Grafana；`enable_amp_remote_write=true` 在此基础上创建 AMP 并 remote-write。AMG 是可选的**现有 workspace**，Terraform 只配置其查询 IAM 与 PrivateLink，不创建 AMG workspace，也不会自动创建 AMG datasource。
+12. **可观测性分三层**：`enable_observability_stack=true` 安装集群内监控；`enable_amp_remote_write=true` 创建 AMP；`enable_p2_observability=true` 增加 CloudWatch Logs、ADOT/X-Ray 和 AMG datasource/Dashboard 自动配置。AMG workspace 仍需预先存在。
 
 ---
 
@@ -374,7 +374,7 @@ terraform output managed_grafana_amp_vpc_endpoint_id
 
 Terraform 会把 AMP 查询权限附加到 AMG workspace role，并在 AMG VPC 创建
 `aps-workspaces` Interface Endpoint。Endpoint 专用安全组只允许 AMG workspace SG
-或该 VPC CIDR 的 TCP/443。若不传 `managed_grafana_vpc_id`，不会创建 PrivateLink。
+的 TCP/443。若不传 `managed_grafana_vpc_id`，不会创建 PrivateLink。
 
 最后在 AMG 中创建 Prometheus datasource（可用 AWS Console 的 workspace
 `Data sources` 页面）：
@@ -406,6 +406,47 @@ count(up{namespace="sandbox-system",job="monitoring/sandbox-node-agent"})
 AMG API 自动化测试如果临时创建 service account/token，必须在测试结束后立即删除；
 不要把 token 写入日志、文档或 shell history。2026-08-12 的真实 AWS 验证证据见
 [P1 可观测性真机测试报告](P1可观测性-真机测试报告-2026-08-12.md)。
+
+### 模式 D：集中日志、跨组件 tracing 与 AMG 自动配置
+
+模式 D 要求模式 A、B 已启用，并要求模式 C 的 AMG workspace 参数完整：
+
+```bash
+export TF_VAR_enable_p2_observability=true
+
+# 逐字重新执行 Step 6 的完整 terraform apply。
+terraform output cloudwatch_platform_log_group
+terraform output adot_otlp_http_endpoint
+```
+
+Terraform 将部署：
+
+- `aws-for-fluent-bit` DaemonSet，仅把 `sandbox-system` 与 `monitoring` 日志写入
+  `/aws/eks/<cluster>/sandbox-platform`，默认保留 30 天；
+- 两副本 ADOT Collector，通过 IRSA 写入 AWS X-Ray；
+- control-plane/node-agent 的 W3C `traceparent` 传播和 `trace_id`/`span_id` JSON 日志；
+- `configure-managed-grafana.sh`：创建 15 分钟 AMG service-account token，幂等 upsert
+  `sandbox-amp` datasource 和 `sandbox-platform` Dashboard，健康检查后立即删除凭据。
+
+按 correlation ID 验证 CloudWatch Logs：
+
+```bash
+aws logs start-query \
+  --log-group-name "/aws/eks/${CLUSTER}/sandbox-platform" \
+  --start-time "$(( $(date +%s) - 900 ))" --end-time "$(date +%s)" \
+  --query-string 'fields @logStream, request_id, trace_id, event | filter request_id="<REQUEST_ID>"'
+```
+
+从日志取得 32 位 `trace_id` 后转换为 X-Ray ID：
+
+```bash
+TRACE_HEX="<32-hex-trace-id>"
+aws xray batch-get-traces \
+  --trace-ids "1-${TRACE_HEX:0:8}-${TRACE_HEX:8}" --region "$AWS_REGION"
+```
+
+应同时看到 control-plane server segment、node-agent client/server segment。完整证据见
+[P2 可观测性真机测试报告](P2可观测性-真机测试报告-2026-08-12.md)。
 
 ---
 
@@ -627,7 +668,7 @@ aws dynamodb delete-item --table-name claude-sbx-sandboxes --key '{"id":{"S":"dr
 
 > 完整 P0 真机测试报告见 **[docs/P0编排加固-真机测试报告-2026-07-07.md](P0编排加固-真机测试报告-2026-07-07.md)**。
 
-**验证 P1 可观测性**（若执行了 Step 6.2）：
+**验证 P1/P2 可观测性**（若执行了 Step 6.2）：
 
 ```bash
 kubectl get pods -n monitoring
@@ -641,8 +682,9 @@ kubectl get prometheusrules -n monitoring
 
 完整验收还应覆盖：29/29 targets（数量随集群规模变化）、remote-write failed=0、
 AMP 查询到 2 个控制面和每个 node-agent、AMG datasource health=`OK`、Dashboard
-存在，以及 `terraform plan -detailed-exitcode` 返回 0。详见
-[P1 可观测性真机测试报告](P1可观测性-真机测试报告-2026-08-12.md)。
+存在。启用 P2 时还需验证 correlation ID 跨两组件、X-Ray 父子链路和临时 AMG
+service account 残留为 0，最后 `terraform plan -detailed-exitcode` 返回 0。详见
+[P2 可观测性真机测试报告](P2可观测性-真机测试报告-2026-08-12.md)。
 
 > **排障：**
 > - **create/exec 全 503 `control plane not configured`** → 没配 API_KEYS。测试环境快速放行：`kubectl set env deployment/sandbox-control-plane -n sandbox-system ALLOW_UNAUTHENTICATED=1`（生产严禁）。
@@ -727,6 +769,8 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
 
 # 若启用了模式 A/B/C，上面的 destroy 还必须带同一组：
 #   -var="enable_observability_stack=true"
+#   -var="enable_amp_remote_write=true"
+#   -var="enable_p2_observability=true"
 #   -var="grafana_admin_password=<至少16字符的占位值>"
 #   -var="enable_amp_remote_write=true"
 #   -var="managed_grafana_workspace_id=<原 workspace id>"

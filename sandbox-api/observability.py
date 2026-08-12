@@ -4,12 +4,21 @@ from __future__ import annotations
 import contextvars
 import functools
 import json
+import os
 import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 HTTP_REQUESTS = Counter(
@@ -77,6 +86,23 @@ _loop_lock = threading.Lock()
 _loops: dict[str, dict[str, float]] = {}
 
 
+def _configure_tracing() -> trace.Tracer:
+    provider = TracerProvider(
+        resource=Resource.create({
+            "service.name": os.environ.get(
+                "OTEL_SERVICE_NAME", "sandbox-control-plane"
+            )
+        })
+    )
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+    return trace.get_tracer("sandbox-platform")
+
+
+_tracer = _configure_tracing()
+
+
 def new_request_id(value: str | None = None) -> str:
     request_id = (value or "").strip()[:128] or uuid.uuid4().hex
     _request_id.set(request_id)
@@ -88,11 +114,18 @@ def current_request_id() -> str:
 
 
 def log_event(level: str, event: str, **fields) -> None:
+    span_context = trace.get_current_span().get_span_context()
     record = {
         "ts": time.time(),
         "level": level,
         "event": event,
         "request_id": current_request_id() or None,
+        "trace_id": (
+            format(span_context.trace_id, "032x") if span_context.is_valid else None
+        ),
+        "span_id": (
+            format(span_context.span_id, "016x") if span_context.is_valid else None
+        ),
         **fields,
     }
     print(
@@ -123,6 +156,47 @@ def record_http(method: str, path: str, status: int, duration: float) -> str:
     HTTP_REQUESTS.labels(route, method, f"{status // 100}xx").inc()
     HTTP_REQUEST_DURATION.labels(route, method).observe(duration)
     return route
+
+
+def start_server_span(headers, method: str, path: str):
+    carrier = {key.lower(): value for key, value in headers.items()}
+    parent = propagate.extract(carrier)
+    route = normalize_route(path)
+    span = _tracer.start_span(
+        f"{method} {route}",
+        context=parent,
+        kind=SpanKind.SERVER,
+        attributes={"http.request.method": method, "http.route": route},
+    )
+    token = otel_context.attach(trace.set_span_in_context(span, parent))
+    return span, token
+
+
+def finish_server_span(span, token, status: int) -> None:
+    if span is None:
+        return
+    span.set_attribute("http.response.status_code", status)
+    if status >= 500:
+        span.set_status(Status(StatusCode.ERROR))
+    span.end()
+    otel_context.detach(token)
+
+
+def inject_trace_headers(headers: dict[str, str]) -> None:
+    propagate.inject(headers)
+
+
+@contextmanager
+def traced_client_request(method: str, target: str):
+    with _tracer.start_as_current_span(
+        f"{method} {target}",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "http.request.method": method,
+            "server.address": target,
+        },
+    ):
+        yield
 
 
 def record_operation(operation: str, result: str, duration: float) -> None:

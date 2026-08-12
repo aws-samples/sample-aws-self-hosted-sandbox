@@ -42,12 +42,15 @@ from sandbox_api.observability import (
     RESUME_INFLIGHT,
     RESUME_QUEUE_WAIT,
     WAKE_RPC_DURATION,
+    finish_server_span,
+    inject_trace_headers,
     log_event,
     metrics_payload,
     new_request_id,
     normalize_route,
     observed_operation,
     record_http,
+    start_server_span,
     stale_loops,
 )
 from sandbox_api.reconcile import Reconciler
@@ -823,6 +826,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = super().parse_request()
         if parsed:
             self.request_id = new_request_id(self.headers.get("X-Request-ID"))
+            self._otel_span, self._otel_token = start_server_span(
+                self.headers, self.command, self.path
+            )
         return parsed
 
     def handle_one_request(self) -> None:
@@ -830,6 +836,8 @@ class Handler(BaseHTTPRequestHandler):
         self._response_status = 500
         self.command = None
         self.path = None
+        self._otel_span = None
+        self._otel_token = None
         try:
             super().handle_one_request()
         finally:
@@ -846,6 +854,9 @@ class Handler(BaseHTTPRequestHandler):
                         status=self._response_status,
                         duration_ms=round(duration * 1000, 3),
                     )
+            finish_server_span(
+                self._otel_span, self._otel_token, self._response_status
+            )
 
     def send_response(self, code: int, message=None) -> None:
         self._response_status = code
@@ -962,6 +973,7 @@ class Handler(BaseHTTPRequestHandler):
                "te", "trailers", "transfer-encoding", "upgrade", "host"}
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in hop}
         fwd["X-Request-ID"] = getattr(self, "request_id", "")
+        inject_trace_headers(fwd)
 
         try:
             conn = http.client.HTTPConnection(node_host, timeout=30)
@@ -1001,6 +1013,10 @@ class Handler(BaseHTTPRequestHandler):
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {node_host}")
         lines.append(f"X-Request-ID: {getattr(self, 'request_id', '')}")
+        trace_headers: dict[str, str] = {}
+        inject_trace_headers(trace_headers)
+        if traceparent := trace_headers.get("traceparent"):
+            lines.append(f"traceparent: {traceparent}")
         up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         with _idle_detector.connection(sid):
             _raw_tunnel(

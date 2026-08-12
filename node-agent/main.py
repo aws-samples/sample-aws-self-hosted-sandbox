@@ -43,6 +43,7 @@ from urllib.parse import urlparse
 from observability import (
     FC_RESUME_INFLIGHT,
     NODE_HEARTBEAT_ERRORS,
+    finish_server_span,
     log_event,
     metrics_payload,
     new_request_id,
@@ -52,9 +53,11 @@ from observability import (
     record_restore_mode,
     record_resume_stage,
     record_snapshot_error,
+    record_snapshot_legacy_migration,
     record_snapshot_transfer,
     record_snapshot_verify,
     refresh_node_metrics,
+    start_server_span,
 )
 
 # ---------- 配置 ----------
@@ -396,6 +399,9 @@ _SNAPSHOT_FILES = (
     "vm.snapshot.base",
     "vm.mem.base",
 )
+_BASE_SNAPSHOT_FILES = frozenset(("vm.snapshot.base", "vm.mem.base"))
+_BASE_HASH_CACHE: dict[str, tuple[tuple[int, int, int, int, int], str]] = {}
+_BASE_HASH_CACHE_LOCK = threading.Lock()
 
 
 class SnapshotIntegrityError(RuntimeError):
@@ -410,6 +416,42 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _file_identity(path: str) -> tuple[int, int, int, int, int]:
+    stat = os.stat(path)
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _snapshot_file_hash(path: str, name: str) -> str:
+    if name not in _BASE_SNAPSHOT_FILES:
+        return _sha256_file(path)
+    identity = _file_identity(path)
+    with _BASE_HASH_CACHE_LOCK:
+        cached = _BASE_HASH_CACHE.get(path)
+    if cached and cached[0] == identity:
+        return cached[1]
+    digest = _sha256_file(path)
+    with _BASE_HASH_CACHE_LOCK:
+        _BASE_HASH_CACHE[path] = (identity, digest)
+    return digest
+
+
+def _clear_base_hash_cache(sandbox_dir: str) -> None:
+    prefix = os.path.abspath(sandbox_dir) + os.sep
+    with _BASE_HASH_CACHE_LOCK:
+        stale = [
+            path for path in _BASE_HASH_CACHE
+            if os.path.abspath(path).startswith(prefix)
+        ]
+        for path in stale:
+            del _BASE_HASH_CACHE[path]
+
+
 def _write_snapshot_manifest(snap_dir: str) -> dict:
     files = {}
     for name in _SNAPSHOT_FILES:
@@ -417,7 +459,7 @@ def _write_snapshot_manifest(snap_dir: str) -> dict:
         if os.path.isfile(path):
             files[name] = {
                 "size": os.path.getsize(path),
-                "sha256": _sha256_file(path),
+                "sha256": _snapshot_file_hash(path, name),
             }
     if "vm.snapshot" not in files or "vm.mem" not in files:
         raise SnapshotIntegrityError("snapshot is missing required files")
@@ -452,7 +494,7 @@ def _verify_snapshot_manifest(snap_dir: str) -> dict:
             raise SnapshotIntegrityError(f"snapshot file is missing: {name}")
         if os.path.getsize(path) != expected.get("size"):
             raise SnapshotIntegrityError(f"snapshot size mismatch: {name}")
-        if _sha256_file(path) != expected.get("sha256"):
+        if _snapshot_file_hash(path, name) != expected.get("sha256"):
             raise SnapshotIntegrityError(f"snapshot checksum mismatch: {name}")
     if "vm.snapshot" not in files or "vm.mem" not in files:
         raise SnapshotIntegrityError("snapshot manifest omits required files")
@@ -462,6 +504,19 @@ def _verify_snapshot_manifest(snap_dir: str) -> dict:
 def _record_snapshot_verification(snap_dir: str) -> dict:
     started = time.monotonic()
     try:
+        manifest_path = os.path.join(snap_dir, _SNAPSHOT_MANIFEST)
+        if not os.path.exists(manifest_path):
+            try:
+                _write_snapshot_manifest(snap_dir)
+                record_snapshot_legacy_migration("success")
+                log_event(
+                    "warning",
+                    "legacy_snapshot_manifest_created",
+                    snapshot_dir=snap_dir,
+                )
+            except Exception:
+                record_snapshot_legacy_migration("error")
+                raise
         manifest = _verify_snapshot_manifest(snap_dir)
         record_snapshot_verify("success", time.monotonic() - started)
         return manifest
@@ -520,7 +575,9 @@ def op_destroy(body: dict) -> dict:
             except (ProcessLookupError, ValueError, TypeError):
                 pass
         _teardown_tap(vm.get("tap", ""))
-        shutil.rmtree(f"{SBX_BASE}/{sid}", ignore_errors=True)
+        sandbox_dir = f"{SBX_BASE}/{sid}"
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        _clear_base_hash_cache(sandbox_dir)
     return {"deleted": True}
 
 
@@ -1408,6 +1465,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = super().parse_request()
         if parsed:
             self.request_id = new_request_id(self.headers.get("X-Request-ID"))
+            self._otel_span, self._otel_token = start_server_span(
+                self.headers, self.command, self.path
+            )
         return parsed
 
     def handle_one_request(self) -> None:
@@ -1415,6 +1475,8 @@ class Handler(BaseHTTPRequestHandler):
         self._response_status = 500
         self.command = None
         self.path = None
+        self._otel_span = None
+        self._otel_token = None
         try:
             super().handle_one_request()
         finally:
@@ -1431,6 +1493,9 @@ class Handler(BaseHTTPRequestHandler):
                         status=self._response_status,
                         duration_ms=round(duration * 1000, 3),
                     )
+            finish_server_span(
+                self._otel_span, self._otel_token, self._response_status
+            )
 
     def send_response(self, code: int, message=None) -> None:
         self._response_status = code
