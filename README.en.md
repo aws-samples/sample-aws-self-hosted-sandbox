@@ -12,11 +12,11 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
 - **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
-- **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes, using either bare-metal hosts or nested-virtualization-capable Intel x86 instances (`i7i.8xlarge` is the current default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
+- **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes, using either bare-metal hosts or nested-virtualization-capable Intel x86 instances (x86 defaults to `r8i.8xlarge` — no local disk, all state on persistent EBS); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md) (`i7i.8xlarge`) and the [`r8i.8xlarge` + OD/Spot dual-pool E2E report](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md) (2026-08-13)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
-- **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
+- **Custom images**: `image` field selects a prebuilt named rootfs template — `web` (demo site auto-served on :80), `claude-code` and `openclaw` (prebaked runtimes, CLI on `PATH`; [E2E-verified 2026-08-13](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md), must be built on a same-architecture host and must not be combined with the node warm pool); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
 - **Platform observability**: low-cardinality Prometheus metrics, centralized JSON logs in CloudWatch, cross-component OpenTelemetry/X-Ray traces, five alert classes, an eight-panel dashboard, SHA-256 snapshot verification, AMP remote-write, and automated AMG configuration
 
@@ -111,15 +111,27 @@ The current implementation also has two important boundaries:
   by node-agent or host lifecycle. Drain sandboxes safely before restarting or upgrading node-agent.
 - Persistent state EBS in the same Availability Zone is currently authoritative. Cross-node EBS
   detach/attach has been verified, but automatic Spot evacuation and recovery are not yet a closed loop.
-  This design must not be described as automatic cross-AZ rescheduling.
+  This design must not be described as automatic cross-AZ rescheduling. The data plane is now split into
+  On-Demand and Spot managed node groups (`sandbox_spot_node_count` defaults to 0 — opt in explicitly);
+  both pools are pinned to a single AZ because persistent EBS cannot be attached across AZs, so they
+  diversify across instance types only, never across AZs.
+- **The dual pools are node-group-level preparation only — the control plane will not use the Spot pool
+  yet.** `_pick_node` ranks nodes by free memory and ignores the `capacity-type` label (2026-08-13
+  real-machine run: all 5 sandboxes landed on the On-Demand node). The "passive instances go to Spot"
+  placement policy is not implemented, so enabling the Spot pool today just pays for an idle machine.
+- **The node warm pool** (`sandbox_warm_pool_size`, default 0) cut node-replacement Ready time from
+  5m03s to **44s** in testing, but it currently **cannot be combined with named rootfs templates**
+  (`rootfs_images`): warm-pool-derived nodes are missing the templates and silently fall back to `min`.
+  Details in the [2026-08-13 report](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)
+  and [terraform/README.md](terraform/README.md).
 
 ### Architecture
 
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────────┐
 │                                                                       │
-│  system node group (On-Demand)   sandbox data node group             │
-│  Graviton m7g (2 by default)     c6g.metal or i7i.*                  │
+│  system node group (On-Demand)   sandbox data pools (OD + Spot)      │
+│  Graviton m7g (2 by default)     r8i.* (default) / i7i.* / c6g.metal │
 │  ┌───────────────────────────┐    ┌────────────────────────────────┐ │
 │  │ sandbox-control-plane     │HTTP│ node-agent Pod (DaemonSet)     │ │
 │  │ (2 replicas, IRSA)        │───►│ hostNetwork / privileged       │ │
@@ -174,7 +186,7 @@ Follow these steps exactly, debugging any errors before proceeding.
 [Prerequisites]
 - AWS CLI configured (IAM permissions: EKS, EC2, IAM, DynamoDB, ECR, S3)
 - kubectl, terraform(>=1.5), helm, git installed
-- EC2 vCPU quota for the selected sandbox host (`c6g.metal`=64, `i7i.8xlarge`=32)
+- EC2 vCPU quota for the selected sandbox host (`r8i.8xlarge`=32, `i7i.8xlarge`=32, `c6g.metal`=64)
 
 [Step 0: Clone the repository]
 git clone https://github.com/teaguexiao/aws-self-hosted-sandbox.git
@@ -189,9 +201,9 @@ aws dynamodb list-tables --region us-east-1 | grep claude-sbx
 [Step 2: Create EKS cluster + separated system and sandbox node groups]
 cd ../phase3
 MY_IP=$(curl -s https://checkip.amazonaws.com)
-# Choose one:
-NODE_ARCH=arm64; SANDBOX_INSTANCE_TYPE=c6g.metal
-# NODE_ARCH=amd64; SANDBOX_INSTANCE_TYPE=i7i.8xlarge
+# Choose one (x86/r8i is the default and recommended path):
+NODE_ARCH=amd64; SANDBOX_INSTANCE_TYPE=r8i.8xlarge
+# NODE_ARCH=arm64; SANDBOX_INSTANCE_TYPE=c6g.metal   # fallback path
 terraform init && terraform apply -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="sandbox_instance_type=${SANDBOX_INSTANCE_TYPE}" \
@@ -199,8 +211,11 @@ terraform init && terraform apply -auto-approve \
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 
-# phase3 creates an On-Demand arm64 system group and a dedicated sandbox group.
-# node_arch describes only the sandbox group; the system group remains arm64 On-Demand.
+# phase3 creates an On-Demand arm64 system group and dedicated sandbox data pools
+# (OD by default; Spot via -var="sandbox_spot_node_count=N", 0 = not created).
+# node_arch describes only the sandbox pools; the system group remains arm64 On-Demand.
+# Optional: -var="rootfs_images=web,claude-code,openclaw"  (build them first, see Step 1.6 in deploy.md)
+#           -var="sandbox_warm_pool_size=1"                (44s node replacement; do NOT combine with rootfs_images)
 
 [Step 5: Build and push matching-architecture images]
 # Note: the sandbox image repo claude-sbx is auto-created by phase3 (Step 2); only create these two:
@@ -368,7 +383,7 @@ done
 
 ```
 You are the ops engineer for this AWS sandbox platform. Platform overview:
-- EKS cluster claude-sbx with a separate On-Demand Graviton system group and c6g.metal/i7i sandbox group
+- EKS cluster claude-sbx with a separate On-Demand Graviton system group and r8i/i7i/c6g.metal sandbox group
 - Control plane: sandbox-system namespace, 2 replicas pinned to system nodes
   External access: http://api.sbx.<domain> (ingress-nginx NLB; POC use port-forward)
 - State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx / nodes / locks)
@@ -385,7 +400,9 @@ Common ops tasks:
 5. DynamoDB item count:   aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
 6. Update images:         bash scripts/build_and_push.sh --control-plane-platform linux/arm64 --node-agent-platform <sandbox-platform>
                           kubectl rollout restart deployment/sandbox-control-plane -n sandbox-system
-7. Scale node capacity:   adjust phase3 `sandbox_node_count` and terraform apply
+7. Scale node capacity:   adjust phase3 `sandbox_od_node_count` (OD pool) / `sandbox_spot_node_count` (Spot pool), then terraform apply
+                          (note: `_pick_node` ignores `capacity-type`, so a larger Spot pool won't be scheduled onto)
+                          Faster replacement: `sandbox_warm_pool_size=1` (44s Ready measured), but not usable together with `rootfs_images`
 8. Cost optimization — bulk-suspend idle sandboxes:
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend
@@ -407,6 +424,16 @@ Monitoring:
 ---
 
 ### Cost Breakdown (Minimum Setup — 2 system nodes + 1 × c6g.metal sandbox, us-east-1)
+
+> ⚠️ The table below still uses `c6g.metal` and is a **historical cost baseline, not the
+> recommended path**. The current x86 default is `r8i.8xlarge` (~$1,623/mo on-demand, ~$1,002/mo
+> at 1-year SP — see the instance table below). It is slightly more expensive on-demand than
+> `c6g.metal` but has half the vCPUs and twice the memory, so the two are not a same-spec
+> comparison. The ARM path is **on hold**: Graviton does not support nested virtualization, so it
+> requires bare metal, and a metal instance takes 10+ minutes to come back after reclaim.
+> The functional r8i real-machine E2E passed on 2026-08-13
+> ([report](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)), but that run
+> included no saturation test, so **density and amortized cost still need to be recomputed**.
 
 | Resource | Monthly Unit Price | Monthly (730h) |
 |---|---|---|
@@ -452,9 +479,22 @@ included. Prices were queried on 2026-08-12; verify current figures with
 | `r8i.8xlarge` | 32 | 256 GiB | None | **$1,623** | **$1,002** | $12,021 |
 | `i7i.8xlarge` | 32 | 256 GiB | 2 × 3.75 TB | **$2,205** | **$1,335** | $16,024 |
 
-All virtualized instances above support `nested_virtualization=enabled`. Because persistent EBS is
-authoritative in the current architecture, local NVMe is not required. `r8i.8xlarge` is the closest
-non-NVMe alternative to `i7i.8xlarge` by vCPU and memory.
+All virtualized instances above support `nested_virtualization=enabled`.
+
+> **The x86 default is `r8i.8xlarge`, not `i7i.8xlarge`.** The local NVMe on i7i is *instance
+> store*: it is destroyed on spot reclaim or stop, so it cannot hold sandbox state that must
+> survive. All platform state (memory snapshots `base`+`diff` and rootfs) already lives on a
+> persistent EBS volume with `delete_on_termination=false` and does **not** depend on local
+> disks, so paying the NVMe premium buys nothing. At the same 32 vCPU / 256 GiB,
+> `r8i.8xlarge` saves **$582/mo** on-demand ($1,623 vs $2,205) and **$333/mo** on a 1-year SP
+> basis ($1,002 vs $1,335).
+>
+> **Do not go below 8xlarge.** Smaller sizes have burst-credit-limited EBS throughput: they can
+> only reach peak briefly and cannot sustain it, which directly lengthens evacuation flush time
+> inside the spot reclaim window. `r8i.8xlarge` provides **1250 MB/s of EBS throughput**
+> (10 Gbps), while **gp3 caps at 1000 MB/s per volume** — so with a single volume the bottleneck
+> is the volume, not the instance, and 1000 MB/s is the ceiling. Saturating 1250 MB/s requires
+> striping multiple volumes or io2.
 
 **Bare Metal:**
 
@@ -471,9 +511,13 @@ non-NVMe alternative to `i7i.8xlarge` by vCPU and memory.
 | `i4i.metal` | x86_64 | 128 | 1,024 GiB | 8 × 3.75 TB | **$8,017** | **$4,855** | $58,263 |
 
 > These are AWS instance candidates capable of hosting Firecracker, not the current Terraform allowlist.
-> This repository currently enables and has tested ARM64 `c6g.metal` and x86 `i7i.*`. Before using
-> `c8i`, `m8i`, `r8i`, or another Bare Metal family, extend Terraform validation and complete an E2E
-> test for that architecture.
+> The current allowlist is ARM64 `c6g.metal` plus x86 `r8i.*` / `i7i.*` (x86 defaults to
+> `r8i.8xlarge`). `c6g.metal`, `i7i.*` and `r8i.8xlarge` all have real-machine E2E reports
+> (r8i: [2026-08-13](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md));
+> what remains to be verified on r8i is real evacuation time inside the spot reclaim window and
+> cross-host restore.
+> Before using `c8i`, `m8i`, or another Bare Metal family, extend Terraform validation and
+> complete an E2E test for that architecture.
 
 **Per-sandbox amortized cost (single c6g.metal, 128 GiB):**
 

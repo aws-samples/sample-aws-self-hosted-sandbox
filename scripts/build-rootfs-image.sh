@@ -5,12 +5,33 @@
 # create 时按沙盒的 image 字段选模板(见 node-agent op_create 的 rootfs_template)。
 #
 # 用法: bash scripts/build-rootfs-image.sh <name> <s3-bucket>
-#   name = min      → 等价于 build-min-rootfs.sh(基础模板)
-#   name = web      → 自带 demo 首页 + 开机自起 :80(端口暴露打开即见站点)
-#   其它 name        → 目前回退到 min 内容(可在下方 case 里加预设)
+#   name = min          → 等价于 build-min-rootfs.sh(基础模板)
+#   name = web          → 自带 demo 首页 + 开机自起 :80(端口暴露打开即见站点)
+#   name = claude-code  → 预打包运行环境:Node.js LTS + @anthropic-ai/claude-code CLI
+#   name = openclaw     → 预打包运行环境:Node.js LTS + openclaw CLI
+#   其它 name            → 目前回退到 min 内容(可在下方 case 里加预设)
+#
+# 环境变量:
+#   PLATFORM=linux/amd64          目标架构(必须与 node_arch 一致;默认 linux/arm64)
+#                                 🔴 claude-code / openclaw 必须在【同架构原生机器】上跑:
+#                                 Apple Silicon 上 PLATFORM=linux/amd64 会在 npm install -g
+#                                 中途 qemu 段错误(2026-08-13 实测 exit 139)。min/web 不装
+#                                 npm 包,跨架构没问题。变通=一次性起同架构 EC2 构建。
+#   NODE_VERSION=22.23.2          预打包运行环境用的 Node.js 版本(claude-code/openclaw 都要 >=22.22.3)
+#   CLAUDE_CODE_VERSION=2.1.231   @anthropic-ai/claude-code 版本(留 latest 也可)
+#   OPENCLAW_VERSION=2026.7.1-2   openclaw 版本
+#
+# 上传后要让节点真的造这个模板,还需在 phase3 传:
+#   -var="rootfs_images=web,claude-code,openclaw"
+# 🔴 且此时 phase3 的 sandbox_warm_pool_size 必须为 0 —— 预热池节点不等 cloud-init 跑完就停机,
+#    命名模板会全缺,而 node-agent 对缺失模板静默回退 min(2026-08-13 实测)。
 set -euo pipefail
 
 PLATFORM="${PLATFORM:-linux/arm64}"
+# 预打包运行环境的版本(可用环境变量覆盖)。Node 需 >=22.22.3(两个 CLI 的 engines 要求)。
+NODE_VERSION="${NODE_VERSION:-22.23.2}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.231}"
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
 ROOTFS_PREFIX="${ROOTFS_PREFIX:-rootfs}"
 NAME="${1:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
 S3_BUCKET="${2:?usage: build-rootfs-image.sh <name> <s3-bucket>}"
@@ -33,6 +54,15 @@ mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
+
+# PATH 显式导出:kernel 传给 PID1 的环境几乎是空的,而 vsock-exec-agent 用 subprocess
+# 继承本进程环境 → 不导出的话 exec 里找不到 /usr/local/bin 下的 node/npm/claude/openclaw
+# (web 预设当年就是踩这个坑才改用 python 绝对路径)。
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 预打包运行环境可在镜像层放 /etc/sbx-env(KEY=VALUE 每行一条),这里导出,
+# 之后启动的 vsock-exec-agent 会继承 → exec 出来的命令直接拿到这些变量。
+if [ -f /etc/sbx-env ]; then set -a; . /etc/sbx-env; set +a; fi
 
 ip link set lo up 2>/dev/null
 
@@ -89,6 +119,52 @@ RUN sed -i 's|deb.debian.org|cdn-aws.deb.debian.org|g' /etc/apt/sources.list.d/d
  && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
  && sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 DOCKER
+
+# ---------- 2.1 预打包运行环境:在镜像里装 Node.js + CLI ----------
+# 放在 Dockerfile 里而不是在导出的 rootfs 目录里做:docker build --platform 能跨架构
+# (走 qemu),而宿主上跑 npm 装出来的原生依赖架构会错。
+# Debian 仓库的 nodejs 太老(claude-code/openclaw 的 engines 都要 node >=22.22.3),
+# 所以直接取 nodejs.org 官方 tarball 解到 /usr/local。
+node_layer() {
+  cat <<EOF
+
+# Node.js ${NODE_VERSION}(官方 tarball;dpkg 架构 → nodejs.org 的 x64/arm64 命名)
+RUN set -eux; \\
+    apt-get update && apt-get install -y --no-install-recommends \\
+      ca-certificates curl xz-utils git; \\
+    rm -rf /var/lib/apt/lists/*; \\
+    case "\$(dpkg --print-architecture)" in \\
+      amd64) NARCH=x64 ;; \\
+      arm64) NARCH=arm64 ;; \\
+      *) echo "unsupported arch: \$(dpkg --print-architecture)" >&2; exit 1 ;; \\
+    esac; \\
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-\$NARCH.tar.xz" \\
+      -o /tmp/node.tar.xz; \\
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \\
+    rm -f /tmp/node.tar.xz; \\
+    node --version && npm --version
+EOF
+}
+
+case "$NAME" in
+  claude-code)
+    node_layer >> "$WORK/Dockerfile"
+    cat >> "$WORK/Dockerfile" <<EOF
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \\
+ && npm cache clean --force \\
+ && claude --version
+EOF
+    ;;
+  openclaw)
+    node_layer >> "$WORK/Dockerfile"
+    cat >> "$WORK/Dockerfile" <<EOF
+RUN npm install -g openclaw@${OPENCLAW_VERSION} \\
+ && npm cache clean --force \\
+ && openclaw --version
+EOF
+    ;;
+esac
+
 docker build --platform "$PLATFORM" -t "sbx-rootfs:$NAME" "$WORK"
 CID=$(docker create --platform "$PLATFORM" "sbx-rootfs:$NAME" sleep infinity)
 mkdir -p "$WORK/rootfs"
@@ -138,6 +214,26 @@ case "$NAME" in
 </body></html>
 HTML
     ;;
+  claude-code)
+    # Node + Claude Code CLI 已在 Dockerfile 层装好(claude 在 /usr/local/bin)。
+    # 这里只放 guest 侧运行时配置:sbxinit 会 source /etc/sbx-env 并导出。
+    cat > "$WORK/rootfs/etc/sbx-env" <<'ENV'
+# 由 /sbin/sbxinit 在启动时 source(set -a 导出),vsock exec 的命令会继承。
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# ⚠️ ANTHROPIC_BASE_URL 必须填【guest 可达】的地址:guest 只有 tap 网段 + 8.8.8.8 DNS,
+#    解析不了集群内 DNS(litellm.litellm),所以不能在镜像里写死集群 Service 名。
+#    正确做法是控制面/node-agent 在 create 时按所在节点写入,例如:
+#      ANTHROPIC_BASE_URL=http://<node-ip>:4000
+#    未配置时 claude 会直接打 Anthropic 公网 API(沙盒内没有 key → 需自带 key)。
+ENV
+    ;;
+  openclaw)
+    # Node + OpenClaw CLI 已在 Dockerfile 层装好(openclaw 在 /usr/local/bin)。
+    cat > "$WORK/rootfs/etc/sbx-env" <<'ENV'
+# 由 /sbin/sbxinit 在启动时 source(set -a 导出),vsock exec 的命令会继承。
+# OpenClaw 是多渠道 AI 网关,凭据/渠道配置不应烤进镜像 —— 由 create 时注入或 exec 时传入。
+ENV
+    ;;
   min|"")
     : # 基础模板,无额外内容
     ;;
@@ -145,6 +241,9 @@ HTML
     echo "==> WARN: 未知预设 '$NAME',仅产出基础(min 等价)内容;可在脚本 case 里加预设"
     ;;
 esac
+
+# 镜像标记:guest 内 `cat /etc/sbx-image` 即可确认自己跑的是哪个模板(e2e 断言用)。
+echo "$NAME" > "$WORK/rootfs/etc/sbx-image"
 
 # ---------- 3. 打包 + 上传 ----------
 TARBALL="$WORK/rootfs-${NAME}.tar.gz"

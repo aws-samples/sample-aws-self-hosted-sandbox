@@ -51,6 +51,20 @@ variable "sandbox_image" {
   description = "ECR URL for claude-sbx sandbox image"
 }
 
+# 可选镜像清单(= 预打包运行环境的 rootfs 模板名),经 SANDBOX_IMAGES 传给控制面,
+# 由 GET /admin/images 供 Portal 创建表单下拉。应与 phase3 的 rootfs_images 保持一致。
+# 注意:它是【展示用清单】而不是强校验白名单 —— create 传了不在此列的 image 不会被拒,
+# 只要名字合法就照传给 node-agent;节点上没有对应模板时静默回退到默认 min 模板。
+variable "sandbox_images" {
+  type        = string
+  default     = "min,web"
+  description = "逗号分隔的可选镜像名(SANDBOX_IMAGES),供 Portal 下拉。内置预设:min / web / claude-code / openclaw;需与 phase3 的 rootfs_images 一致。"
+  validation {
+    condition     = length(trimspace(var.sandbox_images)) > 0
+    error_message = "sandbox_images 不能为空(至少保留 min)。"
+  }
+}
+
 variable "control_plane_image" {
   type        = string
   description = "ECR URL for sandbox-control-plane image"
@@ -90,8 +104,13 @@ variable "sandbox_domain" {
 }
 
 variable "warm_pool_size" {
-  type    = number
-  default = 3
+  type        = number
+  default     = 3
+  description = <<-EOT
+    【microVM 暖池】大小:控制面预先建好并 suspend 的空白 min 沙盒数,create 时 claim 走 resume。
+    注意与 phase3 的 sandbox_warm_pool_size(【EC2 节点】预热池)是两回事,两者互不影响。
+    非默认 image 会跳过暖池走冷建(暖池只预热 min 快照)。
+  EOT
 }
 
 variable "control_plane_replicas" {
@@ -132,10 +151,39 @@ variable "activity_touch_min_s" {
   description = "活跃时间(last_active_at)写节流下限(秒):热路径(proxy/exec)最多每这么久写一次 DynamoDB,防写放大。"
 }
 
+# ---------- Spot 回收(数据面 Spot 池用) ----------
+variable "reclaim_watch_enabled" {
+  type        = bool
+  default     = true
+  description = "node-agent 是否轮询 IMDS 的 spot 回收信号(instance-action 硬通知 + rebalance 软通知)。关掉就完全不感知回收。"
+}
+
+variable "reclaim_auto_evacuate" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    收到回收信号后是否【真的】疏散(给本节点每个 running 沙盒打 Diff 快照到持久状态 EBS)。
+    默认 false = DRY-RUN,只把"会疏散哪些"记进 /reclaim/status,便于先验证检测链路。
+    ⚠️ 开 Spot 数据面池(sandbox_spot_node_count>0)前应置 true,否则 Spot 被回收时沙盒直接丢。
+    ⚠️ 当前疏散实现(_evacuate_local)是串行的,客户复盘建议的并发 6-8 还没落地;
+       另外跨机拉起仍依赖运维把幸存的状态卷 attach 到新节点,不是自动的。
+  EOT
+}
+
+variable "reclaim_poll_s" {
+  type        = number
+  default     = 5
+  description = "IMDS 回收信号轮询间隔(秒)。Spot 硬通知只有 ~120s 窗口,不建议放大。"
+  validation {
+    condition     = var.reclaim_poll_s >= 1 && var.reclaim_poll_s <= 30
+    error_message = "reclaim_poll_s 应在 1-30 秒之间(过大会吃掉 120s 疏散窗口)。"
+  }
+}
+
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。需与 phase3 的 node_arch 一致。"
+  default     = "amd64"
+  description = "沙盒数据节点 CPU 架构:amd64(Intel x86,默认/推荐) 或 arm64(Graviton,备选)。必须与 phase3 的 node_arch 一致(否则 node-agent 镜像架构会对不上数据节点)。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
@@ -504,12 +552,14 @@ resource "kubernetes_config_map" "control_plane" {
     DYNAMODB_LOCKS_TABLE  = local.dynamodb_locks # P1-4: leader 锁
     AWS_REGION            = var.region
     SANDBOX_IMAGE         = var.sandbox_image
-    LITELLM_URL           = var.litellm_url
-    SANDBOX_DOMAIN        = var.sandbox_domain
-    K8S_NAMESPACE         = "default"
-    SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
-    WARM_POOL_SIZE        = tostring(var.warm_pool_size)
-    WARM_POOL_REFILL_S    = "60"
+    # 可选镜像清单(GET /admin/images → Portal 下拉;不是强校验白名单,见变量注释)
+    SANDBOX_IMAGES     = var.sandbox_images
+    LITELLM_URL        = var.litellm_url
+    SANDBOX_DOMAIN     = var.sandbox_domain
+    K8S_NAMESPACE      = "default"
+    SNAPSHOT_S3_BUCKET = local.snapshot_bucket
+    WARM_POOL_SIZE     = tostring(var.warm_pool_size)
+    WARM_POOL_REFILL_S = "60"
     # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。
     AUTO_SLEEP_ENABLED   = var.auto_sleep_enabled
     AUTO_SLEEP_IDLE_S    = tostring(var.auto_sleep_idle_s)
@@ -722,6 +772,20 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
             value = local.p2_enabled ? local.otlp_http_endpoint : ""
+          }
+          # Spot 回收信号监听(IMDS)。数据面分了 Spot 池后,只有这里打开才会真疏散;
+          # 默认 watch=1 / auto_evacuate=0(DRY-RUN 只记疏散计划),与代码默认一致。
+          env {
+            name  = "RECLAIM_WATCH_ENABLED"
+            value = var.reclaim_watch_enabled ? "1" : "0"
+          }
+          env {
+            name  = "RECLAIM_AUTO_EVACUATE"
+            value = var.reclaim_auto_evacuate ? "1" : "0"
+          }
+          env {
+            name  = "RECLAIM_POLL_S"
+            value = tostring(var.reclaim_poll_s)
           }
           security_context {
             privileged = true

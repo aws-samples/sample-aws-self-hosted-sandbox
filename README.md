@@ -12,7 +12,8 @@
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
 - **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS（**不经 S3**），跨机恢复靠 EBS 卷幸存 + detach/attach（见下方"快照落盘与跨机恢复"说明）
-- **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（当前默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
+- **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（x86 默认 `r8i.8xlarge`，无本地盘、状态全落持久 EBS）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)（`i7i.8xlarge`），
+  [`r8i.8xlarge` + OD/Spot 双池 E2E 亦已通过](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)（2026-08-13）
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
 - **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
@@ -58,6 +59,14 @@ root 可绑 80 端口、dnf 装包、嵌套 docker            ✅ 完整 root �
 
 **最小配置月费（us-east-1，2 台 system + 1 台 c6g.metal sandbox）：**
 
+> ⚠️ 下表仍以 `c6g.metal` 为例，是**历史成本基线**，不是当前推荐路线。当前 x86 默认机型是
+> `r8i.8xlarge`（按需 ~$1,623/月、1 年 SP 等效 ~$1,002/月，见下一节机型表），按需口径比
+> `c6g.metal` 略高但 vCPU 少一半、内存多一倍，两者不是同规格对比；ARM 路线因 Graviton 不支持
+> 嵌套虚拟化（只能上 metal，且 metal 回收后重新启动要 10 分钟以上）**当前暂缓**。
+> r8i 的功能性真机 E2E 已于 2026-08-13 通过
+> （[报告](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)），
+> 但该轮未做满载压测，**承载密度与摊算成本仍是待重算项**。
+
 | 资源 | 月单价 | 月费（730h） |
 |---|---|---|
 | c6g.metal（64vCPU/128GiB）**spot**（本平台目标模式）| ~$486/月（us-east-1a 2026-07 查询，约按需 29%）| **~$486** |
@@ -100,8 +109,19 @@ Savings Plan、All Upfront**；“等效月价”是一次性预付总额除以 
 | `r8i.8xlarge` | 32 | 256 GiB | 无 | **$1,623** | **$1,002** | $12,021 |
 | `i7i.8xlarge` | 32 | 256 GiB | 2 × 3.75 TB | **$2,205** | **$1,335** | $16,024 |
 
-上述虚拟化实例均支持 `nested_virtualization=enabled`。当前 EBS-first 状态存储架构
-不依赖本地 NVMe，因此 `r8i.8xlarge` 是规格上最接近 `i7i.8xlarge` 的无本地盘选择。
+上述虚拟化实例均支持 `nested_virtualization=enabled`。
+
+> **x86 默认机型是 `r8i.8xlarge`（不是 `i7i.8xlarge`）。** 原因是 i7i 的本地 NVMe 属于
+> **instance store**：spot 回收或停机即销毁，存不了需要幸存的沙盒状态。而本平台的状态
+> （内存快照 base+diff 与 rootfs）本来就全部落在 `delete_on_termination=false` 的持久
+> EBS 上，**不依赖本地盘**，所以为本地 NVMe 付的溢价是纯浪费：同为 32 vCPU / 256 GiB，
+> `r8i.8xlarge` 比 `i7i.8xlarge` 按需月省 **$582**（$1,623 vs $2,205），1 年 SP 口径月省
+> **$333**（$1,002 vs $1,335）。
+>
+> **规格不要低于 8xlarge。** 更小规格的 EBS 吞吐受突发积分（burst credit）限制，只能短时
+> 冲到峰值、无法长时间持续，会直接拖长 spot 回收窗口内的疏散落盘时间。`r8i.8xlarge` 的
+> **EBS 吞吐为 1250 MB/s**（10 Gbps）；而 **gp3 单卷吞吐上限是 1000 MB/s**，所以单卷配置下
+> 瓶颈在卷不在实例，1000 MB/s 就是天花板 —— 要吃满 1250 MB/s 需要多卷条带或 io2。
 
 **Bare Metal：**
 
@@ -118,8 +138,11 @@ Savings Plan、All Upfront**；“等效月价”是一次性预付总额除以 
 | `i4i.metal` | x86_64 | 128 | 1,024 GiB | 8 × 3.75 TB | **$8,017** | **$4,855** | $58,263 |
 
 > 上表列出 AWS 上可运行 Firecracker 的候选机型，不等于当前 Terraform 的实例白名单。
-> 当前仓库已开放并真机验证的是 ARM64 `c6g.metal` 和 x86 `i7i.*`；使用
-> `c8i` / `m8i` / `r8i` 或其他 Bare Metal 机型前，需要扩展 Terraform 校验并完成对应架构的 E2E。
+> 当前 Terraform 白名单为 ARM64 `c6g.metal` 与 x86 `r8i.*` / `i7i.*`（x86 默认 `r8i.8xlarge`）。
+> `c6g.metal`、`i7i.*` 与 `r8i.8xlarge` 均已有真机 E2E 报告
+> （r8i 见 [2026-08-13 报告](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)）；
+> `r8i` 上仍待验证的是 spot 回收窗口内的真疏散耗时与跨机恢复表现。
+> 使用 `c8i` / `m8i` 或其他 Bare Metal 机型前，需要先扩展 Terraform 校验并完成对应架构的 E2E。
 
 **承载能力与摊算成本（单台 c6g.metal，128 GiB）：**
 
@@ -228,9 +251,16 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 
 > **自定义镜像 / rootfs 模板**：`image` 字段选不同根文件系统模板(命名 rootfs 方案,非实时拉 OCI)。
 > `build-rootfs-image.sh <name>` 预构建 `rootfs-{name}.tar.gz` → 节点造 `/opt/sbx/rootfs-{name}.ext4` →
-> create `image={name}` CoW 之。内置 **`web`** 预设(自带站点 + 开机自起 :80,端口暴露打开即见页面)。
+> create `image={name}` CoW 之。内置三个预设：**`web`**(自带站点 + 开机自起 :80,端口暴露打开即见页面)、
+> **`claude-code`** 与 **`openclaw`**(预打包运行环境,Node LTS + 对应 CLI 直接在 PATH)。
 > 非默认 image 自动跳过暖池走冷建;未构建的模板回退默认 min(不报错)。构建见
 > [docs/deploy.md](docs/deploy.md) Step 1.6,设计见 [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)。
+>
+> `claude-code` / `openclaw` 已于 2026-08-13 真机 E2E 通过(guest 内 `claude --version`=`2.1.231`、
+> `OpenClaw 2026.7.1-2`,OD/Spot 两侧 + suspend/resume 后均可用)。两条真机约束：
+> ① **必须在同架构机器上构建**(Apple Silicon 跨架构装 npm 包会 qemu 段错误)；
+> ② **不要与节点预热池同时开**(预热节点上命名模板会缺失并静默回退 min)。
+> 详见 [报告](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)。
 
 #### 5. 安全性
 - VM 级隔离：每沙盒独立 guest 内核，无共享宿主内核泄漏
@@ -306,15 +336,25 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
   “sandbox 不是 Pod”表示它不是独立的 Kubernetes 调度对象，并不表示它完全不受
   node-agent Pod 或宿主节点生命周期影响。升级或重启 node-agent 前仍需执行安全疏散。
 - sandbox 状态目前以同可用区持久 EBS 为权威来源。跨节点 detach/attach 已验证，但 Spot
-  中断后的自动疏散与恢复尚未完全闭环，不能把它描述成任意跨可用区自动重调度。
+  中断后的自动疏散与恢复尚未完全闭环，不能把它描述成任意跨可用区自动重调度。数据面已按
+  On-Demand / Spot 拆成两个节点组（`sandbox_spot_node_count` 默认 0，需显式开启），
+  两个池都钉在同一可用区（持久 EBS 不能跨 AZ attach），因此只做机型分散、不做 AZ 分散。
+- **双池目前只是节点组层面的准备，控制面还不会用 Spot 池**：`_pick_node` 只按剩余内存
+  降序挑节点，不看 `capacity-type` label（2026-08-13 真机实测 5 个沙盒全落 OD 节点）。
+  「被动用户实例进 Spot 池」这条放置策略尚未实现，现在开 Spot 池只会白付一台机器的钱。
+- **节点预热池**（`sandbox_warm_pool_size`，默认 0）实测把节点替换的 Ready 时间从
+  5 分 03 秒压到 **44 秒**；但它与命名 rootfs 模板（`rootfs_images`）当前**不能同时用**，
+  预热出来的节点上模板会缺失并静默回退 min。两项细节见
+  [2026-08-13 真机测试报告](docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)
+  与 [terraform/README.md](terraform/README.md)。
 
 ### 架构概览
 
 ```
 ┌─ EKS cluster ─────────────────────────────────────────────────────┐
 │                                                                      │
-│  system 节点组（On-Demand）      sandbox 数据节点组                 │
-│  Graviton m7g（默认 2 台）       c6g.metal 或 i7i.*                 │
+│  system 节点组（On-Demand）      sandbox 数据面双池（OD + Spot）     │
+│  Graviton m7g（默认 2 台）       r8i.*（默认）/ i7i.* / c6g.metal   │
 │  ┌──────────────────────────┐      ┌────────────────────────────┐  │
 │  │ sandbox-control-plane    │ HTTP │ node-agent Pod (DaemonSet) │  │
 │  │ (Deployment, 2 副本,IRSA)│─────►│  hostNetwork / privileged  │  │
@@ -379,15 +419,22 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 1. 认证安全：Step 6 必须传入 api_keys 和 litellm_master_key（用 openssl rand -hex 32 生成），
    不能留空——控制面无 key 时所有受保护接口返回 503。
 2. rootfs 必须含 vsock agent：Step 1.5 的 min-rootfs（exec 走 vsock 通道），phase3 apply 需显式传 rootfs_s3_uri。
-3. system 节点固定为 On-Demand Graviton；`node_arch` 只描述 sandbox 数据节点：
-   Graviton=`arm64` + `c6g.metal`，x86=`amd64` + `i7i.8xlarge`（可覆盖任意 `i7i.*`）。
+3. system 节点固定为 On-Demand Graviton；`node_arch` 只描述 sandbox 数据节点，默认
+   `amd64` + `r8i.8xlarge`（可覆盖任意 `r8i.*` / `i7i.*`，建议不低于 8xlarge）。
+   Graviton=`arm64` + `c6g.metal` 为备选路线。
 4. 控制面镜像构建为 `linux/arm64`；node-agent 和 rootfs 必须与数据节点一致。
-5. 测试完成后立即执行 docs/deploy.md 中的【清理】步骤。
+5. 预打包运行环境模板（`claude-code` / `openclaw`）必须在与数据节点同架构的机器上构建，
+   Apple Silicon 上跨架构装 npm 包会 qemu 段错误；`min` / `web` 不受影响。
+6. 默认只开 On-Demand 数据面池。**Spot 池（`sandbox_spot_node_count`）现在开了不会被调度到**
+   （控制面 `_pick_node` 不看 `capacity-type`）；**节点预热池（`sandbox_warm_pool_size`）
+   不要与 `rootfs_images` 同时开**（预热节点会丢命名模板并静默回退 min）。
+7. 测试完成后立即执行 docs/deploy.md 中的【清理】步骤。注意 destroy 不会删数据面持久状态卷
+   （`delete_on_termination=false`），需按 `eks:cluster-name=claude-sbx` tag 核对后手工删除。
 
 开始前先确认：
 - AWS CLI 已配置（需要 EKS / EC2 / IAM / DynamoDB / ECR / S3 权限）
 - 已安装 kubectl, terraform (≥1.5), helm, git
-- 对应实例的 EC2 vCPU 配额已申请（c6g.metal=64，i7i.8xlarge=32）
+- 对应实例的 EC2 vCPU 配额已申请（`r8i.8xlarge`=32，`i7i.8xlarge`=32，`c6g.metal`=64）
 
 确认就绪后，请读取并执行 docs/deploy.md 中的所有步骤。
 ```
@@ -398,7 +445,7 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 
 ```
 你是这套 AWS 沙盒平台的运维工程师。平台概况：
-- EKS 集群 claude-sbx：独立 On-Demand Graviton system 节点组 + c6g.metal/i7i sandbox 数据节点组
+- EKS 集群 claude-sbx：独立 On-Demand Graviton system 节点组 + r8i/i7i/c6g.metal sandbox 数据节点组
 - 控制面：sandbox-system namespace，Deployment 2 副本，固定在 system 节点
   外部访问：http://api.sbx.<domain>（ingress-nginx NLB）
 - 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx / nodes / locks）
@@ -415,7 +462,9 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 4. 查看 LiteLLM：kubectl logs -n litellm deployment/litellm --tail=50
 5. DynamoDB 直查：aws dynamodb scan --table-name claude-sbx-sandboxes --select COUNT
 6. 镜像更新：按 system/data 架构运行 `bash scripts/build_and_push.sh --control-plane-platform linux/arm64 --node-agent-platform <数据节点平台>`，然后滚动重启
-7. 节点扩容：调整 phase3 的 `sandbox_node_count` 并 terraform apply
+7. 节点扩容：调整 phase3 的 `sandbox_od_node_count`（OD 池）/ `sandbox_spot_node_count`（Spot 池）并 terraform apply
+   （注意：控制面 `_pick_node` 目前不看 `capacity-type`，扩 Spot 池不会自动被调度到）
+   加速节点替换：`sandbox_warm_pool_size=1`（实测 44s Ready），但不可与 `rootfs_images` 同用
 8. 成本优化：批量挂起空闲沙盒
    for id in $(curl -s http://api.sbx.<domain>/sandboxes?tenant_id=all | python3 -c "import sys,json; [print(s['id']) for s in json.load(sys.stdin)['sandboxes'] if s['state']=='running']"); do
      curl -s -X POST http://api.sbx.<domain>/sandboxes/$id/suspend

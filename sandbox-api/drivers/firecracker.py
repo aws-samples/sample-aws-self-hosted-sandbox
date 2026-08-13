@@ -235,6 +235,13 @@ class FirecrackerDriver:
     def _pick_node(self) -> str:
         # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
         # 拿不到注册表(如本地测试用 FC_NODES)时回退到逐个探 /health。
+        #
+        # ⚠️ 已知短板(2026-08-13 真机):打分只有 free_mem_mib 这一个维度 ——
+        #   1) 不看节点 capacity-type(od/spot)label → 数据面拆出 Spot 节点组后,
+        #      实测 5/5 个沙盒仍全落 OD 节点,Spot 池开了不会被用到;
+        #   2) 不看节点上命名 rootfs 模板是否齐备 → 预热池换出的节点(丢模板)照样被选中,
+        #      image=claude-code 会静默降级成 min。
+        # 待做:按 capacity-type 分流(常态跑 Spot、受保护租户跑 OD)+ 模板齐备度作为筛选条件。
         registry = self._active_nodes_from_registry()
         if registry:
             for node_id, _ in sorted(registry, key=lambda x: -x[1]):

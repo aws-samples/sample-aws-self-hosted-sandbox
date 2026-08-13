@@ -1,15 +1,16 @@
 #!/bin/bash
-# verify-x86-feasibility.sh —— 在一台开启 nested virtualization 的 Intel i7i 上验证
+# verify-x86-feasibility.sh —— 在一台开启 nested virtualization 的 Intel x86 实例
+# (默认目标 r8i.8xlarge;i7i.* 同样适用)上验证
 # "Sandbox 改 x86" 的全链路可行性。只读/临时验证,不改动任何持久基础设施。
 #
 # 背景:代码已把架构参数化(node_arch=amd64),但以下几项是"靠公开信息推断、需真机坐实"的:
-#   A. /dev/kvm 在 i7i 上可用(确认嵌套虚拟化已开启)
+#   A. /dev/kvm 在该实例上可用(确认嵌套虚拟化已开启)
 #   B. Firecracker x86_64 二进制能跑(--version)
 #   C. Firecracker CI 的 x86_64 vmlinux-5.10.223 能下载 + 能 boot 一个 microVM
 #   D. 自编带 FUSE 的 x86 内核(build-fuse-kernel.sh ARCH=x86_64)产物格式能被 Firecracker 接受
 #      —— 这是当初标注的最高风险点(KIMAGE 取 vmlinux 还是 bzImage)
 #
-# 用法(在 i7i 上,root):
+# 用法(在 x86 沙盒节点上,root):
 #   sudo bash verify-x86-feasibility.sh            # A~C(快,几分钟)
 #   sudo RUN_FUSE_KERNEL=1 bash verify-x86-feasibility.sh   # 含 D(编内核,十几分钟)
 #
@@ -23,7 +24,7 @@ info(){ echo "[..]  $*"; }
 
 ARCH="$(uname -m)"
 info "uname -m = $ARCH"
-[ "$ARCH" = "x86_64" ] || ng "本机不是 x86_64(应在已开启 nested virtualization 的 i7i 上跑);继续仅供参考"
+[ "$ARCH" = "x86_64" ] || ng "本机不是 x86_64(应在已开启 nested virtualization 的 x86 实例如 r8i.8xlarge 上跑);继续仅供参考"
 
 # 在 cd 之前解析脚本所在目录(D 步骤要找同目录的 build-fuse-kernel.sh)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +73,7 @@ JSON
 if [ -e /dev/kvm ]; then
   ok "A. /dev/kvm 存在(nested virtualization 已生效,支持 Firecracker)"
 else
-  ng "A. /dev/kvm 不存在 —— i7i 未开启 nested virtualization,Firecracker 无法运行。后续多半失败"
+  ng "A. /dev/kvm 不存在 —— 本实例未开启 nested virtualization,Firecracker 无法运行。后续多半失败"
 fi
 
 # ---------- B. Firecracker x86_64 二进制 ----------

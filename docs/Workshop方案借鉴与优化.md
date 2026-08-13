@@ -2,6 +2,13 @@
 
 > 📌 **历史存档**:本文借鉴点部分基于当时的 Kata + `k8s/sandbox.yaml` 实现,而 **Kata driver 已从项目移除**
 > (当前为裸 Firecracker 单一后端)。借鉴思路(凭据隔离/节点自动化/生命周期等)仍有参考价值,但涉及 Kata/`k8s/sandbox.yaml` 的具体代码已不存在。仅作历史参考。
+>
+> ✅ **已落地的相关进展**(2026-08-13):本文对标的 **OpenClaw** 现在是 repo 内置的
+> rootfs 预打包运行环境预设之一(`openclaw` 与 `claude-code`,`image` 字段直接可选),
+> guest 内 `openclaw --version` 真机通过;§3 借鉴的 WarmPool 思路也已有两层实现
+> (microVM 暖池 + EC2 节点预热池)。见
+> [OD/Spot 双池 + 预热池 + 预打包运行环境 真机测试报告](OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)
+> 与 [自定义 rootfs 设计](自定义rootfs设计.md)。
 
 > 来源:AWS Workshop《FlexAI Workshop: 基于 EKS & Graviton 部署 OpenClaw & Hermes 智能助理》
 > (`afba7f08-c987-40dc-afa5-da3e200ae7c5`)

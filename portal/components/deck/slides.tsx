@@ -811,7 +811,7 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
           <div className="deck-card accent">
             <span className="dc-icon">🖥️</span>
             <h3>EKS + Firecracker EC2</h3>
-            <p>Graviton 使用 c6g.metal；x86 使用支持嵌套虚拟化的 i7i 全系列，默认 i7i.8xlarge。EKS 管平台，microVM 不进 K8s。</p>
+            <p>x86 走支持嵌套虚拟化的 r8i / i7i 全系列，默认 r8i.8xlarge（无本地盘，状态落持久 EBS）；Graviton 需裸金属 c6g.metal。EKS 管平台，microVM 不进 K8s。</p>
           </div>
           <div className="deck-card accent">
             <span className="dc-icon">🎛️</span>
@@ -836,7 +836,7 @@ export const SLIDES: { id: string; render: () => React.ReactNode }[] = [
           <div className="deck-card accent">
             <span className="dc-icon">💸</span>
             <h3>Spot 利用</h3>
-            <p>c6g.metal Spot 约按需 29%。Karpenter 管节点池,IMDS 监听回收,Diff 快照 + EBS 卷幸存保住内存状态。</p>
+            <p>c6g.metal Spot 约按需 29%。数据面已拆成 OD + Spot 两个节点组,IMDS 监听回收,Diff 快照 + EBS 卷幸存保住内存状态。<small>调度分流尚未实现:2026-08-13 实测沙盒全落 OD 池。</small></p>
           </div>
         </div>
         <div className="slide-foot">
@@ -1018,7 +1018,7 @@ GET  /sandboxes/{id}/files?path=/root/out.txt`}
           </div>
         </div>
         <div className="cover-chips">
-          <span className="chip chip-strong">真机已验证:reconcile · leader · 快照 · 暖池 · Spot 疏散</span>
+          <span className="chip chip-strong">真机已验证:reconcile · leader · 快照 · 暖池 · Spot 疏散(DRY-RUN) · 预打包运行环境(Claude Code / OpenClaw)</span>
         </div>
         <div className="slide-foot" style={{ maxWidth: 720, margin: "26px auto 0" }}>
           建议路线:标准 / 快速验证场景用 AgentCore 起步;长驻、高密度、深度自控与数据主权场景,用本方案自建 —— 两者可并存互补。

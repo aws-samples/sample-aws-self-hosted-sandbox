@@ -10,7 +10,7 @@
 本仓库是一个自托管的 Fly.io 式 **Firecracker microVM 沙盒平台**(AWS + EKS + DynamoDB):
 
 - **控制面** `sandbox-api/app.py`:纯 Python 标准库 `http.server`,端口 8000,Bearer Token 认证,DynamoDB 为唯一真源；运行在 On-Demand Graviton system 节点。
-- **node-agent**:专用 `sandbox=true` c6g.metal/i7i 数据节点上的执行手(端口 8002,内网),直接管 Firecracker microVM、快照、网络。
+- **node-agent**:专用 `sandbox=true` 数据节点(x86 r8i/i7i 或 c6g.metal)上的执行手(端口 8002,内网),直接管 Firecracker microVM、快照、网络。
 - **snapshot-agent**:快照(Full base + Diff 增量内存)相关。
 
 平台此前**完全没有 UI**,所有操作靠 curl。本 Portal 是**第一个 UI**,目标有二:
@@ -45,7 +45,7 @@
 | Method | 路径 | 用途 |
 |---|---|---|
 | GET | `/` · `/capabilities` | 服务信息 / 能力(免鉴权) |
-| POST | `/sandboxes` | 创建(body: image/cpu/mem_mib/env/services/tenant_id/idempotency_key) |
+| POST | `/sandboxes` | 创建(body: image/cpu/mem_mib/env/services/tenant_id/idempotency_key);`image` 取值由 `GET /admin/images` 给出(`SANDBOX_IMAGES` env,预设 `min`/`web`/`claude-code`/`openclaw`) |
 | GET | `/sandboxes?tenant_id=x` | 列出**单租户**沙盒(默认 limit=100) |
 | GET | `/sandboxes/{id}` · `/{id}/wait` · `/{id}/locate` | 查询 / 长轮询 / 调试定位 |
 | DELETE | `/sandboxes/{id}` | 销毁 |
@@ -73,11 +73,12 @@ Portal BFF 直连 DynamoDB),核心服务改动最小、UI 侧零 AWS 凭证。
 | `GET /admin/nodes` | `list_active_nodes()` | `{nodes: [...]}` 活节点(free_mem_mib/vm_count/last_seen/labels) |
 | `GET /admin/stats` | 上述 + `count_warm()` | 汇总:`total_sandboxes / by_state / node_count / cluster_free_mem_mib / running_vm_count / warm_pool` |
 | `GET /admin/events?id=&limit=` | **新增** `list_events()` | `{events: [...]}` 时间线;`id` 为空则全局 |
+| `GET /admin/images` | `SANDBOX_IMAGES` env | `{images: [...]}` 可选镜像名,供创建表单下拉(预设 `min`/`web`/`claude-code`/`openclaw`)。**展示用清单而非白名单**:节点上没有对应 rootfs 模板时 node-agent 静默回退 min |
 
 - 权限:`_require_admin()`(仅 `default` 租户 key,开发模式放行)。
 - `list_events`:给 `id` → 走主键 query;否则全表有界 scan 后按 `ts` 倒序取 `limit`(POC 规模可接受)。
 - 测试:`sandbox-api/smoke_test.py` 包含 `TestAdminAggregates`(跨租户可见性 / stats 计数 / 事件 / 非 admin→403)
-  与 `TestDB.test_list_events_single_and_global`；当前完整测试套件为 `50/50 PASS`。
+  与 `TestDB.test_list_events_single_and_global`；当前完整测试套件为 `53/53 PASS`。
 
 ---
 
@@ -149,7 +150,7 @@ Token 只在本机 BFF 进程,不出本机。若控制面未起,页面展示友�
 
 ## 7. 验证(end-to-end)
 
-1. **聚合 endpoint 单测**:`python3 sandbox-api/smoke_test.py`(moto mock DynamoDB)—— 覆盖 `/admin/*`；当前完整套件 `50/50 PASS`。
+1. **聚合 endpoint 单测**:`python3 sandbox-api/smoke_test.py`(moto mock DynamoDB)—— 覆盖 `/admin/*`；当前完整套件 `53/53 PASS`。
 2. **Portal 构建**:`cd portal && npm run build` —— 类型检查 + 编译通过。✅ 9 路由。
 3. **本地联调**:port-forward 通到真实控制面 → `npm run dev` → 走一遍
    create → 详情页看指标 → suspend(看 snapshot 大小/耗时)→ resume(看 restore_time_s)→ exec → destroy,

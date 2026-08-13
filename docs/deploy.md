@@ -13,12 +13,22 @@ node-agent，不依赖 K8s 编排沙盒本身。
 
 部署者必须选择节点架构：
 
-| 选择 | `node_arch` | 默认实例 | KVM 来源 |
-|---|---|---|---|
-| Graviton | `arm64` | `c6g.metal` | 裸金属 |
-| Intel x86 | `amd64` | `i7i.8xlarge` | Nitro nested virtualization |
+| 选择 | `node_arch` | 默认实例 | KVM 来源 | 状态 |
+|---|---|---|---|---|
+| **Intel x86** | `amd64`（默认） | `r8i.8xlarge` | Nitro nested virtualization | 推荐主线 |
+| Graviton | `arm64` | `c6g.metal` | 裸金属 | 备选，暂缓 |
 
-x86 支持所有 `i7i.*` 规格，可用 `sandbox_instance_type` 覆盖；默认选 `i7i.8xlarge`。
+x86 支持 `r8i.*` 与 `i7i.*` 规格，可用 `sandbox_instance_type` 覆盖，默认 `r8i.8xlarge`：
+
+- **`r8i.*`（默认，推荐）**：无本地 NVMe。平台状态（内存快照 base+diff、rootfs）本来就全落
+  `delete_on_termination=false` 的持久 EBS，不依赖本地盘，因此不必为 NVMe 付溢价。
+- **`i7i.*`（保留）**：带本地 NVMe，但它是 **instance store** —— spot 回收/停机即销毁，
+  存不了需要幸存的状态。保留该系列仅为复现既有 i7i 真机报告。
+- **规格不要低于 8xlarge**：更小规格 EBS 吞吐受突发积分限制，只能短时冲峰、无法持续，
+  会拖长 spot 回收窗口内的疏散落盘。`r8i.8xlarge` 的 EBS 吞吐为 1250 MB/s（10 Gbps），
+  而 gp3 单卷吞吐上限 1000 MB/s —— 单卷配置下瓶颈在卷，1000 MB/s 即天花板。
+- **Graviton 暂缓**：Graviton 不支持嵌套虚拟化，只能上裸金属，而 metal 被回收后重新启动
+  要 10 分钟以上，不适合 spot。`arm64` 路径仍可用且已有真机报告，但不作为推荐路线。
 
 无论选择哪种数据节点，Terraform 都会另外创建至少 2 台 On-Demand Graviton
 system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点带
@@ -34,8 +44,9 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 
 - AWS CLI 已配置（需要权限：EKS / EC2 / IAM / DynamoDB / ECR / S3；启用托管可观测性时还需要 APS/AMP、Amazon Managed Grafana、CloudWatch Logs、X-Ray 和 VPC Endpoint 权限）
 - 已安装：kubectl, terraform (≥1.5), helm, git, docker
-- EC2 vCPU 服务配额：Graviton `c6g.metal` 需要 64 vCPU；x86 默认 `i7i.8xlarge` 需要 32 vCPU
-- x86 部署区域必须提供 i7i 且支持 nested virtualization；部署前按 Step 0.5 查询
+- EC2 vCPU 服务配额：x86 默认 `r8i.8xlarge` 需要 32 vCPU；Graviton `c6g.metal` 需要 64 vCPU。
+  用 Spot 池时注意 OD 与 Spot 是**两套独立配额**，都要够
+- x86 部署区域必须提供所选机型（`r8i.*` / `i7i.*`）且支持 nested virtualization；部署前按 Step 0.5 查询
 - 生产部署必须设置 `API_KEYS`（见 Step 6 注意事项）
 
 ---
@@ -47,13 +58,16 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 3. **`fc_nodes` 是 fallback，节点发现优先走 DynamoDB 心跳表**：P0 加固后 node-agent 每 30s 写 `claude-sbx-nodes` 表，控制面 `_pick_node` 优先从心跳表选活节点（按 `last_seen` 超时剔除死节点），`fc_nodes` 仅在心跳表为空时兜底。**首次部署 fc_nodes 仍建议只填稳定节点**（心跳还没写起来时靠它），但节点增减后无需再改 `fc_nodes` + 重启控制面——心跳表会自动反映。查活节点：`aws dynamodb scan --table-name claude-sbx-nodes --query 'Items[].{node:node_id.S,last_seen:last_seen.S}'`。
 4. **rootfs 必须是含 vsock agent 的 min-rootfs**：exec 走 vsock 通道，需要 `scripts/build-min-rootfs.sh` 产出的 rootfs（内含 `/sbin/vsock-exec-agent.py`，sbxinit 后台启动）。**别用 phase3 `rootfs_s3_uri` 的默认 juicefs 版**——apply phase3 时必须显式传 `-var="rootfs_s3_uri=s3://<bucket>/rootfs/min-rootfs.tar.gz"`（见 Step 1.5 + Step 2）。
 5. **节点反复 NotReady / ASG 替换循环**：`c6g.metal` 过 EC2 status check 需 5-10 分钟，而 EKS 托管节点组 ASG 默认 grace period 过短。`terraform/phase3/main.tf` 已用 `null_resource.sandbox_asg_grace_period` 固化为 900s。若仍反复替换，检查 ASG activity、EC2 status check 和 grace period。
-6. **异构镜像必须分别构建**：控制面固定用 `linux/arm64`；node-agent 与 rootfs 跟随 sandbox 数据节点，Graviton 用 `linux/arm64`，i7i 用 `linux/amd64`。不要用一个共享 `--platform` 把控制面也构建成 amd64。
-7. **system 节点必须保持 On-Demand**：未来可为 sandbox 数据面增加 Spot 池，但控制面、LiteLLM、Ingress 与 CoreDNS 不应跟随 Spot 中断。
+6. **异构镜像必须分别构建**：控制面固定用 `linux/arm64`（它跑在 Graviton system 节点上）；node-agent 与 rootfs 跟随 sandbox 数据节点，Graviton 数据节点用 `linux/arm64`，x86 数据节点（`r8i` / `i7i`）用 `linux/amd64`。不要用一个共享 `--platform` 把控制面也构建成 amd64。
+7. **system 节点必须保持 On-Demand**：数据面已拆成 OD 池（`sandbox_od_node_count`）+ Spot 池（`sandbox_spot_node_count`，默认 0 不创建），但 `system_arm64` 组固定 On-Demand —— 控制面、LiteLLM、Ingress 与 CoreDNS 不应跟随 Spot 中断。开 Spot 池前先把 stage2 的 `reclaim_auto_evacuate` 置 true（默认 DRY-RUN 只记录疏散计划），否则 Spot 被回收时沙盒直接丢；且**跨机拉起仍需运维手动把幸存状态卷 attach 到新节点**，尚未自动化。
+   🔴 **另外：Spot 池现在开了也不会被用到** —— 控制面 `_pick_node` 只按 `free_mem_mib` 降序挑节点，不看 `capacity-type` label（2026-08-13 真机实测 5 个沙盒全落 OD 节点）。分流策略实现前，开 Spot 池等于白付一台机器的钱。
 8. **LiteLLM 必须传 master key**：`litellm_master_key` 无默认值，terraform apply 时必须传入（如 `openssl rand -hex 32`）。
 9. **SSM 排障用 `AWS-RunShellScript`**：本账号 `AWS-RunShellCommand`（旧名）不可用，`aws ssm send-command` 要用 document 名 `AWS-RunShellScript`。
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
 11. **Helm/Kubernetes 认证依赖 AWS CLI**：stage2 provider 使用 `aws eks get-token` 动态刷新凭据，避免 15 分钟 EKS token 在长时间 Helm upgrade 中过期。执行 Terraform 的环境必须能从 `PATH` 调用 `aws`，且当前身份可访问目标集群。
 12. **可观测性分三层**：`enable_observability_stack=true` 安装集群内监控；`enable_amp_remote_write=true` 创建 AMP；`enable_p2_observability=true` 增加 CloudWatch Logs、ADOT/X-Ray 和 AMG datasource/Dashboard 自动配置。AMG workspace 仍需预先存在。
+13. **节点预热池与命名 rootfs 模板互斥**（2026-08-13 真机）：`sandbox_warm_pool_size` 能把节点替换的 Ready 时间从 5m03s 压到 **44s**，但 ASG 不等 cloud-init 跑完就把预热实例停机 → 预热出来的节点上 `rootfs-{name}.ext4` 全部缺失，而 node-agent 对缺失模板**静默回退 min**（`image=claude-code` 返回 `running` 但 guest 里没有 CLI）。两者现阶段二选一，详见 `terraform/README.md` 预热池一节。
+14. **预打包运行环境模板必须原生同架构构建**（2026-08-13 真机）：Apple Silicon 上 `--platform linux/amd64` 构建 `claude-code` / `openclaw` 会在 `npm install -g` 中途 qemu 段错误（exit 139）。`min` / `web` 不装 npm 包可以跨架构。见 Step 1.6。
 
 ---
 
@@ -71,16 +85,17 @@ export AWS_REGION=us-east-1
 
 ```bash
 # 二选一。本文后续命令复用这两个变量。
-export NODE_ARCH=arm64
-export SANDBOX_INSTANCE_TYPE=c6g.metal
-export SANDBOX_AZ_INDEX=0
+# Intel x86（推荐路线，默认 r8i.8xlarge；也支持其他 r8i.* 与 i7i.* 规格，建议不低于 8xlarge）
+export NODE_ARCH=amd64
+export SANDBOX_INSTANCE_TYPE=r8i.8xlarge
+export SANDBOX_AZ_INDEX=0        # 0/1/2 = us-east-1a/1b/1c
 export SYSTEM_INSTANCE_TYPE=m7g.large
 export SYSTEM_NODE_COUNT=2
 
-# Intel x86（默认 i7i.8xlarge；其他 i7i 规格也支持）
-# export NODE_ARCH=amd64
-# export SANDBOX_INSTANCE_TYPE=i7i.8xlarge
-# export SANDBOX_AZ_INDEX=0   # 0/1/2 = us-east-1a/1b/1c
+# Graviton（暂缓：不支持嵌套虚拟化，只能上裸金属，回收后重启动 10min+）
+# export NODE_ARCH=arm64
+# export SANDBOX_INSTANCE_TYPE=c6g.metal
+# export SANDBOX_AZ_INDEX=0
 
 if [ "$NODE_ARCH" = "amd64" ]; then
   aws ec2 describe-instance-types --region "$AWS_REGION" \
@@ -134,7 +149,7 @@ tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
 ```
 
 > Mac 上 docker 未起：Graviton 可用 `colima start --cpu 4 --memory 8 --arch aarch64`；
-> i7i 构建用 Docker 的 `linux/amd64` 平台。
+> x86（`r8i` / `i7i`）构建用 Docker 的 `linux/amd64` 平台。
 
 ---
 
@@ -142,18 +157,65 @@ tar tzf /tmp/r.tgz | grep -E 'sbin/(vsock-exec-agent.py|sbxinit)$'
 
 让 `image` 字段生效——沙盒按 image 选不同 rootfs 模板。`build-rootfs-image.sh <name> <bucket>`
 产出 `rootfs-{name}.tar.gz`,节点会造成 `/opt/sbx/rootfs-{name}.ext4`,create `image={name}` 时 CoW 它。
-内置 **`web`** 预设:自带 demo 首页 + 开机自起 :80 → 端口暴露打开即见站点。
+内置三个预设:
+
+| `name` | 内容 | 用途 |
+|---|---|---|
+| `web` | demo 首页 + 开机自起 :80 | 端口暴露打开即见站点 |
+| `claude-code` | Node.js LTS + `@anthropic-ai/claude-code` | 预打包运行环境,`claude` 直接在 PATH |
+| `openclaw` | Node.js LTS + `openclaw` | 预打包运行环境,`openclaw` 直接在 PATH |
 
 ```bash
 # 构建 web 模板(与 min 同基底,叠加 demo 站点 + 开机自起 :80)
 ROOTFS_PREFIX="rootfs/${NODE_ARCH}" PLATFORM="${PLATFORM}" \
   bash scripts/build-rootfs-image.sh web "${BUCKET}"
 # → 上传到 s3://<bucket>/rootfs/rootfs-web.tar.gz
+
+# 预打包运行环境:Node.js + CLI 都在 docker 层里装
+# ⚠️ 必须在与 NODE_ARCH 同架构的机器上构建,见下方说明
+ROOTFS_PREFIX="rootfs/${NODE_ARCH}" PLATFORM="${PLATFORM}" \
+  bash scripts/build-rootfs-image.sh claude-code "${BUCKET}"
+ROOTFS_PREFIX="rootfs/${NODE_ARCH}" PLATFORM="${PLATFORM}" \
+  bash scripts/build-rootfs-image.sh openclaw "${BUCKET}"
+# 版本可覆盖:NODE_VERSION=22.23.2 CLAUDE_CODE_VERSION=2.1.231 OPENCLAW_VERSION=2026.7.1-2
 ```
 
-> 节点在 Step 2 apply 时按 `rootfs_images`(默认含 `web`)拉取这些模板造 ext4。
+> 🔴 **`claude-code` / `openclaw` 必须原生同架构构建,不能靠 `--platform` 跨架构**。
+> 2026-08-13 实测:Apple Silicon(colima aarch64)上构建 amd64 的 `claude-code`,
+> `npm install -g @anthropic-ai/claude-code` 中途 qemu 段错误
+> (`panic(main thread): Segmentation fault at address 0x9`,exit 139),
+> 同一层里 `node --version`/`npm --version` 却正常。`min`/`web` 不装 npm 包所以能跨架构。
+> 变通:开一台同架构一次性 EC2(如 amd64 用 `c7i.2xlarge` + AL2023 + docker),
+> 把整个 `scripts/` 目录和 `.sbxkeys/sbx_exec.pub` 打包传上去构建
+> (只传 `build-rootfs-image.sh` 会因缺 `scripts/vsock-exec-agent.py` 失败),
+> 结果写回 S3 后自毁。原生构建下这一层只要 5~17 秒。
+> 具体做法见 `docs/OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md` §9。
+
+> 节点在 Step 2 apply 时按 `rootfs_images`(默认只含 `web`)拉取这些模板造 ext4。
 > **本步须在 Step 2 之前完成**(节点 userData 启动时拉);漏了则 create `image=web` 会回退默认 min(不报错)。
-> 未列出的 image → 同样回退 min。控制面 `SANDBOX_IMAGES`(默认 `min,web`)决定 Portal 下拉列表。
+> 未列出的 image → 同样回退 min。控制面 `SANDBOX_IMAGES`(stage2 变量 `sandbox_images`,默认 `min,web`)
+> 决定 Portal 下拉列表 —— 用了预打包运行环境要同时传
+> `-var="rootfs_images=web,claude-code,openclaw"`(phase3)和
+> `-var="sandbox_images=min,web,claude-code,openclaw"`(stage2)。
+>
+> ⚠️ 每多一个模板,节点 pre-bootstrap 就多一次「下载 + dd + mkfs + 解包」,会拉长节点 Ready 时间
+> (这一段过长会打断 kubelet 心跳 → ASG 替换循环)。预打包运行环境的 tarball 比 min 大不少
+> (Node 运行时 + npm 包),只装用得上的。模板大小由 phase3 的 `rootfs_template_size_mib`
+> 控制(默认 2048 MiB);装更多东西要同步调大。
+>
+> ⚠️ 沙盒内没有 LiteLLM 凭据也没有集群 DNS:guest 只有 tap 网段 + 8.8.8.8,解析不了
+> `litellm.litellm`。`claude` 要走网关必须由调用方注入 guest 可达的 `ANTHROPIC_BASE_URL`
+> (镜像里 `/etc/sbx-env` 留了注释说明,sbxinit 会 source 它并导出给 exec 会话)。
+>
+> ✅ 2026-08-13 真机验证通过(`r8i.8xlarge`,OD 与 Spot 节点各测):guest 内
+> `claude --version` = `2.1.231 (Claude Code)`、`openclaw --version` = `OpenClaw 2026.7.1-2`,
+> suspend/resume 后仍可用;Diff 快照不因 rootfs 变大(229 MiB)而变大。
+> tarball 参考大小:`claude-code` 229 MiB / `openclaw` 194 MiB / `min`·`web` 各 53 MiB;
+> 节点侧每个命名模板约多花 20~27 秒 pre-bootstrap。
+>
+> 🔴 **不要和节点预热池(`sandbox_warm_pool_size`)一起用**:ASG 不等 cloud-init 跑完就停机,
+> 预热出来的节点上命名模板会全部缺失,而 node-agent 对缺失模板**静默回退 min**
+> → 沙盒能起但里面没有 CLI。详见 `terraform/README.md` 预热池一节。
 
 ---
 
@@ -176,7 +238,11 @@ terraform init && terraform apply -auto-approve \
   -var="endpoint_public_access_cidrs=[\"${MY_IP}/32\"]"
 # rootfs_images(默认 web):节点额外拉 rootfs-{name}.tar.gz 造 /opt/sbx/rootfs-{name}.ext4 模板;
 #   须在 Step 1.6 先构建上传对应模板。不需要自定义镜像可传 -var="rootfs_images="。
-# 默认 1 台沙盒节点；跨机快照演示加 -var="sandbox_node_count=2"
+#   预打包运行环境:-var="rootfs_images=web,claude-code,openclaw"(见 Step 1.6)
+# 数据面台数(默认 OD 1 台 / Spot 0 台);跨机快照演示加 -var="sandbox_od_node_count=2"
+#   Spot 池:-var="sandbox_spot_node_count=2" [-var='sandbox_spot_instance_types=["r8i.8xlarge","r8i.12xlarge"]']
+# 节点预热池(缩短替换节点的 Ready 时间,单 AZ 亲和):-var="sandbox_warm_pool_size=1"
+#   默认挂 OD 组;-var="sandbox_warm_pool_target=spot|both" 可改。详见 terraform/README.md
 aws eks update-kubeconfig --name claude-sbx --region us-east-1
 kubectl wait node --all --for=condition=Ready --timeout=900s
 ```
@@ -245,6 +311,7 @@ terraform apply -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="sandbox_images=min,web" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
   -var="snapshot_s3_bucket=${S3_BUCKET}" \
@@ -264,6 +331,11 @@ terraform apply -auto-approve \
 > 否则会把 system 节点误当 Firecracker 宿主。控制面 `_pick_node` 串行探每个节点
 > `/health`，遇不可达节点会阻塞。改完可热更新：
 > `kubectl set env deployment/sandbox-control-plane -n sandbox-system FC_NODES=<稳定数据节点IP>`。
+>
+> ⚠️ 热更新**只在心跳表为空时才影响调度落点**（`_pick_node` 优先用 DynamoDB 注册表）。
+> 2026-08-13 实测：心跳正常时把 `FC_NODES` 改成单个节点 IP，新沙盒仍按
+> `free_mem_mib` 降序落到注册表里的另一台节点。要强制落某台节点得改注册表或代码，
+> 不能靠 `FC_NODES`。
 >
 > **常见问题：** Terraform `Unexpected Identity Change` 错误 → 清理 state 重试：
 > ```bash
@@ -471,6 +543,7 @@ terraform apply -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="sandbox_images=min,web" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
   -var="snapshot_s3_bucket=${S3_BUCKET}" \
@@ -554,10 +627,14 @@ echo "NLB: $NLB_HOST"
 
 ## Step 9: 验证部署（Firecracker）
 
-> 已验证配置：On-Demand system=`2 × m7g.large`，sandbox=`i7i.8xlarge`、
+> 已真机验证过的配置：On-Demand system=`2 × m7g.large`，sandbox=`i7i.8xlarge`、
 > `node_arch=amd64`、`sandbox_az_index=2`。`us-east-1a/1b` 容量不足后，
 > `us-east-1c` 创建成功。完整调度、宿主、guest、生命周期、Bedrock 和故障转移证据见
 > [控制面与数据面分离 i7i 真机测试报告](控制面数据面分离-i7i真机测试报告-2026-08-11.md)。
+>
+> ⚠️ 当前默认已改为 `r8i.8xlarge`（无本地 NVMe，状态全落持久 EBS）。它与 i7i 只差
+> 实例族和本地盘，Terraform 路径完全相同，但**尚未跑过真机 E2E**：EBS 落盘吞吐、
+> spot 回收窗口内的疏散、跨机恢复三项需在 r8i 上重新坐实。
 
 ```bash
 kubectl rollout status deployment/sandbox-control-plane -n sandbox-system --timeout=300s
@@ -759,6 +836,7 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="node_arch=${NODE_ARCH}" \
   -var="fc_nodes=placeholder" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
+  -var="sandbox_images=min,web" \
   -var="control_plane_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
   -var="node_agent_image=${ACCT}.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
   -var="snapshot_s3_bucket=${S3_BUCKET}" \
@@ -821,6 +899,10 @@ cd ../phase3 && terraform destroy -auto-approve \
 
 # 5. 显式删除 delete_on_termination=false 遗留的 sandbox 状态 EBS。
 #    只删已 available、且带本集群和 sandbox 节点组标签的卷。
+#    ⚠️ 共享账号里绝不要按 size 之类的宽泛条件删 —— 2026-08-13 清理时旁边就有两块
+#       2022 年的 8G Zabbix 卷。下面这组 tag 过滤已真机验证只命中本集群的卷。
+#    ⚠️ 卷数 = 数据节点数 + 预热池台数 + 历史被替换过的节点数（每次节点替换都会残留一块）。
+#       2026-08-13 那次是 4 块 400G（2 台数据节点 + 1 台预热 + 1 块替换残留）。
 for vol in $(aws ec2 describe-volumes --region "$AWS_REGION" \
     --filters "Name=status,Values=available" \
       "Name=tag:eks:cluster-name,Values=claude-sbx" \

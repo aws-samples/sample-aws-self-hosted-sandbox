@@ -37,8 +37,8 @@ variable "az" {
 
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI、默认实例和嵌套虚拟化配置。"
+  default     = "amd64"
+  description = "节点 CPU 架构:amd64(Intel x86,默认/推荐) 或 arm64(Graviton,备选)。决定 AMI、默认实例和嵌套虚拟化配置。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
@@ -48,21 +48,26 @@ variable "node_arch" {
 variable "sandbox_instance_type" {
   type        = string
   default     = ""
-  description = "Firecracker 主机实例类型。留空时 arm64=c6g.metal,amd64=i7i.8xlarge；x86 可覆盖为任意 i7i 规格。"
+  description = <<-EOT
+    Firecracker 主机实例类型。留空时 amd64(默认)=r8i.8xlarge,arm64=c6g.metal。
+    x86 可覆盖为任意 r8i.*(推荐,无本地 NVMe,状态落持久 EBS)或 i7i.*(带本地 NVMe,
+    spot 回收即销毁,保留仅为复现既有 i7i 报告)规格。规格建议不低于 8xlarge —— 更小规格
+    的 EBS 吞吐受突发积分限制,无法持续跑满。
+  EOT
   validation {
     condition = (
       var.sandbox_instance_type == "" ||
       (var.node_arch == "arm64" && var.sandbox_instance_type == "c6g.metal") ||
-      (var.node_arch == "amd64" && can(regex("^i7i\\.", var.sandbox_instance_type)))
+      (var.node_arch == "amd64" && can(regex("^(r8i|i7i)\\.", var.sandbox_instance_type)))
     )
-    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 i7i 系列（例如 i7i.8xlarge）。"
+    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 r8i 系列(推荐,例如 r8i.8xlarge)或 i7i 系列。"
   }
 }
 
 locals {
   default_instance_by_arch = {
     arm64 = "c6g.metal"
-    amd64 = "i7i.8xlarge"
+    amd64 = "r8i.8xlarge"
   }
   ssm_arch_suffix = {
     arm64 = "arm64"

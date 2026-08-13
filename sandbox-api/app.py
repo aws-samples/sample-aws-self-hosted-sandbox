@@ -352,10 +352,12 @@ def admin_images() -> tuple[int, dict]:
     """可用镜像/rootfs 模板列表(供 Portal 创建表单下拉)。"""
     from sandbox_api.drivers.firecracker import available_images
     imgs = available_images()
-    # 附带简短说明,web 预设自带站点
+    # 附带简短说明,web 预设自带站点;claude-code/openclaw 是预打包运行环境
     desc = {
         "min": "基础镜像(python + sshd + exec agent),无预置服务",
         "web": "自带 demo 站点,开机自起 :80 —— 端口暴露打开即见页面",
+        "claude-code": "预打包运行环境:Node.js LTS + Claude Code CLI(claude 已在 PATH)",
+        "openclaw": "预打包运行环境:Node.js LTS + OpenClaw CLI(openclaw 已在 PATH)",
     }
     return 200, {"images": [{"name": n, "desc": desc.get(n, "")} for n in imgs]}
 

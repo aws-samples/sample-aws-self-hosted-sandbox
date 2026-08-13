@@ -1,7 +1,10 @@
 # 自定义镜像 / 多 rootfs 模板设计
 
 > 让 `image` 字段真正生效 —— 沙盒按 `image` 选不同根文件系统模板(如自带 web 的镜像),
-> 而非所有沙盒都 CoW 同一个 min-rootfs。**已实现并真机验证(2026-07)。**
+> 而非所有沙盒都 CoW 同一个 min-rootfs。**已实现并真机验证**:
+> `web` 于 2026-07(c6g.metal)验证,`claude-code` / `openclaw` 预打包运行环境于
+> 2026-08-13(r8i.8xlarge)验证 —— 见
+> [OD/Spot 双池 + 预热池 + 预打包运行环境 真机测试报告](OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md)。
 
 ---
 
@@ -34,8 +37,12 @@ create(image="web")
 ## 4. 实现要点(已落地)
 
 - **`scripts/build-rootfs-image.sh <name> <bucket>`**:泛化自 build-min-rootfs.sh,复用 sbxinit +
-  vsock-exec-agent(保证 exec/端口暴露仍工作),按 name 叠加应用层。内置 `web` 预设:demo 首页 +
-  sbxinit 开机自起 :80(用 python 绝对路径 `/usr/local/bin/python3`,因 sbxinit 由 /bin/sh 执行 PATH 不全)。
+  vsock-exec-agent(保证 exec/端口暴露仍工作),按 name 叠加应用层。内置三个预设:
+  - `web`:demo 首页 + sbxinit 开机自起 :80(用 python 绝对路径 `/usr/local/bin/python3`,
+    因 sbxinit 由 /bin/sh 执行 PATH 不全)。
+  - `claude-code`:Node LTS + `@anthropic-ai/claude-code`,`claude` 在 PATH(229 MiB tarball)。
+  - `openclaw`:Node LTS + `openclaw`,`openclaw` 在 PATH(194 MiB tarball)。
+  版本可用 `NODE_VERSION` / `CLAUDE_CODE_VERSION` / `OPENCLAW_VERSION` 覆盖。
 - **node-agent**:`_rootfs_template_path(name)` —— 空/min/default→默认 ROOTFS;否则找
   `/opt/sbx/rootfs-{name}.ext4`,不存在回退默认。`op_create` / `op_resume` 兜底均用它。
 - **控制面**:`normalize_image(image)`(取末段去 tag)+ create/resume body 带 `rootfs_template`;
@@ -45,23 +52,55 @@ create(image="web")
   `rootfs-{name}.tar.gz` 造 `/opt/sbx/rootfs-{name}.ext4`。
 - **Portal**:创建表单 image 改下拉(拉 `/admin/images`),web 预设标注"自带 demo 站点"。
 
-## 5. 真机验证(2026-07,EKS + c6g.metal)
+## 5. 真机验证
+
+### 5.1 `web`(2026-07,EKS + c6g.metal)
 
 - `build-rootfs-image.sh web` → 节点造 `/opt/sbx/rootfs-web.ext4`。
 - create `image=web`(冷建,`restore_time_s=none`)→ guest `/web/index.html` 存在 →
   `/s/{id}/80/` **直接返回 demo 站点 HTML,无需手动起服务** ✅。
 - 回归:`image` 留空 → 走暖池秒起 min,未受影响 ✅。
 
+### 5.2 `claude-code` / `openclaw`(2026-08-13,EKS + r8i.8xlarge)
+
+- 4 个模板(`min`/`web`/`claude-code`/`openclaw`)在 OD 与 Spot 两台数据节点上均造出;
+  `/admin/images` 返回 4 项。
+- guest 内 `claude --version` = `2.1.231 (Claude Code)`、`openclaw --version` =
+  `OpenClaw 2026.7.1-2 (0790d9f)`,`rc=0` ✅;`/etc/sbx-image` 内容正确、
+  `/etc/sbx-env` 已被 sbxinit source ✅。
+- suspend → resume 后 CLI 仍可用 ✅;Spot 节点上同样通过 ✅。
+- Diff 快照不因 rootfs 变大而变大(claude-code 沙盒快照实际 81.7 MB / 0.19 s)。
+
+完整证据见
+[真机测试报告](OD-Spot双池-节点预热池-预打包运行环境-真机测试报告-2026-08-13.md) §5。
+
 ## 6. 关键坑
 
 1. **暖池冲突**:暖池预热的是 min 快照;不判断 image 就 claim 会让 `image=web` 拿到 min 内容。
    修复:非默认 image 跳过暖池走冷建。
 2. **sbxinit PATH**:sbxinit 由 `/bin/sh` 执行,PATH 未必含 `/usr/local/bin` → `python3` 找不到。
-   自起 web 用绝对路径。
+   自起 web 用绝对路径。预打包运行环境同理:sbxinit 必须显式
+   `export PATH=...` 并 `set -a; . /etc/sbx-env`,否则 vsock exec 继承 PID1 的空 env 找不到 `claude`。
 3. **模板需在节点启动前就位**:userData 启动时拉模板;运行中新增模板需重启节点或手动造(SSM)。
+4. 🔴 **装 npm 包的模板必须原生同架构构建**(2026-08-13 实测):Apple Silicon 上
+   `--platform linux/amd64` 构建 `claude-code`,`npm install -g` 中途 qemu 段错误
+   (`Segmentation fault at address 0x9`,exit 139),同层 `node -v`/`npm -v` 却正常。
+   `min`/`web` 不装 npm 包所以跨架构没问题。变通=一次性同架构 EC2 构建。
+5. 🔴 **"找不到模板就静默回退 min"在有节点预热池时会咬人**(2026-08-13 实测):
+   `_rootfs_template_path()` 的回退设计对"模板未构建"是友好的,但 ASG 预热池不等
+   cloud-init 跑完就停机 → 预热出来的节点上命名模板全缺 → `image=claude-code`
+   返回 `running` 而 guest 里没有 CLI,**调用方完全无感**。
+   现阶段规避:预热池与 `rootfs_images` 二选一(见 `terraform/README.md`)。
+6. **guest 内没有集群 DNS**:只有 tap 网段 + 8.8.8.8,解析不了 `litellm.litellm`
+   → `ANTHROPIC_BASE_URL` 不能烤进镜像,只能 create 时注入 guest 可达地址,
+   镜像里 `/etc/sbx-env` 作为注入点。
 
 ## 7. 未来增强
 
+- 🔴 **模板缺失应报错而非静默回退**(或 node-agent 启动时自愈补拉),优先级最高 ——
+  这是坑 5 的根治手段之一,也是开节点预热池的前置条件。
+- 🔴 **把模板烤进自定义 AMI**:同时解决坑 5 和"每多一个模板节点 pre-bootstrap 多 20-27s"
+  (2026-08-13 实测 4 个模板共 2m26s,过长会触发 ASG 替换循环)。
 - 按 image 分暖池(对齐 E2B/Fly,让自定义 image 也能秒起)。
 - 实时 OCI → rootfs 转换(真正"任意容器镜像")。
 - 更多预设(node / python-web 等,同脚本加 case)。

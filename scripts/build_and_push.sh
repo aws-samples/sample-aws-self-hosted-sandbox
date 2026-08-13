@@ -7,7 +7,7 @@
 #
 # 架构:
 #   - control plane 默认 linux/arm64，运行在 On-Demand Graviton system 节点。
-#   - node-agent 使用数据节点架构（c6g.metal=linux/arm64，i7i=linux/amd64）。
+#   - node-agent 使用数据节点架构（c6g.metal=linux/arm64，x86 r8i/i7i=linux/amd64）。
 #   - 兼容旧参数 --platform / PLATFORM：同时覆盖两个镜像的平台。
 #
 # 前提:

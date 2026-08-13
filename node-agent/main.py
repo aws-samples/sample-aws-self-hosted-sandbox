@@ -96,6 +96,11 @@ def _rootfs_template_path(name: str) -> str:
     name 为空/"min"/"default" → 默认 ROOTFS;否则在【已枚举的模板字典】里查该 name。
     查不到(未构建 / 非法名)一律回退默认,保证任何 image 都能起。
 
+    ⚠️ 已知问题(2026-08-13 真机):这个静默回退在【节点来自 ASG 预热池】时会咬人 ——
+    预热节点不等 cloud-init 跑完就被停机,命名模板全缺 → image=claude-code 返回
+    running 但 guest 里没有 CLI,调用方完全无感。规避:预热池与 rootfs_images 二选一
+    (见 terraform/phase3 sandbox_warm_pool_size 说明)。待做:改报错或启动时自愈补拉。
+
     安全:用户输入 name 仅作 dict 键查找,返回的路径来自 os.listdir 结果,
     绝不拼接用户输入到路径 → 无路径注入可能。额外用正则先挡非法名。"""
     name = (name or "").strip()

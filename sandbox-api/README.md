@@ -34,6 +34,7 @@ node-agent/
 | POST | /sandboxes/{id}/exec | 在沙盒内执行命令 |
 | GET | /sandboxes/{id}/locate | 定位 VMM(调试) |
 | GET | /capabilities | 当前 driver 能力 |
+| GET | /admin/sandboxes · /admin/nodes · /admin/stats · /admin/events · /admin/images | 管理面聚合(仅 `default` key);`/admin/images` 给出可选 `image` 列表供 Portal 下拉 |
 
 ## 本地冒烟测试(无需 AWS)
 
@@ -54,7 +55,10 @@ aws eks update-kubeconfig --name claude-sbx --region us-east-1
 
 # phase3 创建独立节点池：
 # - On-Demand Graviton system 节点：控制面、LiteLLM、Ingress
-# - c6g.metal/i7i sandbox 节点：node-agent + Firecracker
+# - sandbox 数据面节点（x86 r8i/i7i 或 c6g.metal）：node-agent + Firecracker
+#   数据面又拆成 On-Demand 组 + Spot 组(capacity-type=od|spot label,默认只开 OD)
+#   ⚠️ 控制面 _pick_node() 目前只按 free_mem_mib 排序、不看 capacity-type，
+#      开了 Spot 组也不会被优先选中(2026-08-13 真机实测 5/5 落 OD)
 
 # DynamoDB 表
 cd terraform/stage1-dynamodb && terraform apply
@@ -94,6 +98,7 @@ bash scripts/e2e_test.sh --api-key "$API_KEY"
 | DYNAMODB_TABLE | sandboxes | 主状态表名 |
 | AWS_REGION | us-east-1 | |
 | SANDBOX_IMAGE | (必填) | 沙盒容器镜像 |
+| SANDBOX_IMAGES | min,web | `/admin/images` 返回的可选 image 列表;每个非默认值需要节点上有对应 `/opt/sbx/rootfs-{name}.ext4`(phase3 `rootfs_images` 变量),否则 node-agent **静默回退 min** |
 | LITELLM_URL | http://litellm... | LiteLLM 网关(凭据隔离) |
 | SANDBOX_DOMAIN | sbx.example.com | 通配符子域名根 |
 | SNAPSHOT_S3_BUCKET | | rootfs 分发及未来 S3 归档预留；当前快照权威存储是持久 EBS |
@@ -101,4 +106,4 @@ bash scripts/e2e_test.sh --api-key "$API_KEY"
 | WARM_POOL_SIZE | 5 | 暖池沙盒数 |
 | NODE_AGENT_PORT | 8002 | node-agent 监听端口 |
 
-本地测试当前期望 `50/50 PASS`；真实 E2E 还应验证 resume 后 exec 和状态保留。
+本地测试当前期望 `53/53 PASS`；真实 E2E 还应验证 resume 后 exec 和状态保留。
