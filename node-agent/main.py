@@ -1203,6 +1203,8 @@ def _heartbeat_once() -> None:
         "free_mem_mib": {"N": str(_free_mem_mib())},
         "vm_count":     {"N": str(vm_count)},
         "last_seen":    {"S": datetime.now(timezone.utc).isoformat()},
+        # M2:节点池归属(spot / protected),控制面据此做放置决策。
+        "pool":         {"S": _detect_pool()},
     }
     subprocess.run(
         ["aws", "dynamodb", "put-item",
@@ -1306,6 +1308,35 @@ def _imds_get(path: str, token: str | None) -> tuple[int, str]:
         return e.code, ""      # 正常无信号时 spot/instance-action 返回 404
     except Exception:
         return 0, ""           # IMDS 不可达(本地/非 EC2)
+
+
+# ---------- 节点池归属(M2:受保护池 / 抢占池分离)----------
+# 每个节点属于一个"池":
+#   spot      —— 抢占实例,随时可能被回收。空闲/可疏散的沙盒优先放这里(便宜)。
+#   protected —— on-demand 实例,不会被回收。活跃/交互中的沙盒放这里,避免抢占中断。
+# 归属【单次探测缓存】:先看显式覆盖 NODE_POOL(便于本地/测试),否则查 IMDS
+# instance-life-cycle("spot" → spot 池;"on-demand"/其它 → protected 池)。
+# IMDS 不可达(非 EC2 本地)默认 protected —— 宁可当"不会被回收"避免误疏散。
+_POOL_CACHE: str | None = None
+
+
+def _detect_pool() -> str:
+    """探测本节点池归属并缓存。返回 "spot" 或 "protected"。"""
+    global _POOL_CACHE
+    if _POOL_CACHE is not None:
+        return _POOL_CACHE
+    override = os.environ.get("NODE_POOL", "").strip().lower()
+    if override in ("spot", "protected"):
+        _POOL_CACHE = override
+        return _POOL_CACHE
+    try:
+        token = _imds_token()
+        st, body = _imds_get("/latest/meta-data/instance-life-cycle", token)
+        life = (body or "").strip().lower()
+        _POOL_CACHE = "spot" if (st == 200 and life == "spot") else "protected"
+    except Exception:
+        _POOL_CACHE = "protected"   # 探不到:保守当不可回收
+    return _POOL_CACHE
 
 
 def _check_reclaim_signal() -> dict | None:

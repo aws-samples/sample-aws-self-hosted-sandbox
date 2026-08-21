@@ -92,6 +92,21 @@ variable "system_node_count" {
   }
 }
 
+# M2:沙盒节点组计费类型。默认 ON_DEMAND(非破坏,行为不变)。
+# 设 SPOT → 沙盒节点变抢占实例,node-agent 经 IMDS instance-life-cycle 自动上报 pool=spot,
+# 控制面据此做受保护/抢占池放置(见 sandbox-api/app.py _placement_pool)。
+# 注:要"受保护池 + 抢占池并存"需运行两个沙盒节点组(一 ON_DEMAND 一 SPOT);
+# 当前受方案C(单 AZ 持久状态 EBS)约束,双节点组拓扑留作后续设计对齐项。
+variable "sandbox_capacity_type" {
+  type        = string
+  default     = "ON_DEMAND"
+  description = "沙盒节点组计费类型:ON_DEMAND(默认)或 SPOT。SPOT 时 node-agent 上报 pool=spot,控制面按池放置。"
+  validation {
+    condition     = contains(["ON_DEMAND", "SPOT"], var.sandbox_capacity_type)
+    error_message = "sandbox_capacity_type 仅支持 \"ON_DEMAND\" 或 \"SPOT\"。"
+  }
+}
+
 variable "sandbox_az_index" {
   type        = number
   default     = 0
@@ -253,7 +268,8 @@ module "eks" {
       kubernetes_version = "1.31"
       ami_type           = local.node_arch_cfg.ami_type
       instance_types     = [local.sandbox_instance_type]
-      capacity_type      = "ON_DEMAND"
+      # M2:默认 ON_DEMAND(非破坏);设 var.sandbox_capacity_type=SPOT 让沙盒池变抢占实例。
+      capacity_type = var.sandbox_capacity_type
 
       # Intel i7i 是虚拟化实例，必须显式打开 Nitro nested virtualization 才会暴露 /dev/kvm。
       # c6g.metal 直接使用宿主 KVM，不设置该选项。
