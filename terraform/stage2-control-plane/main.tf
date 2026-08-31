@@ -84,6 +84,12 @@ variable "snapshot_s3_bucket" {
   default = ""
 }
 
+variable "snapshot_to_s3" {
+  type        = bool
+  default     = true
+  description = "默认把 suspend 快照上传 S3 作权威副本(节点/状态卷丢失后可跨机恢复)。false=只保留在节点持久状态 EBS。需配合 snapshot_s3_bucket 才实际上传。"
+}
+
 variable "sandbox_domain" {
   type    = string
   default = "sbx.example.com"
@@ -508,6 +514,8 @@ resource "kubernetes_config_map" "control_plane" {
     SANDBOX_DOMAIN        = var.sandbox_domain
     K8S_NAMESPACE         = "default"
     SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
+    # 默认把 suspend 快照上传 S3 作权威副本;false=只保留在节点持久状态 EBS(方案C)。
+    SNAPSHOT_TO_S3        = var.snapshot_to_s3 ? "1" : "0"
     WARM_POOL_SIZE        = tostring(var.warm_pool_size)
     WARM_POOL_REFILL_S    = "60"
     # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。

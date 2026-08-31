@@ -29,6 +29,11 @@ from sandbox_api.driver import Capabilities, SandboxSpec, UnsupportedOperation
 NODE_AGENT_PORT = int(os.environ.get("NODE_AGENT_PORT", "8002"))
 KERNEL_PATH     = os.environ.get("FC_KERNEL_PATH", "/opt/sbx/vmlinux")
 S3_BUCKET       = os.environ.get("SNAPSHOT_S3_BUCKET", "")
+# 快照持久化目标(可选开关)。默认把快照上传 S3 作为权威副本:节点/状态卷丢失后仍可
+# 从 S3 跨机恢复。设 SNAPSHOT_TO_S3=0 则只保留在节点持久状态 EBS(方案C,省一次
+# 上传的耗时/带宽,但节点连同状态卷一起丢失时该沙盒不可恢复)。
+# 实际是否上传 = 开关开启 且 配置了 SNAPSHOT_S3_BUCKET(未配桶则自动退化为纯本地 EBS)。
+SNAPSHOT_TO_S3  = os.environ.get("SNAPSHOT_TO_S3", "1").strip().lower() in ("1", "true", "yes")
 
 # 自定义镜像 / rootfs 模板:控制面把 image 字段归一化成模板名,node-agent 据此选
 # /opt/sbx/rootfs-{name}.ext4。可用模板名由 SANDBOX_IMAGES(逗号分隔)声明,供 Portal 下拉;
@@ -63,6 +68,16 @@ def available_images() -> list[str]:
     return SANDBOX_IMAGES
 # 统一路径约定:所有节点把沙盒文件放同一前缀(跨机 resume 必须)
 SBX_BASE        = "/var/lib/sbx"
+
+
+def _s3_enabled() -> bool:
+    """是否把快照上传 S3。默认开;仅当同时配置了 SNAPSHOT_S3_BUCKET 才真正上传。"""
+    return SNAPSHOT_TO_S3 and bool(S3_BUCKET)
+
+
+def _s3_prefix(snap_id: str) -> str:
+    """每沙盒的 S3 快照前缀 s3://<bucket>/sbx/{id}/。未启用则返回空串(退化为纯本地 EBS)。"""
+    return f"s3://{S3_BUCKET}/sbx/{snap_id}/" if _s3_enabled() else ""
 
 
 class FirecrackerDriver:
@@ -131,22 +146,31 @@ class FirecrackerDriver:
         }, timeout=180)
 
     def suspend(self, sandbox_id: str, record: dict) -> dict:
-        # 方案C:快照落节点持久状态 EBS(snap_local),spot 终止后卷幸存,不传 S3。
+        # 快照落节点持久状态 EBS(snap_local),spot 终止后卷幸存;
+        # 默认再上传 S3 作权威副本(SNAPSHOT_TO_S3=0 则纯 EBS 本地,见 _s3_enabled)。
         # 有 base 时走 Diff(只写脏页,秒级);无 base 降级 Full。
         node        = record["node"]
         snap_local  = f"{SBX_BASE}/{sandbox_id}/snap"
+        upload      = _s3_enabled()
 
-        # suspend 在慢速 EBS gp3 上 Full 快照可能 ~100s，给足 300s 避免 API 超时
-        # 方案C 不传 S3(快照落持久状态 EBS,卷幸存);不带 s3_prefix。
+        # Full 快照在慢速 EBS gp3 上可能 ~100s;开启 S3 时还含整份 snap_dir 上传(内存+磁盘)。
+        # 纯本地给 300s;上传 S3 给足 600s 避免 API 超时。
         resp = self._agent(node, "POST", "/vm/suspend", {
             "id":                   sandbox_id,
             "snapshot_local_path":  snap_local,
-        }, timeout=300)
+            # 默认上传 S3(节点/卷丢失后可跨机恢复);关开关则传空串 → node-agent 只落本地。
+            "s3_prefix":            _s3_prefix(sandbox_id),
+            "upload_s3":            upload,
+        }, timeout=600 if upload else 300)
         return {
             "snapshot_type":          resp.get("snapshot_type", ""),
             "snapshot_size_bytes":    resp.get("mem_file_bytes", 0),
             "snapshot_actual_bytes":  resp.get("mem_actual_bytes", 0),
             "snapshot_create_time_s": resp.get("snapshot_create_time_s", 0),
+            # 已上传则回填 S3 前缀(持久到 record.snapshot_s3,resume 跨机时据此从 S3 拉);
+            # 未上传则为空串,resume 只会走本地 EBS 路径。
+            "snapshot_s3":            resp.get("snapshot_s3", ""),
+            "s3_upload_time_s":       resp.get("s3_upload_time_s", 0),
         }
 
     # ------------------------------------------------------------------
@@ -162,7 +186,9 @@ class FirecrackerDriver:
         snap_id    = snapshot_id or sandbox_id
         snap_local = f"{SBX_BASE}/{snap_id}/snap"
         rootfs     = f"{SBX_BASE}/{snap_id}/rootfs.ext4"
-        snap_s3    = record.get("snapshot_s3", "")
+        # S3 前缀:优先用 suspend 时回填到 record 的权威值;缺失时(如老记录)在开关开启下
+        # 按 snap_id 推导(与 suspend 上传路径一致)。关开关或未配桶时为空 → 只走本地 EBS。
+        snap_s3    = record.get("snapshot_s3", "") or _s3_prefix(snap_id)
 
         # 优先在快照所在的原节点 resume:该节点本地已有快照文件,resume 亚秒级;
         # 若换节点则需从 S3 下载整份内存镜像(实测跨节点 ~78s,远慢于冷建),
@@ -175,8 +201,9 @@ class FirecrackerDriver:
             "snapshot_local_path": snap_local,
             "rootfs_path":         rootfs,        # 路径约定,跨机一致
             "tap_idx":             record["tap_idx"],
-            # snap_s3 恒为空(方案C 从不上传 S3)→ 这条"本地无缓存则从 S3 拉"的
-            # 兜底路径当前不会触发,为未来可选的 S3 归档预留,不代表现在有 S3 副本。
+            # 同机 resume:本地 EBS 已有快照 → node-agent 跳过 S3 下载(亚秒)。
+            # 跨机 resume(原节点已死):本地无 → node-agent 从 s3_prefix 拉 snap_dir 再 load。
+            # 默认已上传 S3 故此处非空;若关了 SNAPSHOT_TO_S3 则为空,跨机不可恢复。
             "s3_prefix":           snap_s3,
             # rootfs 缺失时的兜底模板(与 create 一致);正常路径 rootfs 已随卷在,不用它。
             "rootfs_template":     normalize_image(record.get("image", "")),

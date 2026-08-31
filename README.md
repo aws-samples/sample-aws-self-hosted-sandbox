@@ -11,7 +11,7 @@
 在 AWS 上复刻 Fly.io Firecracker microVM 架构，以更低成本、更高可控性运行 Claude Code 及各类 AI Agent。
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
-- **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS（**不经 S3**），跨机恢复靠 EBS 卷幸存 + detach/attach（见下方"快照落盘与跨机恢复"说明）
+- **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS，**默认再上传 S3 作权威副本(可关,`SNAPSHOT_TO_S3`)**,跨机恢复可从 S3 下载或靠 EBS 卷幸存（见下方"快照落盘与跨机恢复"说明）
 - **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（当前默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
@@ -196,7 +196,7 @@ GET /sandboxes/{id}/wait?state=running&timeout=30
 # 挂起（快照 + 释放内存）
 POST /sandboxes/{id}/suspend   # → snapshot_type, restore_time（快照落持久 EBS）
 
-# 恢复（同机 ~1.2s；快照读自持久 EBS，不经 S3）
+# 恢复（同机 ~1.2s 读本地 EBS；跨机从 S3 拉,默认已上传）
 POST /sandboxes/{id}/resume
 
 # 执行命令
@@ -520,19 +520,20 @@ python3 node-agent/observability_test.py
 
 为避免与实现产生误解，明确当前边界：
 
-- **快照只落节点本地的持久状态 EBS（`/var/lib/sbx/{id}/snap`），不经 S3。** suspend / spot 疏散全程不上传 S3；
-  `snapshot_s3` 字段恒为空。跨机恢复依赖的是那块 `DeleteOnTermination=false` 的状态卷本身幸存、再 attach 到新节点，
-  **不是从 S3 下载快照**。
-- **代码里的 S3 兜底路径当前是"空转"的**：resume/`op_resume` 仍保留了"本地无快照则从 `s3_prefix` 拉"的分支，
-  但因为没有任何路径把快照写进 S3（`upload_s3` 从不置真、`snapshot_s3` 恒空），这段兜底逻辑当前不会被触发。
-  它是为"未来可选的 S3 归档/兜底"预留的接口，**不代表现在有 S3 副本**。
-- **跨机恢复尚未全自动闭环**：node-agent 的 spot 回收自动疏散默认 **DRY-RUN**（只记录计划，不打快照），
-  需设 `RECLAIM_AUTO_EVACUATE=1` 才真打快照落 EBS；而"节点死后自动 detach 卷 → attach 到新节点 → 批量拉起"
-  这一步（Block 2 跨机编排）**尚未实现**。上文 50 满载"跨机恢复"实测中的卷 detach/attach 与批量 resume
-  是**测试时手动/半自动编排**触发的能力验证，不是生产环境下的全自动流程。
+- **快照默认上传 S3 作权威副本(可关)。** suspend 时先把内存快照(base+diff)落节点本地持久状态 EBS
+  (`/var/lib/sbx/{id}/snap`,同机 resume 亚秒),随后**默认再上传整份 snap_dir 到 S3**(`s3://<bucket>/sbx/{id}/`),
+  并把前缀回填到 `snapshot_s3`。开关 `SNAPSHOT_TO_S3`(默认 `1`;terraform 变量 `snapshot_to_s3`)设 `0` 则只保留在
+  EBS(方案C,省一次上传的耗时/带宽)。需配置 `SNAPSHOT_S3_BUCKET` 才实际上传(未配桶自动退化为纯本地)。
+- **跨机恢复有两条路径**:①(开启 S3 时,默认)节点死后从 S3 下载 snap_dir → 合并 diff → load;
+  ②EBS 状态卷(`DeleteOnTermination=false`)幸存后 detach/attach 到新节点。开启 S3 上传后,即使节点连同状态卷一起丢失
+  也能靠 ① 恢复。`op_resume` 的"本地无快照则从 `s3_prefix` 拉"分支现已被实际触发(不再是空转)。
+- **spot 自动疏散仍是 opt-in / 半自动**:node-agent 的 spot 回收自动疏散默认 **DRY-RUN**(只记录计划,不打快照),
+  需设 `RECLAIM_AUTO_EVACUATE=1` 才真打快照(落 EBS;若开 S3 则同时上传);而"节点死后自动 detach 卷 / 或自动从 S3
+  批量拉起"这一编排闭环**尚未实现**。上文 50 满载"跨机恢复"实测中的卷 detach/attach 与批量 resume
+  是**测试时手动/半自动编排**触发的能力验证,不是生产环境下的全自动流程。
 
-> 一句话：**同机 suspend/resume 全自动、完全不碰 S3；跨机恢复的底层能力（EBS 卷幸存 + 快照精确续上）已实测，
-> 但"自动侦测 spot 回收 → 自动搬卷 → 自动拉起"的编排闭环还没做完。**
+> 一句话:**同机 suspend/resume 亚秒;快照默认上传 S3(可关),跨机恢复可从 S3 下载(不再只依赖 EBS 卷幸存);
+> 但"自动侦测 spot 回收 → 自动疏散 → 自动拉起"的全自动编排闭环还没做完。**
 
 ---
 

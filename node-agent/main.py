@@ -734,16 +734,25 @@ def op_suspend(body: dict) -> dict:
         vm["state"] = "suspended"
         vm["pid"]   = None
 
-    # 跨机恢复靠 EBS detach/attach(控制面/运维编排),node-agent 不主动上传。
-    # (非方案C 场景若显式要求 upload_s3,保留 S3 上传作兜底路径。)
+    # 快照默认上传 S3 作权威副本(控制面 SNAPSHOT_TO_S3 开关决定是否传 upload_s3)。
+    # 上传整份 snap_dir(base + diff + manifest),跨机 resume 时 node-agent 从此前缀
+    # 拉回并合并再 load。关开关时 s3_prefix 为空 → 只保留在持久状态 EBS(卷幸存靠 attach)。
+    snapshot_s3  = ""
+    s3_upload_dt = 0.0
     if s3_prefix and body.get("upload_s3", False):
+        _t = time.monotonic()
         _s3_upload_sync(snap_dir, s3_prefix)
+        s3_upload_dt = round(time.monotonic() - _t, 3)
+        snapshot_s3  = s3_prefix
 
     return {
         "snapshot_type": snap_type,
         "snapshot_create_time_s": round(dt, 3),
         "mem_file_bytes": mem_apparent,
         "mem_actual_bytes": mem_actual,
+        # 回填给控制面:已上传则为 S3 前缀(持久到 record.snapshot_s3),否则空串。
+        "snapshot_s3": snapshot_s3,
+        "s3_upload_time_s": s3_upload_dt,
     }
 
 
