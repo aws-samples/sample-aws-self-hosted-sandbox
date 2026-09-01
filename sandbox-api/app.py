@@ -36,6 +36,11 @@ from botocore.exceptions import ClientError
 
 from sandbox_api import db
 from sandbox_api.autosleep import AutoSleeper
+from sandbox_api.crd import (
+    CRDCreateOutcomeUnknown,
+    FirecrackerSandboxStore,
+    crd_control_enabled,
+)
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.idle_detection import IdleDetector
 from sandbox_api.observability import (
@@ -62,14 +67,22 @@ _DRIVER_NAME = "firecracker"
 from sandbox_api.drivers.firecracker import FirecrackerDriver
 _driver = FirecrackerDriver()
 
-# reconcile loop + leader 选举(P0-1 / P1-4)。
-# 暖池补充与 reconcile 共用同一 leader 门控:多副本控制面下只有 leader 跑后台
-# loop,请求路径仍全副本无状态服务。
-_reconciler = Reconciler(_driver)
-_reconciler.start_loop()
-
+# 路线A:CRD 只接管生命周期 desired state;node-agent/Firecracker API 完全保留。
+# 关闭开关时仍走原同步路径,可作为无数据迁移的快速回滚。
+_CRD_CONTROL_ENABLED = crd_control_enabled()
+_crd_store = FirecrackerSandboxStore() if _CRD_CONTROL_ENABLED else None
 _warm_pool = WarmPool(_DRIVER_NAME, _driver)
-_warm_pool.start_replenish_loop(is_leader=lambda: _reconciler.is_leader)
+
+# 旧模式由 API Pod 自己跑 reconcile/warm-pool/autosleep。CRD 模式下这些后台
+# 职责全部移到 firecracker-operator,避免两个 lifecycle authority 同时操作 VM。
+if not _CRD_CONTROL_ENABLED:
+    _reconciler = Reconciler(_driver)
+    _reconciler.start_loop()
+    _warm_pool.start_replenish_loop(
+        is_leader=lambda: _reconciler.is_leader
+    )
+else:
+    _reconciler = None
 
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8000"))
@@ -96,6 +109,8 @@ EXPOSE_TOKEN = os.environ.get("EXPOSE_TOKEN", "")
 # 沙盒生效(见 _autostop_enabled / _autostart_enabled),默认关,符合"显式开"。
 AUTO_SLEEP_ENABLED   = os.environ.get("AUTO_SLEEP_ENABLED", "1").lower() in ("1", "true")
 AUTO_WAKE_TIMEOUT_S  = int(os.environ.get("AUTO_WAKE_TIMEOUT_S", "30"))  # 网关唤醒等待上限
+CRD_API_WAIT_S       = int(os.environ.get("CRD_API_WAIT_S", "700"))
+CRD_DELETE_WAIT_S    = int(os.environ.get("CRD_DELETE_WAIT_S", "120"))
 
 # ---------- 认证 ----------
 # API_KEYS: 逗号分隔的有效 key 列表
@@ -187,6 +202,81 @@ def _autostart_enabled(record: dict) -> bool:
     return bool((record.get("meta") or {}).get("auto_wake"))
 
 
+# ---------- CRD lifecycle bridge ----------
+
+def _wait_record_states(
+    sid: str,
+    states: set[str],
+    timeout_s: int,
+) -> dict | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        record = db.get(sid)
+        if record is None or record.get("state") in states:
+            return record
+        time.sleep(0.25)  # nosemgrep: arbitrary-sleep -- 等 Operator 收敛
+    return db.get(sid)
+
+
+def _ensure_crd(record: dict) -> None:
+    if _crd_store is None:
+        raise RuntimeError("CRD lifecycle control is not initialized")
+    _crd_store.ensure(record)
+
+
+def _request_crd_state(
+    record: dict,
+    desired_state: str,
+    *,
+    suspend_reason: str = "",
+) -> str:
+    _ensure_crd(record)
+    operation_id = uuid.uuid4().hex
+    _crd_store.request_state(
+        record["id"],
+        desired_state,
+        operation_id,
+        suspend_reason=suspend_reason,
+    )
+    return operation_id
+
+
+def _crd_transition_result(
+    sid: str,
+    success_states: set[str],
+    timeout_s: int = CRD_API_WAIT_S,
+    operation_id: str = "",
+) -> tuple[int, dict]:
+    deadline = time.monotonic() + timeout_s
+    record: dict | None = None
+    while time.monotonic() < deadline:
+        record = db.get(sid)
+        if record is None:
+            break
+        if record.get("state") in success_states | {"failed"}:
+            break
+        if (
+            operation_id
+            and record.get("failed_operation_id") == operation_id
+        ):
+            break
+        time.sleep(0.25)  # nosemgrep: arbitrary-sleep -- 等 Operator 收敛
+    if record is None:
+        return 404, {"error": "not found"}
+    if record.get("state") in success_states:
+        return 200, record
+    if record.get("state") == "failed" or (
+        operation_id
+        and record.get("failed_operation_id") == operation_id
+    ):
+        return 500, record
+    return 504, {
+        "error": "operator reconciliation timeout",
+        "id": sid,
+        "current_state": record.get("state"),
+    }
+
+
 # ---------- 业务逻辑 ----------
 
 # ---------- M2:受保护池 / 抢占池放置策略 ----------
@@ -243,6 +333,7 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         "image":            spec.image,
         "cpu":              spec.cpu,
         "mem_mib":          spec.mem_mib,
+        "env":              spec.env,
         # M2:期望池(记录供观测;实际落点见 driver 返回的 node)。
         "pool":             pool or "",
         "created_at":       db._utcnow(),
@@ -260,16 +351,44 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
 
     db.put(record)
 
+    if _CRD_CONTROL_ENABLED:
+        try:
+            assert _crd_store is not None
+            _crd_store.create_confirmed(record)
+            code, result = _crd_transition_result(
+                sid, {"running"}, CRD_API_WAIT_S
+            )
+            return (201 if code == 200 else code), result
+        except CRDCreateOutcomeUnknown as e:
+            # The Kubernetes write may already have committed. Keep the DDB
+            # projection so the operator and caller have a stable id to
+            # reconcile instead of silently creating an untracked microVM.
+            return 503, {
+                "error": str(e),
+                "id": sid,
+                "current_state": "creating",
+                "retryable": True,
+            }
+        except Exception as e:
+            # create_confirmed only reaches this branch after a successful GET
+            # proved that no CR exists. Delete the projection so an
+            # idempotency key can safely retry.
+            try:
+                db.delete(sid)
+            except Exception:
+                pass
+            return 500, {"error": str(e)}
+
     try:
         # 先尝试从暖池 resume(FC 模式 ~7ms);失败或不支持则冷建。
         # 暖池预热的是默认(min)rootfs;若请求了非默认 image,暖池的快照不匹配 →
         # 跳过暖池直接冷建,才会走 op_create 的模板选择(CoW 对应 rootfs-{name}.ext4)。
         from sandbox_api.drivers.firecracker import normalize_image
         wants_default = normalize_image(spec.image) == "min"
-        # M2:指定了明确 pool 时跳过暖池(暖池 VM 池归属不确定),走冷建以落到目标池;
-        # 未指定 pool(None)时仍可用暖池,维持秒级 create。
-        use_warm = wants_default and pool is None
-        claimed = _warm_pool.claim(sid, spec) if use_warm else False
+        # 暖池条目带明确 protected/spot 归属，只在请求池匹配时 claim；
+        # spot 请求不会误拿 protected 预热 VM。
+        use_warm = wants_default and _warm_pool.can_claim(pool)
+        claimed = _warm_pool.claim(sid, spec, pool=pool) if use_warm else False
         if not claimed:
             driver_fields = _driver.create(sid, spec, pool=pool)
             db.force_update(sid, {**driver_fields, "state": "running"})
@@ -444,6 +563,16 @@ def health_report(require_dependencies: bool) -> tuple[int, dict]:
             checks["dynamodb"] = {"error_type": type(exc).__name__}
             checks["active_nodes"] = 0
             healthy = False
+        if _CRD_CONTROL_ENABLED:
+            try:
+                assert _crd_store is not None
+                _crd_store.ready()
+                checks["firecracker_crd"] = "ok"
+            except Exception as exc:
+                checks["firecracker_crd"] = {
+                    "error_type": type(exc).__name__
+                }
+                healthy = False
     return (200 if healthy else 503), {
         "status": "ok" if healthy else "unhealthy",
         "checks": checks,
@@ -579,6 +708,43 @@ def destroy_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
 
+    if _CRD_CONTROL_ENABLED:
+        try:
+            _ensure_crd(record)
+            assert _crd_store is not None
+            _crd_store.delete(sid)
+            initial_failed = record.get("state") == "failed"
+            initial_error = record.get("error", "")
+            initial_updated_at = record.get("updated_at", "")
+            deadline = time.monotonic() + CRD_DELETE_WAIT_S
+            while time.monotonic() < deadline:
+                current = db.get(sid)
+                if current is None:
+                    return 200, {"id": sid, "deleted": True}
+                if current.get("state") == "failed":
+                    # A sandbox may already be failed before DELETE. That is
+                    # still a valid cleanup request, so wait for the
+                    # finalizer instead of reporting the old failure as a
+                    # deletion failure. A new failed projection after the
+                    # request indicates the destroy action itself failed.
+                    delete_failed = (
+                        not initial_failed
+                        or current.get("error", "") != initial_error
+                        or current.get("updated_at", "")
+                        != initial_updated_at
+                    )
+                    if delete_failed:
+                        return 500, current
+                time.sleep(0.25)  # nosemgrep: arbitrary-sleep -- 等 finalizer
+            current = db.get(sid) or {}
+            return 504, {
+                "error": "operator deletion timeout",
+                "id": sid,
+                "current_state": current.get("state"),
+            }
+        except Exception as exc:
+            return 500, {"error": str(exc)}
+
     lease_id = None
     try:
         lease_id = db.acquire_lease(sid)
@@ -604,6 +770,22 @@ def suspend_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, di
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
+
+    if _CRD_CONTROL_ENABLED:
+        if record.get("state") != "running":
+            return 409, {
+                "error": "sandbox is not in running state",
+                "state": record.get("state"),
+            }
+        try:
+            operation_id = _request_crd_state(
+                record, "Suspended", suspend_reason="manual"
+            )
+            return _crd_transition_result(
+                sid, {"suspended"}, operation_id=operation_id
+            )
+        except Exception as exc:
+            return 500, {"error": str(exc)}
 
     lease_id = None
     try:
@@ -643,6 +825,24 @@ def auto_sleep_sandbox(sid: str) -> tuple[int, dict]:
     record = db.get(sid)
     if not record or record.get("state") != "running":
         return 409, {"error": "not running"}
+
+    if _CRD_CONTROL_ENABLED:
+        decision = _idle_detector.decide(record)
+        if not decision.idle:
+            return 200, {
+                "skipped": "no longer idle",
+                "idle_s": decision.idle_seconds,
+                "blockers": list(decision.blockers),
+            }
+        try:
+            operation_id = _request_crd_state(
+                record, "Suspended", suspend_reason="idle"
+            )
+            return _crd_transition_result(
+                sid, {"slept"}, operation_id=operation_id
+            )
+        except Exception as exc:
+            return 500, {"error": str(exc)}
 
     lease_id = None
     try:
@@ -695,6 +895,23 @@ def resume_sandbox(sid: str, caller_tenant: str | None = None) -> tuple[int, dic
         return 404, {"error": "not found"}
     if (denied := _check_tenant_access(record, caller_tenant)):
         return denied
+
+    if _CRD_CONTROL_ENABLED:
+        prev = record.get("state")
+        if prev not in (
+            "suspended", "slept", "needs_reschedule", "orphaned"
+        ):
+            return 409, {
+                "error": "sandbox is not in a resumable state",
+                "state": prev,
+            }
+        try:
+            operation_id = _request_crd_state(record, "Running")
+            return _crd_transition_result(
+                sid, {"running"}, operation_id=operation_id
+            )
+        except Exception as exc:
+            return 500, {"error": str(exc)}
 
     lease_id = None
     try:
@@ -841,7 +1058,7 @@ def wait_sandbox(sid: str, target_state: str, timeout: int = 30) -> tuple[int, d
 # 放在这里(而非 import 顶部)是因为需要引用后面定义的 auto_sleep_sandbox / _idle_seconds /
 # _autostop_enabled。与 reconcile / 暖池共用同一 leader 门控:多副本下只有 leader 扫描。
 # AUTO_SLEEP_ENABLED=0 可整体关闭(仍不影响手动 suspend/resume 与网关唤醒逻辑)。
-if AUTO_SLEEP_ENABLED:
+if AUTO_SLEEP_ENABLED and not _CRD_CONTROL_ENABLED:
     _autosleeper = AutoSleeper(
         sleep_fn         = auto_sleep_sandbox,
         idle_decision_fn = _idle_detector.decide,

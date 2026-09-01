@@ -56,6 +56,10 @@ resource "aws_dynamodb_table" "sandboxes" {
     name = "driver"
     type = "S"
   }
+  attribute {
+    name = "state"
+    type = "S"
+  }
 
   # 按租户列出沙盒(最新优先)
   global_secondary_index {
@@ -77,6 +81,15 @@ resource "aws_dynamodb_table" "sandboxes" {
     name            = "pool_state-driver-index"
     hash_key        = "pool_state"
     range_key       = "driver"
+    projection_type = "ALL"
+  }
+
+  # 千级沙盒下 autosleep/operator 不能每轮全表 scan。按 state 分区、updated_at
+  # 排序，支持 lifecycle maintenance 用 Query 分页拉取。
+  global_secondary_index {
+    name            = "state-updated_at-index"
+    hash_key        = "state"
+    range_key       = "updated_at"
     projection_type = "ALL"
   }
 

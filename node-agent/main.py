@@ -536,6 +536,24 @@ def op_create(body: dict) -> dict:
     kernel   = body.get("kernel", "/opt/sbx/vmlinux")
     env      = body.get("env", {})
 
+    # Operator reconciliation is level-triggered: after a watch reconnect or
+    # process crash it may repeat a create whose side effect already
+    # succeeded. Make the node boundary idempotent so the retry cannot start a
+    # second Firecracker process or overwrite the running VM's rootfs.
+    with _LOCK:
+        existing = _VMS.get(sid)
+        if existing and existing.get("state") == "running":
+            return {
+                "state": "running",
+                "ip": existing.get("ip", ""),
+                "already_exists": True,
+            }
+        if existing:
+            raise RuntimeError(
+                f"sandbox {sid} already exists in state "
+                f"{existing.get('state', 'unknown')}"
+            )
+
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
 
@@ -563,10 +581,92 @@ def op_create(body: dict) -> dict:
     return {"state": "running", "ip": guest_ip}
 
 
+def _managed_sandbox_dir(path: str) -> str | None:
+    """Return a normalized direct child of SBX_BASE, or None if unsafe."""
+    base = os.path.abspath(SBX_BASE)
+    candidate = os.path.abspath(path)
+    if os.path.dirname(candidate) != base:
+        return None
+    return candidate
+
+
+def _snapshot_source(sid: str, snap_dir: str) -> tuple[str | None, str | None]:
+    """Identify a distinct managed sandbox directory backing a snapshot."""
+    source_dir = _managed_sandbox_dir(os.path.dirname(snap_dir))
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not source_dir or source_dir == sandbox_dir:
+        return None, None
+    return os.path.basename(source_dir), source_dir
+
+
+def _ensure_resume_source_available(sid: str, snap_dir: str) -> None:
+    """A warm snapshot may only be claimed from an inactive source VM."""
+    source_sid, _ = _snapshot_source(sid, snap_dir)
+    if not source_sid:
+        return
+    with _LOCK:
+        source = _VMS.get(source_sid)
+        if source and source.get("state") != "suspended":
+            raise RuntimeError(
+                f"snapshot source {source_sid} is still "
+                f"{source.get('state', 'unknown')}"
+            )
+
+
+def _register_resumed_vm(sid: str, vm: dict, snap_dir: str) -> None:
+    """Atomically transfer a warm snapshot's local ownership to real sid."""
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    source_sid, source_dir = _snapshot_source(sid, snap_dir)
+    owned_dirs = {
+        path for path in (sandbox_dir, source_dir)
+        if path is not None
+    }
+    with _LOCK:
+        # A warm-claimed sandbox can later suspend into real_id/snap and
+        # resume again. That second resume no longer exposes warm_id through
+        # snap_dir, so retain the ownership transferred by the first claim.
+        previous = _VMS.get(sid) or {}
+        for path in previous.get("owned_dirs") or []:
+            managed = _managed_sandbox_dir(str(path))
+            if managed:
+                owned_dirs.add(managed)
+        vm["owned_dirs"] = sorted(owned_dirs)
+        _VMS[sid] = vm
+        if source_sid:
+            source = _VMS.get(source_sid)
+            if source and source.get("state") == "suspended":
+                _VMS.pop(source_sid, None)
+
+
+def _owned_runtime_dirs(sid: str, vm: dict) -> list[str]:
+    """Return only safe per-sandbox directories owned by a runtime."""
+    candidates = list(vm.get("owned_dirs") or [])
+    candidates.extend((vm.get("dir", ""), f"{SBX_BASE}/{sid}"))
+    result: list[str] = []
+    for candidate in candidates:
+        managed = _managed_sandbox_dir(str(candidate)) if candidate else None
+        if managed and managed not in result:
+            result.append(managed)
+    return result
+
+
+def _live_runtime_socket(sandbox_dir: str) -> str | None:
+    for name in ("api.sock", "api-resume.sock"):
+        sock = os.path.join(sandbox_dir, name)
+        if os.path.exists(sock) and _wait_sock(sock, timeout=0.2):
+            return sock
+    return None
+
+
 def op_destroy(body: dict) -> dict:
     sid = body["id"]
     with _LOCK:
         vm = _VMS.pop(sid, None)
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not vm and sandbox_dir and _live_runtime_socket(sandbox_dir):
+        raise RuntimeError(
+            f"sandbox {sid} has a live Firecracker socket but is not tracked"
+        )
     if vm:
         if vm.get("pid"):
             # os.kill 而非 subprocess(slim 镜像无 /bin/kill)
@@ -575,9 +675,20 @@ def op_destroy(body: dict) -> dict:
             except (ProcessLookupError, ValueError, TypeError):
                 pass
         _teardown_tap(vm.get("tap", ""))
-        sandbox_dir = f"{SBX_BASE}/{sid}"
-        shutil.rmtree(sandbox_dir, ignore_errors=True)
-        _clear_base_hash_cache(sandbox_dir)
+        # A warm claim restores from the warm source directory because the
+        # Firecracker snapshot embeds paths to its rootfs/vsock/memory files.
+        # The real sandbox therefore owns both its runtime directory and that
+        # source directory until destroy. Remove both after the VMM is dead.
+    cleanup_vm = vm or {
+        "dir": sandbox_dir or "",
+        "owned_dirs": (
+            _recovered_owned_dirs(sandbox_dir)
+            if sandbox_dir else []
+        ),
+    }
+    for owned_dir in _owned_runtime_dirs(sid, cleanup_vm):
+        shutil.rmtree(owned_dir, ignore_errors=True)
+        _clear_base_hash_cache(owned_dir)
     return {"deleted": True}
 
 
@@ -815,12 +926,55 @@ def _vsock_uds_in_snapshot(snapshot_path: str) -> list[str]:
     return sorted({m.decode("utf-8", "ignore") for m in re.findall(pat, blob)})
 
 
+def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
+    # Reconciliation may retry after a successful response was lost. Do not
+    # start a second Firecracker process or rebuild tap/rootfs. A normal
+    # suspend intentionally retains a lightweight _VMS entry with pid=None;
+    # that exact suspended state is the valid input to snapshot restore.
+    with _LOCK:
+        existing = _VMS.get(sid)
+        if existing and existing.get("state") == "running":
+            source_sid, source_dir = _snapshot_source(sid, snap_dir)
+            if source_dir:
+                owned_dirs = set(existing.get("owned_dirs") or [])
+                owned_dirs.update((
+                    _managed_sandbox_dir(f"{SBX_BASE}/{sid}"),
+                    source_dir,
+                ))
+                existing["owned_dirs"] = sorted(
+                    path for path in owned_dirs if path
+                )
+                source = _VMS.get(source_sid or "")
+                if source and source.get("state") == "suspended":
+                    _VMS.pop(source_sid or "", None)
+            return {
+                "state": "running",
+                "ip": existing.get("ip", ""),
+                "already_exists": True,
+                "restore_time_s": 0,
+                "merge_time_s": 0,
+                "restore_mode": "existing",
+                "net_fix_ok": True,
+                "juicefs_mode": JUICEFS_ENABLED,
+            }
+        if existing and existing.get("state") != "suspended":
+            raise RuntimeError(
+                f"sandbox {sid} already exists in state "
+                f"{existing.get('state', 'unknown')}"
+            )
+    return None
+
+
 def op_resume(body: dict) -> dict:
     sid        = body["id"]
     snap_dir   = body["snapshot_local_path"]
     rootfs     = body["rootfs_path"]          # 统一路径约定
     tap_idx    = int(body["tap_idx"])
     s3_prefix  = body.get("s3_prefix", "")
+
+    if existing_result := _existing_resume_result(sid, snap_dir):
+        return existing_result
+    _ensure_resume_source_available(sid, snap_dir)
 
     # 兜底:若本地无快照文件且传了 s3_prefix,从 S3 拉回。
     # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
@@ -962,8 +1116,9 @@ def op_resume(body: dict) -> dict:
         except OSError:
             pass
 
-    with _LOCK:
-        _VMS[sid] = {
+    _register_resumed_vm(
+        sid,
+        {
             "state":   "running",
             "pid":     proc.pid,
             "sock":    sock,
@@ -971,7 +1126,9 @@ def op_resume(body: dict) -> dict:
             "tap_idx": tap_idx,
             "ip":      guest_ip,
             "dir":     d,
-        }
+        },
+        snap_dir,
+    )
 
     # ---- P1: resume 后经 vsock 加速 guest 网络收敛 ----
     # 跨机 resume 后,guest 内存快照固化了旧宿主 tap 的网关 MAC(stale ARP)。
@@ -1244,6 +1401,19 @@ def start_heartbeat_loop() -> None:
 
 # ---------- 启动自恢复(P0-1:重建 _VMS,防重启后状态漂移) ----------
 
+def _recovered_owned_dirs(sandbox_dir: str) -> list[str]:
+    """Infer warm-source ownership from the recovered vsock symlink."""
+    owned = {_managed_sandbox_dir(sandbox_dir)}
+    vsock = os.path.join(sandbox_dir, "v.sock")
+    if os.path.islink(vsock):
+        source_dir = _managed_sandbox_dir(
+            os.path.dirname(os.path.realpath(vsock))
+        )
+        if source_dir:
+            owned.add(source_dir)
+    return sorted(path for path in owned if path)
+
+
 def _recover_vms() -> int:
     """
     启动时扫 SBX_BASE 下各沙盒目录,对仍有存活 FC api socket 的重建 _VMS。
@@ -1277,6 +1447,10 @@ def _recover_vms() -> int:
                     "tap":   f"fctap{_tap_idx_guess(sid)}",
                     "ip":    "",
                     "dir":   d,
+                    # Warm-claimed VMs keep a symlink to the snapshot source
+                    # vsock. Recover that source directory so a later destroy
+                    # still removes all locally-owned state after restart.
+                    "owned_dirs": _recovered_owned_dirs(d),
                 }
             recovered += 1
             break

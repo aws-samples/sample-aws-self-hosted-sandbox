@@ -56,6 +56,13 @@ def normalize_image(image: str) -> str:
     img = (image or "").strip()
     if not img or img in ("min", "default"):
         return "min"
+    # Stage 2 historically stores the legacy container image URI in
+    # SANDBOX_IMAGE. Firecracker has always fallen back to the min rootfs when
+    # that template does not exist, so treat that configured default as min
+    # for warm-pool eligibility while preserving the public record value.
+    configured_default = os.environ.get("SANDBOX_IMAGE", "").strip()
+    if configured_default and img == configured_default:
+        return "min"
     # 允许传 "web"、"web:latest"、"123.dkr.ecr.../sbx-web:tag" 之类,取末段去 tag
     last = img.rsplit("/", 1)[-1].split(":", 1)[0]
     if not last or not _IMAGE_NAME_RE.match(last):
@@ -91,9 +98,48 @@ class FirecrackerDriver:
 
     def create(self, sandbox_id: str, spec: SandboxSpec,
                pool: str | None = None) -> dict:
-        tap_idx = db.alloc_tap_idx()
-        # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时 _pick_node 内部回退不限池。
-        node_id = self._pick_node(pool=pool)
+        # Persist placement before the node side effect. If the operator
+        # crashes after node-agent starts Firecracker but before status is
+        # published, the next reconciliation retries the same node/tap instead
+        # of creating a second VM elsewhere.
+        current = db.get(sandbox_id)
+        node_id = str((current or {}).get("node", ""))
+        tap_idx = int((current or {}).get("tap_idx", 0) or 0)
+
+        if node_id and tap_idx:
+            try:
+                info = self._agent(node_id, "GET", f"/vm/{sandbox_id}")
+                if info.get("state") == "running":
+                    return {
+                        "node": node_id,
+                        "tap_idx": tap_idx,
+                        "guest_ip": info.get("ip", ""),
+                    }
+            except Exception:
+                # Reuse the journaled placement when the node itself is
+                # reachable and only the VM is absent. If the node is gone,
+                # choose a fresh node/tap below.
+                try:
+                    self._agent(node_id, "GET", "/health")
+                except Exception:
+                    node_id = ""
+                    tap_idx = 0
+
+        if not node_id:
+            # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时
+            # _pick_node 内部回退不限池。
+            node_id = self._pick_node(pool=pool)
+        if not tap_idx:
+            tap_idx = db.alloc_tap_idx()
+        if current is not None:
+            db.force_update(
+                sandbox_id,
+                {
+                    "node": node_id,
+                    "tap_idx": tap_idx,
+                    "runtime_operation": "create",
+                },
+            )
         rootfs  = f"{SBX_BASE}/{sandbox_id}/rootfs.ext4"
 
         self._agent(node_id, "POST", "/vm/create", {
@@ -120,12 +166,36 @@ class FirecrackerDriver:
     # ------------------------------------------------------------------
 
     def destroy(self, sandbox_id: str, record: dict) -> None:
+        """Legacy best-effort delete kept for the pre-CRD synchronous path."""
+        self._destroy(sandbox_id, record, require_ack=False)
+
+    def destroy_confirmed(self, sandbox_id: str, record: dict) -> None:
+        """Delete only after node-agent confirms runtime cleanup.
+
+        CRD finalizers must not disappear after a timeout or node-agent 500,
+        otherwise Kubernetes reports the sandbox deleted while Firecracker may
+        still be running. A missing runtime is already an idempotent 200 in the
+        node-agent, so every exception here is a real unconfirmed outcome.
+        """
+        self._destroy(sandbox_id, record, require_ack=True)
+
+    def _destroy(
+        self,
+        sandbox_id: str,
+        record: dict,
+        *,
+        require_ack: bool,
+    ) -> None:
         node = record.get("node")
         if node:
             try:
                 self._agent(node, "POST", "/vm/destroy", {"id": sandbox_id})
             except Exception:
-                pass   # 节点已挂/沙盒已不存在,destroy 幂等
+                if require_ack:
+                    raise
+                # Legacy behavior: node down and missing sandbox are treated
+                # as best-effort/idempotent cleanup.
+                pass
         if record.get("tap_idx"):
             db.release_tap_idx(record["tap_idx"])
 

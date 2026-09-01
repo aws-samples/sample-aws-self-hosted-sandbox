@@ -240,10 +240,13 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 
 #### 6. 高可用编排（控制面自愈，非"手搓 POC"）
 
-控制面无状态、状态全落 DynamoDB，配合一组 DynamoDB 原语实现生产级编排能力（对标 E2B 的中心化控制面，详见 [docs/编排层调研与改进路线.md](docs/编排层调研与改进路线.md)）：
+控制面无状态。路线 A 使用 `FirecrackerSandbox` CRD 保存生命周期期望态，
+`firecracker-operator` 复用现有 FirecrackerDriver/node-agent 执行实际动作；
+DynamoDB 保留为 REST/Portal 兼容投影、幂等索引、事件、活跃信号、节点心跳和租约。
+详细设计与迁移边界见 [docs/CRD路线A-架构与迁移.md](docs/CRD路线A-架构与迁移.md)。
 
-- **reconcile loop（状态自愈）**：后台周期对账 DynamoDB 期望态 vs node-agent 实况；发现漂移（如节点/VM 消失但记录仍 `running`）自动标 `orphaned` 并回收泄漏资源，杜绝状态永久漂移。
-- **leader 选举（多副本不打架）**：DynamoDB 条件写租约 + fencing token（rvn），控制面多副本下只有 leader 跑 reconcile/暖池补充；leader pod 挂掉后另一副本秒级接管。
+- **CRD reconcile（状态自愈）**：watch + 周期 resync 对账 CRD 期望态、DynamoDB 投影和 node-agent 实况；Operator 重启或事件丢失后仍会继续收敛。
+- **并发防护（多副本不打架）**：每沙盒 DynamoDB 长租约持续续租；create 预写 node/tap 操作日志，node-agent 对重复 create 幂等；leader 只运行暖池与 autosleep 全局维护。
 - **节点心跳注册表（弹性发现）**：node-agent 每 30s 上报 `free_mem/vm_count/last_seen`，控制面按 `last_seen` 超时自动剔除死节点、`_pick_node` 从注册表选节点——不再靠硬编码 `FC_NODES`。
 - **快照落盘强一致**：suspend 先同步确认快照已落持久状态 EBS、再释放 VMM 内存；落盘失败则恢复 VM 运行而非静默丢数据。保证不变式 **状态标 `suspended` ⟺ 持久 EBS 确有快照**。
 
@@ -266,47 +269,49 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 | **控制面自愈** | ✅ reconcile + leader + 心跳发现 | ✅ ~20s sync loop | ✅ 去中心化 flyd | ✅ 托管 |
 | **可观测性** | ✅ Prometheus/Alertmanager/Grafana；可选 AMP + AMG | 托管 | 托管 | CloudWatch |
 | **数据主权** | ✅ 数据留 AWS 账号内 | ❌ 第三方 | ❌ 第三方 | ✅ |
-| **K8s 生态集成** | 平台组件运行在 EKS；sandbox 不建 Pod | ❌ | ❌ | ❌ |
+| **K8s 生态集成** | 每沙盒有 CRD/condition/RBAC；microVM 不建 Pod | ❌ | ❌ | ❌ |
 
 ---
 
 ### 为什么每个 sandbox 不是一个 Pod
 
-本项目使用 Kubernetes 管理**平台服务**，但不把每个用户 sandbox 注册成 Kubernetes
-工作负载。Ingress、控制面、LiteLLM 和 node-agent 都是 Pod；真正执行用户代码的
+本项目使用 Kubernetes 管理**平台服务和生命周期对象**，但不把每个用户 sandbox
+运行成 Pod。Ingress、控制面、Operator、LiteLLM 和 node-agent 都是 Pod；每个沙盒有
+一个轻量 `FirecrackerSandbox` CRD，真正执行用户代码的
 Firecracker microVM 则是 sandbox 节点上的宿主机进程。可以把这个边界概括为：
-**Kubernetes 调度管理器，平台自己的控制面调度 microVM。**
+**Kubernetes 保存期望状态，平台 Operator 调度和控制 microVM。**
 
-创建 sandbox 时，请求先到 `sandbox-control-plane`。控制面根据 node-agent 心跳和剩余
-容量选择数据节点、在 DynamoDB 建立状态记录，再调用该节点上的 node-agent。node-agent
+创建 sandbox 时，请求先到 `sandbox-control-plane`，写入 CRD 和 DynamoDB 兼容投影。
+Operator 根据 node-agent 心跳和剩余容量选择数据节点，再调用该节点上的 node-agent。node-agent
 随后在宿主机上准备 rootfs、TAP 网络和 vsock，分配 vCPU/内存并启动 Firecracker。
 kube-scheduler 只看见每个数据节点上的一个 node-agent DaemonSet Pod，不会为每个
-sandbox 创建 Pod、PVC、Service 或 CRD。
+sandbox 创建 Pod、PVC 或 Service。
 
 | 维度 | 普通 Pod | 本项目的 Firecracker sandbox |
 |---|---|---|
-| Kubernetes 对象 | 每个实例都是 Pod，可由 Deployment/Job 等控制器创建 | sandbox 记录在 DynamoDB，由控制面和 node-agent 管理；Kubernetes 中没有对应 Pod |
+| Kubernetes 对象 | 每个实例都是 Pod，可由 Deployment/Job 等控制器创建 | 每个 sandbox 是轻量 CRD；没有对应 Pod |
 | 放置决策 | kube-scheduler 根据 requests、affinity、taint 等选择节点 | 控制面根据 node-agent 心跳、可用内存和 VM 数量选择 sandbox 节点 |
 | 隔离边界 | 容器依赖 namespace/cgroup，通常与节点共享宿主内核 | KVM 提供虚拟硬件边界，每个 microVM 启动独立 guest 内核 |
 | 启停语义 | kubelet 拉取镜像并启动容器；异常后按 Pod 策略重建 | node-agent 调 Firecracker API 执行 create、snapshot、suspend、resume、destroy |
 | 网络 | CNI 分配 Pod IP，Service/Ingress 路由到 Pod | 每个 guest 连接独立 TAP `/30` 网段，经 `Ingress → 控制面 → node-agent → guest` 代理访问 |
 | 状态存储 | 常见做法是容器层加 PV/PVC，生命周期由 Kubernetes 协调 | 每个 sandbox 使用独立 rootfs 和内存快照，文件落在宿主机挂载的持久状态 EBS |
-| 可观测性 | `kubectl`、Pod condition、probe 和容器日志直接可见 | Kubernetes 只看见 node-agent；VM 状态、快照耗时和 guest 健康由平台自行采集 |
-| 规模单位 | 一份用户环境通常至少增加一个 Pod 及相关 API 对象 | 单个 node-agent 在一台节点上管理多台 microVM，避免把 sandbox 数量直接映射成 Pod 数量 |
+| 可观测性 | `kubectl`、Pod condition、probe 和容器日志直接可见 | `kubectl get fcsbx` 查看期望态/phase/condition；VM 指标由平台采集 |
+| 规模单位 | 一份用户环境通常至少增加一个 Pod 及相关网络对象 | 每沙盒仅增加一个 CR；单个 node-agent 管理多台 microVM |
 
 这样设计的主要目的不是绕开 Kubernetes，而是让长期存活、可挂起的用户环境拥有独立于
 Pod 重建语义的生命周期。空闲 sandbox 可以写入 Firecracker 快照并释放 VMM 内存，恢复时
 继续使用原有 guest 状态；节点内也能按真实工作集对 CPU 和内存做更细的装箱。与此同时，
 Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障接管。
 
-这条路径也意味着平台要承担原本由 Kubernetes 提供的一部分能力：节点选择、实例状态机、
-网络代理、健康检查、资源回收和恢复编排都必须由控制面实现。当前实现还有两个明确边界：
+这条路径也意味着平台要承担 kubelet 不会替 microVM 完成的能力：节点选择、Firecracker
+状态机、网络代理、快照与恢复动作由 Operator/node-agent 实现。当前实现还有两个明确边界：
 
 - Firecracker 是 node-agent 启动的子进程，并运行在 node-agent Pod 的 cgroup 中；因此
   “sandbox 不是 Pod”表示它不是独立的 Kubernetes 调度对象，并不表示它完全不受
   node-agent Pod 或宿主节点生命周期影响。升级或重启 node-agent 前仍需执行安全疏散。
-- sandbox 状态目前以同可用区持久 EBS 为权威来源。跨节点 detach/attach 已验证，但 Spot
-  中断后的自动疏散与恢复尚未完全闭环，不能把它描述成任意跨可用区自动重调度。
+- suspend 快照默认上传 S3，同时保留节点状态 EBS。Operator 可消费可恢复的
+  `needs_reschedule`；但运行中节点突然消失时，历史快照可能不是最新状态，系统会标
+  `orphaned` 而不会静默回滚。Spot 中断前的最新快照/状态 CAS/排除 draining 节点仍需闭环。
 
 ### 架构概览
 
@@ -316,13 +321,14 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
 │  system 节点组（On-Demand）      sandbox 数据节点组                 │
 │  Graviton m7g（默认 2 台）       c6g.metal 或 i7i.*                 │
 │  ┌──────────────────────────┐      ┌────────────────────────────┐  │
-│  │ sandbox-control-plane    │ HTTP │ node-agent Pod (DaemonSet) │  │
-│  │ (Deployment, 2 副本,IRSA)│─────►│  hostNetwork / privileged  │  │
-│  │  FirecrackerDriver       │◄─────│  心跳 / tap / 快照 / 代理  │  │
-│  │  WarmPool                │ 心跳 ├────────────────────────────┤  │
-│  │  Reconciler (leader-only)│      │ 宿主机 Firecracker 进程     │  │
-│  │  无状态 → DynamoDB        │      │  ├ microVM A（不是 Pod）    │  │
-│  └──────────────────────────┘      │  ├ microVM B（不是 Pod）    │  │
+│  │ sandbox-control-plane    │      │ node-agent Pod (DaemonSet) │  │
+│  │ REST / exec / files/proxy│      │  hostNetwork / privileged  │  │
+│  ├──────────────────────────┤ HTTP │  心跳 / tap / 快照 / 代理  │  │
+│  │ firecracker-operator     │─────►├────────────────────────────┤  │
+│  │ CRD watch/reconcile      │◄─────│ 宿主机 Firecracker 进程     │  │
+│  │ WarmPool / AutoSleep     │ 心跳 │  ├ microVM A（不是 Pod）    │  │
+│  │ 无状态 → CRD + DynamoDB   │      │  ├ microVM B（不是 Pod）    │  │
+│  └──────────────────────────┘      │  └ microVM N（不是 Pod）    │  │
 │                                    │  └ microVM N（不是 Pod）    │  │
 │                                    └────────────────────────────┘  │
 │  CoreDNS / LiteLLM / Ingress         taint: dedicated=sandbox       │
@@ -449,8 +455,9 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 # 无需 AWS，本地直接跑
 python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
+python3 sandbox-api/crd_test.py
 python3 node-agent/observability_test.py
-# 期望：控制面 53/53 + node-agent 8/8 PASS
+# 期望：控制面 55/55 + CRD/operator 8/8 + node-agent 10/10 PASS
 ```
 
 ---
@@ -483,7 +490,7 @@ python3 node-agent/observability_test.py
 | 单机最大并发 | 60 VM（测试截止，未到上限）| c6g.metal 128 GiB |
 | npm install 耗时 | 18s（JuiceFS）/ 4s（本地 ext4）| 7160 文件，8 依赖 |
 | LiteLLM → Bedrock | ~1-2s | claude-haiku-4-5 |
-| 冒烟测试通过率 | **控制面 53/53 + node-agent 8/8（ALL PASS）** | moto mock + tracing/可观测性/完整性测试 |
+| 冒烟测试通过率 | **控制面 55/55 + CRD/operator 8/8 + node-agent 10/10（ALL PASS）** | moto mock + tracing/可观测性/完整性测试 |
 | 控制面 / 数据面分离 | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 生命周期 | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |

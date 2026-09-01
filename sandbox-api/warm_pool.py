@@ -21,6 +21,18 @@ from sandbox_api.observability import log_event, record_loop, register_loop
 POOL_SIZE    = int(os.environ.get("WARM_POOL_SIZE", "5"))
 REFILL_EVERY = int(os.environ.get("WARM_POOL_REFILL_S", "30"))
 SNAPSHOT_SETTLE_S = float(os.environ.get("WARM_SNAPSHOT_SETTLE_S", "1"))
+_POOL_PLACEMENT_ENABLED = os.environ.get(
+    "POOL_PLACEMENT_ENABLED", "1"
+).lower() in ("1", "true")
+_POOL_CANDIDATE = os.environ.get(
+    "WARM_POOL_POOL",
+    os.environ.get("DEFAULT_CREATE_POOL", "protected"),
+).strip().lower()
+WARM_POOL_POOL = (
+    _POOL_CANDIDATE
+    if _POOL_PLACEMENT_ENABLED and _POOL_CANDIDATE in ("protected", "spot")
+    else None
+)
 
 # 暖池用的基础镜像和规格(与真实沙盒保持一致)
 _BASE_SPEC = SandboxSpec(
@@ -40,44 +52,112 @@ class WarmPool:
     # claim — create 时先尝试从池子拿
     # ------------------------------------------------------------------
 
-    def claim(self, real_id: str, spec: SandboxSpec) -> bool:
+    @property
+    def placement_pool(self) -> str | None:
+        return WARM_POOL_POOL
+
+    def can_claim(self, requested_pool: str | None) -> bool:
+        return requested_pool == self.placement_pool
+
+    def claim(
+        self,
+        real_id: str,
+        spec: SandboxSpec,
+        pool: str | None = None,
+    ) -> bool:
         """
         尝试从暖池取一个沙盒并 resume,填充真实配置。
         成功返回 True(调用方跳过冷建);失败返回 False(调用方走冷建)。
         """
-        warm_id = db.claim_warm_item(self._driver_name)
-        if not warm_id:
+        if not self.can_claim(pool):
             return False
+
+        # Journal the source before the node side effect. If the operator dies
+        # after resume but before the DDB migration, the retry reuses this
+        # exact warm VM instead of consuming another one.
+        real_record = db.get(real_id) or {}
+        warm_id = str(real_record.get("warm_source_id", ""))
+        if not warm_id:
+            warm_id = db.claim_warm_item(self._driver_name, pool) or ""
+            if not warm_id:
+                return False
 
         record = db.get(warm_id)
         if not record:
+            db.force_update(
+                real_id,
+                {"warm_source_id": "", "runtime_operation": ""},
+            )
             return False
+        if (record.get("pool") or None) != pool:
+            return False
+
+        db.force_update(
+            real_id,
+            {
+                "warm_source_id": warm_id,
+                "runtime_operation": "warm_resume",
+                "node": record.get("node", ""),
+                "tap_idx": int(record.get("tap_idx", 0) or 0),
+            },
+        )
+
+        def finish(driver_fields: dict) -> None:
+            # Migrate the warm runtime fields to the already-created real
+            # placeholder. Clear the journal only after the projection is
+            # complete; then remove the consumed source.
+            migrate = {
+                k: v for k, v in record.items()
+                if k not in (
+                    "id", "pool_state", "tenant_id",
+                    "created_at", "updated_at",
+                )
+            }
+            migrate.update({
+                "state": "running",
+                "warm_source_id": "",
+                "runtime_operation": "",
+                **driver_fields,
+            })
+            db.force_update(real_id, migrate)
+            db.delete(warm_id)
 
         try:
             # 用 real_id 注册 VM(后续 exec/suspend 按 real_id 路由),
             # 但从 warm_id 的快照/rootfs 恢复(本地快照在 warm_id 目录)。
             driver_fields = self._driver.resume(real_id, record, snapshot_id=warm_id)
-            # 迁移到 real_id:create_sandbox 已先 put 了一条 id=real_id 的占位记录
-            # (state=creating),故这里必须用 force_update 覆盖,不能再 db.put
-            # ——db.put 带 attribute_not_exists(id) 条件写,对已存在的 real_id 会抛
-            # ConditionalCheckFailedException,导致 claim 静默回退冷建(暖池形同虚设)。
-            # 迁移暖池实例的运行态字段(快照/tap/node/guest_ip)到占位记录上。
-            # 排除 updated_at:force_update 内部固定 SET updated_at=:now,
-            # 若 migrate 里也带 updated_at 会导致 UpdateExpression 路径重叠报错。
-            migrate = {
-                k: v for k, v in record.items()
-                if k not in ("id", "pool_state", "tenant_id", "created_at", "updated_at")
-            }
-            migrate.update({"state": "running", **driver_fields})
-            db.force_update(real_id, migrate)
-            db.delete(warm_id)
+            finish(driver_fields)
             return True
         except Exception as e:
+            # A lost HTTP response can arrive after node-agent already made
+            # the VM running. Probe the journaled node and retry the now
+            # idempotent resume once before treating the source as damaged.
+            try:
+                journal = db.get(real_id) or {}
+                if self._driver.get_runtime_state(
+                    real_id, journal
+                ) == "running":
+                    driver_fields = self._driver.resume(
+                        real_id, record, snapshot_id=warm_id
+                    )
+                    finish(driver_fields)
+                    return True
+            except Exception:
+                pass
             # resume 失败:该 warm 快照/VM 可能已损坏,删掉避免反复领到坏实例;
             # 打印异常(不静默吞)——否则暖池全回退冷建时无从排查(可观测性)。
             log_event(
                 "error", "warm_pool_claim_failed",
                 sandbox_id=warm_id, error_type=type(e).__name__,
+            )
+            db.force_update(
+                real_id,
+                {
+                    "warm_source_id": "",
+                    "runtime_operation": "",
+                    "node": "",
+                    "tap_idx": 0,
+                },
             )
             db.delete(warm_id)
             return False
@@ -87,7 +167,7 @@ class WarmPool:
     # ------------------------------------------------------------------
 
     def replenish(self) -> dict[str, int]:
-        current = db.count_warm(self._driver_name)
+        current = db.count_warm(self._driver_name, self.placement_pool)
         need    = POOL_SIZE - current
         stats = {"created": 0, "errors": 0}
         if need <= 0:
@@ -97,7 +177,9 @@ class WarmPool:
             warm_id = f"warm-{uuid.uuid4().hex[:8]}"
             try:
                 # 1. driver 层创建 VM
-                driver_fields = self._driver.create(warm_id, _BASE_SPEC)
+                driver_fields = self._driver.create(
+                    warm_id, _BASE_SPEC, pool=self.placement_pool
+                )
                 # 2. 写入 DB(replenish 绕过了 app.py create_sandbox,需手动 put)
                 db.put({
                     "id":         warm_id,
@@ -105,6 +187,7 @@ class WarmPool:
                     "state":      "running",
                     "driver":     self._driver_name,
                     "pool_state": "running",
+                    "pool":       self.placement_pool or "",
                     "updated_at": db._utcnow(),
                     **driver_fields,
                 })

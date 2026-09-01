@@ -72,11 +72,38 @@ def list_by_tenant(tenant_id: str, limit: int = 100) -> list[dict]:
 
 def list_by_states(states: list[str]) -> list[dict]:
     """
-    扫全表取 state ∈ states 的沙盒,供 reconcile 对账用。
-    POC 规模(数百沙盒)全表 scan 可接受;量大后应建 state-index GSI 改 query。
+    通过 state-updated_at-index 查询 lifecycle 状态。
+
+    老环境在 GSI 在线创建完成前会返回 ValidationException，此时暂时回退旧的
+    scan 路径，支持无停机滚动升级；新环境和索引就绪后不再做全表扫描。
     """
     if not states:
         return []
+    try:
+        items: list[dict] = []
+        for state in states:
+            kwargs: dict = {
+                "IndexName": "state-updated_at-index",
+                "KeyConditionExpression": "#s = :state",
+                "ExpressionAttributeNames": {"#s": "state"},
+                "ExpressionAttributeValues": {":state": state},
+            }
+            while True:
+                resp = _sb().query(**kwargs)
+                items.extend(resp.get("Items", []))
+                lek = resp.get("LastEvaluatedKey")
+                if not lek:
+                    break
+                kwargs["ExclusiveStartKey"] = lek
+        return [_from_dynamo(i) for i in items]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {
+            "ValidationException",
+            "ResourceNotFoundException",
+        }:
+            raise
+
+    # Rolling-upgrade fallback while the new GSI is not ACTIVE yet.
     # FilterExpression: #s IN (:s0, :s1, ...)
     placeholders = {f":s{i}": s for i, s in enumerate(states)}
     filter_expr  = "#s IN (" + ", ".join(placeholders) + ")"
@@ -175,7 +202,12 @@ def acquire_lease(sandbox_id: str, duration_s: int = LEASE_DURATION_S) -> str:
     _sb().update_item(
         Key={"id": sandbox_id},
         UpdateExpression="SET lease_id = :lid, lease_expires = :exp",
-        ConditionExpression="attribute_not_exists(lease_id) OR lease_expires < :now",
+        # Never let a late duplicate reconciler recreate a key-only item
+        # after the delete finalizer removed the sandbox projection.
+        ConditionExpression=(
+            "attribute_exists(id) AND "
+            "(attribute_not_exists(lease_id) OR lease_expires < :now)"
+        ),
         ExpressionAttributeValues={":lid": lease_id, ":exp": expires, ":now": now},
     )
     return lease_id
@@ -191,6 +223,31 @@ def release_lease(sandbox_id: str, lease_id: str) -> None:
         )
     except Exception:
         pass
+
+
+def renew_lease(
+    sandbox_id: str,
+    lease_id: str,
+    duration_s: int = LEASE_DURATION_S,
+) -> bool:
+    """Extend a per-sandbox operation lease only while this owner still holds it."""
+    try:
+        _sb().update_item(
+            Key={"id": sandbox_id},
+            UpdateExpression="SET lease_expires = :exp",
+            ConditionExpression="lease_id = :lid",
+            ExpressionAttributeValues={
+                ":lid": lease_id,
+                ":exp": _utcnow_plus(duration_s),
+            },
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) == "ConditionalCheckFailedException":
+            return False
+        raise
 
 
 # ---------- 节点心跳注册表(P0-3) ----------
@@ -279,37 +336,60 @@ def mark_warm(sandbox_id: str) -> None:
     force_update(sandbox_id, {"pool_state": "warm", "state": "warm", "driver": os.environ.get("SANDBOX_DRIVER", "firecracker")})
 
 
-def claim_warm_item(driver: str) -> str | None:
-    resp = _sb().query(
-        IndexName="pool_state-driver-index",
-        KeyConditionExpression="pool_state = :w AND driver = :d",
-        ExpressionAttributeValues={":w": "warm", ":d": driver},
-        Limit=1,
-    )
-    items = resp.get("Items", [])
-    if not items:
-        return None
-    candidate = items[0]["id"]
-    try:
-        _sb().update_item(
-            Key={"id": candidate},
-            UpdateExpression="SET pool_state = :claimed",
-            ConditionExpression="pool_state = :warm",
-            ExpressionAttributeValues={":claimed": "claimed", ":warm": "warm"},
+def _warm_items(driver: str, pool: str | None = None) -> list[dict]:
+    """List warm entries for one placement pool using the existing warm GSI."""
+    items: list[dict] = []
+    kwargs: dict = {
+        "IndexName": "pool_state-driver-index",
+        "KeyConditionExpression": "pool_state = :w AND driver = :d",
+        "ExpressionAttributeValues": {":w": "warm", ":d": driver},
+    }
+    while True:
+        resp = _sb().query(**kwargs)
+        items.extend(
+            item for item in resp.get("Items", [])
+            if (item.get("pool") or None) == pool
         )
-        return candidate
-    except Exception:
-        return None
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            return items
+        kwargs["ExclusiveStartKey"] = lek
 
 
-def count_warm(driver: str) -> int:
-    resp = _sb().query(
-        IndexName="pool_state-driver-index",
-        KeyConditionExpression="pool_state = :w AND driver = :d",
-        ExpressionAttributeValues={":w": "warm", ":d": driver},
-        Select="COUNT",
-    )
-    return resp.get("Count", 0)
+def claim_warm_item(driver: str, pool: str | None = None) -> str | None:
+    # Conditional update fences two API/operator replicas racing for the same
+    # warm entry. Continue through candidates if another replica wins first.
+    for item in _warm_items(driver, pool):
+        candidate = item["id"]
+        try:
+            _sb().update_item(
+                Key={"id": candidate},
+                UpdateExpression="SET pool_state = :claimed",
+                ConditionExpression=(
+                    "pool_state = :warm AND "
+                    "(#pool = :pool OR "
+                    "(attribute_not_exists(#pool) AND :pool = :empty))"
+                ),
+                ExpressionAttributeNames={"#pool": "pool"},
+                ExpressionAttributeValues={
+                    ":claimed": "claimed",
+                    ":warm": "warm",
+                    ":pool": pool or "",
+                    ":empty": "",
+                },
+            )
+            return candidate
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def count_warm(driver: str, pool: str | None = None) -> int:
+    return len(_warm_items(driver, pool))
 
 
 # ---------- tap_idx 分布式分配 ----------

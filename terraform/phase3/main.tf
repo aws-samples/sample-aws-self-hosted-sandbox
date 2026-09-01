@@ -5,7 +5,7 @@
 #       控制面 / node-agent / LiteLLM 等集群内资源由 stage2-control-plane 部署,不归此处。
 #
 # 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或
-#       amd64(Intel x86 i7i.8xlarge,显式开启 nested virtualization)。
+#       amd64(Intel x86 R8i/M8i/C8i/I7i,显式开启 nested virtualization)。
 #       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
 #
 # ⚠️ 计费:EKS 控制平面 + 沙盒节点按小时计费。用完务必 destroy。
@@ -55,14 +55,17 @@ variable "node_arch" {
 variable "sandbox_instance_type" {
   type        = string
   default     = ""
-  description = "Firecracker 沙盒节点实例类型。留空时 arm64=c6g.metal,amd64=i7i.8xlarge；x86 可覆盖为任意 i7i 规格。"
+  description = "Firecracker 沙盒节点实例类型。留空时 arm64=c6g.metal,amd64=r8i.8xlarge；x86 支持启用 nested virtualization 的 R8i/M8i/C8i/I7i。"
   validation {
     condition = (
       var.sandbox_instance_type == "" ||
       (var.node_arch == "arm64" && var.sandbox_instance_type == "c6g.metal") ||
-      (var.node_arch == "amd64" && can(regex("^i7i\\.", var.sandbox_instance_type)))
+      (
+        var.node_arch == "amd64" &&
+        can(regex("^(r8i|m8i|c8i|i7i)\\.", var.sandbox_instance_type))
+      )
     )
-    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 i7i 系列（例如 i7i.8xlarge）。"
+    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 R8i/M8i/C8i/I7i 系列。"
   }
 }
 
@@ -128,7 +131,7 @@ locals {
     }
     amd64 = {
       ami_type         = "AL2023_x86_64_STANDARD"
-      default_instance = "i7i.8xlarge"
+      default_instance = "r8i.8xlarge"
       fc_arch          = "x86_64"
       rootfs_key       = "rootfs/rootfs-juicefs-x86_64.tar.gz"
     }
@@ -271,7 +274,8 @@ module "eks" {
       # M2:默认 ON_DEMAND(非破坏);设 var.sandbox_capacity_type=SPOT 让沙盒池变抢占实例。
       capacity_type = var.sandbox_capacity_type
 
-      # Intel i7i 是虚拟化实例，必须显式打开 Nitro nested virtualization 才会暴露 /dev/kvm。
+      # Intel R8i/M8i/C8i/I7i 虚拟实例必须显式打开 Nitro nested
+      # virtualization 才会暴露 /dev/kvm。
       # c6g.metal 直接使用宿主 KVM，不设置该选项。
       cpu_options = var.node_arch == "amd64" ? {
         nested_virtualization = "enabled"

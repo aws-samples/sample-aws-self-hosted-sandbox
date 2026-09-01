@@ -158,6 +158,155 @@ class TestNodeAgentObservability(unittest.TestCase):
 
         self.assertNotIn(str(base), self.main._BASE_HASH_CACHE)
 
+    def test_create_is_idempotent_for_existing_running_vm(self):
+        self.main._VMS["already-running"] = {
+            "state": "running",
+            "ip": "172.18.9.2",
+        }
+        try:
+            with patch.object(self.main.subprocess, "run") as run:
+                result = self.main.op_create({
+                    "id": "already-running",
+                    "tap_idx": 9,
+                    "cpu": 2,
+                    "mem_mib": 512,
+                })
+            self.assertTrue(result["already_exists"])
+            self.assertEqual(result["ip"], "172.18.9.2")
+            run.assert_not_called()
+        finally:
+            self.main._VMS.pop("already-running", None)
+
+    def test_resume_is_idempotent_for_existing_running_vm(self):
+        self.main._VMS["already-resumed"] = {
+            "state": "running",
+            "ip": "172.18.10.2",
+        }
+        try:
+            with patch.object(
+                self.main, "_record_snapshot_verification"
+            ) as verify:
+                result = self.main.op_resume({
+                    "id": "already-resumed",
+                    "snapshot_local_path": "/must/not/be/read",
+                    "rootfs_path": "/must/not/be/read/rootfs.ext4",
+                    "tap_idx": 10,
+                })
+            verify.assert_not_called()
+            self.assertTrue(result["already_exists"])
+            self.assertEqual(result["ip"], "172.18.10.2")
+            self.assertEqual(result["restore_mode"], "existing")
+        finally:
+            self.main._VMS.pop("already-resumed", None)
+
+    def test_resume_accepts_existing_suspended_vm(self):
+        self.main._VMS["normally-suspended"] = {
+            "state": "suspended",
+            "pid": None,
+            "ip": "172.18.11.2",
+        }
+        try:
+            self.assertIsNone(
+                self.main._existing_resume_result("normally-suspended")
+            )
+        finally:
+            self.main._VMS.pop("normally-suspended", None)
+
+    def test_resume_rejects_other_existing_states(self):
+        self.main._VMS["still-paused"] = {
+            "state": "paused",
+            "pid": 123,
+        }
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError, "already exists in state paused"
+            ):
+                self.main._existing_resume_result("still-paused")
+        finally:
+            self.main._VMS.pop("still-paused", None)
+
+    def test_warm_resume_transfers_source_ownership_and_destroy_cleans_it(self):
+        source_dir = pathlib.Path(self.tmp.name) / "warm-source"
+        real_dir = pathlib.Path(self.tmp.name) / "real-sandbox"
+        (source_dir / "snap").mkdir(parents=True)
+        real_dir.mkdir()
+        self.main._VMS["warm-source"] = {
+            "state": "suspended",
+            "pid": None,
+            "dir": str(source_dir),
+        }
+
+        self.main._register_resumed_vm(
+            "real-sandbox",
+            {
+                "state": "running",
+                "pid": None,
+                "tap": "",
+                "dir": str(real_dir),
+            },
+            str(source_dir / "snap"),
+        )
+
+        self.assertNotIn("warm-source", self.main._VMS)
+        self.assertEqual(
+            set(self.main._VMS["real-sandbox"]["owned_dirs"]),
+            {str(source_dir), str(real_dir)},
+        )
+
+        # A subsequent normal suspend/resume uses real-sandbox/snap. It must
+        # preserve ownership of the original warm source for final cleanup.
+        (real_dir / "snap").mkdir()
+        self.main._VMS["real-sandbox"]["state"] = "suspended"
+        self.main._register_resumed_vm(
+            "real-sandbox",
+            {
+                "state": "running",
+                "pid": None,
+                "tap": "",
+                "dir": str(real_dir),
+            },
+            str(real_dir / "snap"),
+        )
+        self.assertEqual(
+            set(self.main._VMS["real-sandbox"]["owned_dirs"]),
+            {str(source_dir), str(real_dir)},
+        )
+
+        with patch.object(self.main, "_teardown_tap"):
+            self.main.op_destroy({"id": "real-sandbox"})
+        self.assertFalse(source_dir.exists())
+        self.assertFalse(real_dir.exists())
+
+    def test_warm_resume_rejects_active_snapshot_source(self):
+        source_dir = pathlib.Path(self.tmp.name) / "warm-active"
+        (source_dir / "snap").mkdir(parents=True)
+        self.main._VMS["warm-active"] = {
+            "state": "running",
+            "pid": 123,
+        }
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError, "snapshot source warm-active is still running"
+            ):
+                self.main._ensure_resume_source_available(
+                    "real-active", str(source_dir / "snap")
+                )
+        finally:
+            self.main._VMS.pop("warm-active", None)
+
+    def test_destroy_removes_untracked_inactive_directory(self):
+        sandbox_dir = pathlib.Path(self.tmp.name) / "untracked-stale"
+        sandbox_dir.mkdir()
+        (sandbox_dir / "stale-file").write_text("old")
+
+        with patch.object(
+            self.main, "_live_runtime_socket", return_value=None
+        ):
+            result = self.main.op_destroy({"id": "untracked-stale"})
+
+        self.assertTrue(result["deleted"])
+        self.assertFalse(sandbox_dir.exists())
+
     def test_http_observability_endpoints(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), self.main.Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

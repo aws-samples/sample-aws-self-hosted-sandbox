@@ -236,7 +236,10 @@ resource "aws_iam_role" "control_plane" {
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
-          "${local.oidc_issuer}:sub" = "system:serviceaccount:sandbox-system:sandbox-control-plane"
+          "${local.oidc_issuer}:sub" = [
+            "system:serviceaccount:sandbox-system:sandbox-control-plane",
+            "system:serviceaccount:sandbox-system:firecracker-operator",
+          ]
           "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
         }
       }
@@ -372,6 +375,18 @@ resource "kubernetes_service_account" "node_agent" {
   }
 }
 
+resource "kubernetes_service_account" "firecracker_operator" {
+  metadata {
+    name      = "firecracker-operator"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+    annotations = {
+      # Separate Kubernetes identity/RBAC, shared AWS role because both
+      # processes need the same DynamoDB/node-discovery projection.
+      "eks.amazonaws.com/role-arn" = aws_iam_role.control_plane.arn
+    }
+  }
+}
+
 # ---------- Kubernetes: RBAC ----------
 # 控制面需要操作 default namespace 的 Pod/Service/Ingress
 
@@ -394,9 +409,9 @@ resource "kubernetes_cluster_role" "control_plane" {
     verbs      = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   }
   rule {
-    api_groups = ["agents.x-k8s.io"]
-    resources  = ["sandboxes", "sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
-    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete"]
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes"]
+    verbs      = ["get", "list", "watch", "create", "patch", "delete"]
   }
 }
 
@@ -410,6 +425,34 @@ resource "kubernetes_cluster_role_binding" "control_plane" {
   subject {
     kind      = "ServiceAccount"
     name      = kubernetes_service_account.control_plane.metadata[0].name
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+}
+
+resource "kubernetes_cluster_role" "firecracker_operator" {
+  metadata { name = "firecracker-operator" }
+  rule {
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes"]
+    verbs      = ["get", "list", "watch", "create", "update", "patch"]
+  }
+  rule {
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes/status", "firecrackersandboxes/finalizers"]
+    verbs      = ["get", "update", "patch"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "firecracker_operator" {
+  metadata { name = "firecracker-operator" }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = kubernetes_cluster_role.firecracker_operator.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.firecracker_operator.metadata[0].name
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
 }
@@ -509,15 +552,30 @@ resource "kubernetes_config_map" "control_plane" {
     DYNAMODB_NODES_TABLE  = local.dynamodb_nodes # P0-3: 节点发现/reconcile
     DYNAMODB_LOCKS_TABLE  = local.dynamodb_locks # P1-4: leader 锁
     AWS_REGION            = var.region
+    CRD_CONTROL_ENABLED   = var.crd_control_enabled ? "1" : "0"
+    CRD_GROUP             = "sandbox.memorion.ai"
+    CRD_VERSION           = "v1alpha1"
+    CRD_PLURAL            = "firecrackersandboxes"
+    CRD_KIND              = "FirecrackerSandbox"
+    CRD_NAMESPACE         = kubernetes_namespace.sandbox_system.metadata[0].name
+    CRD_OPERATOR_WORKERS  = tostring(var.crd_operator_workers)
+    CRD_OPERATION_LEASE_S = "900"
+    CRD_RESYNC_S          = "20"
+    CRD_API_WAIT_S        = "700"
+    CRD_DELETE_WAIT_S     = "120"
     SANDBOX_IMAGE         = var.sandbox_image
     LITELLM_URL           = var.litellm_url
     SANDBOX_DOMAIN        = var.sandbox_domain
     K8S_NAMESPACE         = "default"
     SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
     # 默认把 suspend 快照上传 S3 作权威副本;false=只保留在节点持久状态 EBS(方案C)。
-    SNAPSHOT_TO_S3        = var.snapshot_to_s3 ? "1" : "0"
-    WARM_POOL_SIZE        = tostring(var.warm_pool_size)
-    WARM_POOL_REFILL_S    = "60"
+    SNAPSHOT_TO_S3     = var.snapshot_to_s3 ? "1" : "0"
+    WARM_POOL_SIZE     = tostring(var.warm_pool_size)
+    WARM_POOL_REFILL_S = "60"
+    # Warm entries are created on the protected pool and are only claimed by
+    # matching requests, preserving both low latency and pool isolation.
+    WARM_POOL_POOL      = "protected"
+    DEFAULT_CREATE_POOL = "protected"
     # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。
     AUTO_SLEEP_ENABLED   = var.auto_sleep_enabled
     AUTO_SLEEP_IDLE_S    = tostring(var.auto_sleep_idle_s)
@@ -618,6 +676,11 @@ resource "kubernetes_deployment" "control_plane" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_manifest.firecracker_sandbox_crd,
+    kubernetes_cluster_role_binding.control_plane,
+  ]
 }
 
 # ---------- Kubernetes: 控制面 Service ----------

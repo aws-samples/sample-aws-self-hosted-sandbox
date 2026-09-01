@@ -316,11 +316,18 @@ class TestDB(unittest.TestCase):
         from sandbox_api import db
         db.put({"id": "warm-001", "tenant_id": "pool", "state": "warm",
                 "driver": "firecracker", "pool_state": "warm",
+                "pool": "protected",
                 "updated_at": db._utcnow()})
-        claimed = db.claim_warm_item("firecracker")
+        db.put({"id": "warm-spot", "tenant_id": "pool", "state": "warm",
+                "driver": "firecracker", "pool_state": "warm",
+                "pool": "spot", "updated_at": db._utcnow()})
+        claimed = db.claim_warm_item("firecracker", "protected")
         self.assertEqual(claimed, "warm-001")
-        # 已被 claim,再取应返回 None
-        self.assertIsNone(db.claim_warm_item("firecracker"))
+        # protected 已被 claim；spot 条目不能跨池领取。
+        self.assertIsNone(db.claim_warm_item("firecracker", "protected"))
+        self.assertEqual(
+            db.claim_warm_item("firecracker", "spot"), "warm-spot"
+        )
 
     @mock_aws
     def test_list_events_single_and_global(self):
@@ -366,6 +373,56 @@ class TestFirecrackerDriver(unittest.TestCase):
         drv.destroy("sbx-test1", {**result, "tap_idx": result["tap_idx"]})
         calls = [c[1] for c in _AgentStub.calls]
         self.assertIn("/vm/destroy", calls)
+
+    @mock_aws
+    def test_confirmed_destroy_propagates_node_agent_failure(self):
+        _create_tables()
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+
+        drv = FirecrackerDriver()
+        drv._agent = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(RuntimeError("destroy not acknowledged"))
+        )
+        record = {
+            "node": "127.0.0.1:1",
+            "tap_idx": 77,
+        }
+
+        # The legacy path intentionally retains its old best-effort behavior.
+        drv.destroy("legacy-delete", record)
+        with self.assertRaisesRegex(RuntimeError, "not acknowledged"):
+            drv.destroy_confirmed("crd-delete", record)
+
+    @mock_aws
+    def test_create_reuses_journaled_node_and_tap(self):
+        _create_tables()
+        from sandbox_api import db
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        from sandbox_api.driver import SandboxSpec
+
+        db.put({
+            "id": "sbx-retry",
+            "tenant_id": "t1",
+            "state": "creating",
+            "driver": "firecracker",
+            "node": f"127.0.0.1:{_STUB_PORT}",
+            "tap_idx": 77,
+            "updated_at": db._utcnow(),
+        })
+        _AgentStub.calls.clear()
+
+        result = FirecrackerDriver().create(
+            "sbx-retry",
+            SandboxSpec(image="min", cpu=1, mem_mib=256),
+        )
+
+        self.assertEqual(result["tap_idx"], 77)
+        self.assertEqual(result["node"], f"127.0.0.1:{_STUB_PORT}")
+        self.assertNotIn(
+            "/vm/create",
+            [path for method, path, _body in _AgentStub.calls
+             if method == "POST"],
+        )
 
     @mock_aws
     def test_suspend_and_resume(self):
@@ -723,6 +780,9 @@ class TestCustomImage(unittest.TestCase):
         # 关键:末段永远不含 / . 等路径字符(正则限定 [A-Za-z0-9_-]),故无路径注入。
         self.assertEqual(normalize_image("../../etc/passwd"), "passwd")
         self.assertEqual(normalize_image("web/../x"), "x")
+        configured = "123.dkr.ecr.us-east-1.amazonaws.com/claude-sbx:poc"
+        with patch.dict(os.environ, {"SANDBOX_IMAGE": configured}):
+            self.assertEqual(normalize_image(configured), "min")
 
     @mock_aws
     def test_admin_images(self):
@@ -912,25 +972,79 @@ class TestWarmPool(unittest.TestCase):
         import os as _os
         self.assertIn("FC_NODES", _os.environ, "FC_NODES not set")
         pool.replenish()
-        count = db.count_warm("firecracker")
+        count = db.count_warm("firecracker", "protected")
         self.assertEqual(count, 2, f"warm count={count}, FC_NODES={_os.environ.get('FC_NODES')}")
 
         # claim 一个
         spec = SandboxSpec(image="t", cpu=1, mem_mib=256)
-        ok = pool.claim("real-sbx-1", spec)
+        ok = pool.claim("real-sbx-1", spec, pool="protected")
         self.assertTrue(ok)
 
         # 池子减一
-        self.assertEqual(db.count_warm("firecracker"), 1)
+        self.assertEqual(db.count_warm("firecracker", "protected"), 1)
 
         # claim 第二个
-        ok2 = pool.claim("real-sbx-2", spec)
+        ok2 = pool.claim("real-sbx-2", spec, pool="protected")
         self.assertTrue(ok2)
-        self.assertEqual(db.count_warm("firecracker"), 0)
+        self.assertEqual(db.count_warm("firecracker", "protected"), 0)
 
         # 池子空了,claim 应返回 False
-        ok3 = pool.claim("real-sbx-3", spec)
+        ok3 = pool.claim("real-sbx-3", spec, pool="protected")
         self.assertFalse(ok3)
+
+        # protected 暖池不能服务 spot 请求。
+        self.assertFalse(pool.claim("real-sbx-4", spec, pool="spot"))
+
+    @mock_aws
+    def test_claim_reuses_journaled_warm_source_after_retry(self):
+        _create_tables()
+        from sandbox_api.warm_pool import WarmPool
+        from sandbox_api.driver import SandboxSpec
+        from sandbox_api import db
+
+        class Driver:
+            def __init__(self):
+                self.sources = []
+
+            def resume(self, sid, record, snapshot_id=None):
+                self.sources.append(snapshot_id)
+                return {
+                    "node": record["node"],
+                    "tap_idx": record["tap_idx"],
+                    "guest_ip": "172.18.9.2",
+                }
+
+        db.put({
+            "id": "real-retry",
+            "tenant_id": "t",
+            "state": "creating",
+            "driver": "firecracker",
+            "pool": "protected",
+            "warm_source_id": "warm-retry",
+            "updated_at": db._utcnow(),
+        })
+        db.put({
+            "id": "warm-retry",
+            "tenant_id": "__pool__",
+            "state": "warm",
+            "driver": "firecracker",
+            "pool_state": "claimed",
+            "pool": "protected",
+            "node": "10.0.0.10",
+            "tap_idx": 9,
+            "updated_at": db._utcnow(),
+        })
+        driver = Driver()
+        pool = WarmPool("firecracker", driver)
+        spec = SandboxSpec(image="min", cpu=1, mem_mib=256)
+
+        self.assertTrue(
+            pool.claim("real-retry", spec, pool="protected")
+        )
+        self.assertEqual(driver.sources, ["warm-retry"])
+        self.assertEqual(db.get("real-retry")["state"], "running")
+        self.assertEqual(db.get("real-retry")["warm_source_id"], "")
+        self.assertIsNone(db.get("warm-retry"))
 
 
 class TestAPIAuth(unittest.TestCase):
