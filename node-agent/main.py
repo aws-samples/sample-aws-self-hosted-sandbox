@@ -29,16 +29,18 @@ import os
 import re
 import signal
 import shutil
-import signal
 import socket
+import ssl
 import subprocess
 import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from observability import (
     FC_RESUME_INFLIGHT,
@@ -110,6 +112,8 @@ NODE_ID      = os.environ.get("NODE_ID", socket.gethostname())
 
 # ---------- 心跳注册(P0-3:控制面按 last_seen 判活,替换 FC_NODES 硬编码)----------
 NODES_TABLE       = os.environ.get("DYNAMODB_NODES_TABLE", "sandbox_nodes")
+SANDBOXES_TABLE   = os.environ.get("DYNAMODB_TABLE", "sandboxes")
+EVENTS_TABLE      = os.environ.get("DYNAMODB_EVENTS_TABLE", "sandbox_events")
 HEARTBEAT_EVERY_S = int(os.environ.get("HEARTBEAT_EVERY_S", "30"))
 # 上报给控制面的节点标识:必须是控制面能 HTTP 连到 node-agent 的地址。
 # 默认自动探测主网卡内网 IP;可用 NODE_ADVERTISE_IP 覆盖。
@@ -123,9 +127,51 @@ RECLAIM_WATCH         = os.environ.get("RECLAIM_WATCH_ENABLED", "1").lower() in 
 RECLAIM_POLL_S        = int(os.environ.get("RECLAIM_POLL_S", "5"))
 # =0(默认)DRY-RUN 只记录计划;=1 才真正触发疏散(打 Diff 快照到持久 EBS)。
 RECLAIM_AUTO_EVACUATE = os.environ.get("RECLAIM_AUTO_EVACUATE", "0").lower() in ("1", "true")
+RECLAIM_SNAPSHOT_CONCURRENCY = max(
+    1, int(os.environ.get("RECLAIM_SNAPSHOT_CONCURRENCY", "12"))
+)
+RECLAIM_BUDGET_S = max(10, int(os.environ.get("RECLAIM_BUDGET_S", "120")))
+# 在实例终止前留出写 journal、fsync、控制面观测的尾部预算。
+RECLAIM_COMMIT_RESERVE_S = max(
+    2, int(os.environ.get("RECLAIM_COMMIT_RESERVE_S", "8"))
+)
+NODE_RECOVERY_ROLE = os.environ.get("NODE_RECOVERY_ROLE", "").strip().lower()
+NODE_RECOVERY_GROUP = os.environ.get("NODE_RECOVERY_GROUP", "").strip()
+STATE_VOLUME_ID_OVERRIDE = os.environ.get("STATE_VOLUME_ID", "").strip()
+NODE_LABEL_REFRESH_S = max(
+    5, int(os.environ.get("NODE_LABEL_REFRESH_S", "30"))
+)
+K8S_SERVICE_ACCOUNT_DIR = os.environ.get(
+    "K8S_SERVICE_ACCOUNT_DIR",
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+)
+CLOUD_INIT_STATUS_PATH = os.environ.get(
+    "CLOUD_INIT_STATUS_PATH",
+    "/host/var/lib/cloud/data/status.json",
+)
+NODE_BOOTSTRAP_MARKER = os.environ.get(
+    "NODE_BOOTSTRAP_MARKER",
+    "/opt/sbx/.bootstrap-complete",
+)
+NODE_BOOTSTRAP_WAIT_S = max(
+    0, int(os.environ.get("NODE_BOOTSTRAP_WAIT_S", "900"))
+)
+NODE_STABILITY_MIN_AGE_S = max(
+    0, int(os.environ.get("NODE_STABILITY_MIN_AGE_S", "180"))
+)
 # 最近一次回收检测/疏散计划(供 GET /reclaim/status 观测;injected 供测试注入)
 _RECLAIM_STATE: dict = {"detected": False, "signal": None, "at": None,
                         "plan": None, "evacuated": False, "injected": None}
+_INSTANCE_ID_CACHE = ""
+_AZ_CACHE = ""
+_STATE_VOLUME_CACHE = ""
+_NODE_RECOVERY_IDENTITY_CACHE: dict[str, object] = {
+    "role": "",
+    "group": "",
+    "resolved": False,
+    "fetched_at": 0.0,
+}
+_NODE_RECOVERY_IDENTITY_LOCK = threading.Lock()
 
 # ---------- JuiceFS 配置（方案 B：workspace 在 S3，快照不含磁盘）----------
 JUICEFS_ENABLED    = os.environ.get("JUICEFS_ENABLED", "false").lower() == "true"
@@ -143,6 +189,68 @@ _HEARTBEAT_LAST_SUCCESS = 0.0
 _HEARTBEAT_LAST_ITERATION = time.monotonic()
 
 os.makedirs(SBX_BASE, exist_ok=True)
+
+
+def _node_bootstrap_ready() -> bool:
+    """Only advertise after bootstrap and a fresh-node stability window.
+
+    The explicit marker is written at the very end of our custom bootstrap and
+    is authoritative. Older launch templates do not write it, so they must
+    satisfy both cloud-init completion and a minimum Kubernetes Node age. This
+    keeps the agent from accepting work before a late kubelet/containerd
+    restart rebuilds its pod sandbox.
+    """
+    if NODE_BOOTSTRAP_MARKER and os.path.exists(NODE_BOOTSTRAP_MARKER):
+        return True
+    try:
+        with open(CLOUD_INIT_STATUS_PATH, encoding="utf-8") as status_file:
+            status = json.load(status_file)
+        stages = status.get("v1", {})
+        final = stages.get("modules-final", {})
+        if not final.get("finished") or final.get("errors"):
+            return False
+        if any(
+            stage.get("errors")
+            for stage in stages.values()
+            if isinstance(stage, dict)
+        ):
+            return False
+        if NODE_STABILITY_MIN_AGE_S == 0:
+            return True
+        metadata = _fetch_node_object().get("metadata", {})
+        created_at = str(metadata.get("creationTimestamp", "")).strip()
+        if not created_at:
+            return False
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - created).total_seconds()
+        return age_s >= NODE_STABILITY_MIN_AGE_S
+    except (OSError, ValueError, TypeError, RuntimeError, urllib.error.URLError):
+        return False
+
+
+def _wait_for_node_bootstrap() -> None:
+    if NODE_BOOTSTRAP_WAIT_S == 0:
+        return
+    deadline = time.monotonic() + NODE_BOOTSTRAP_WAIT_S
+    last_log = 0.0
+    while not _node_bootstrap_ready():
+        now = time.monotonic()
+        if now >= deadline:
+            raise TimeoutError(
+                "node bootstrap did not complete within "
+                f"{NODE_BOOTSTRAP_WAIT_S}s"
+            )
+        if now - last_log >= 30:
+            print(
+                "[bootstrap] waiting for cloud-init/custom bootstrap "
+                "completion",
+                flush=True,
+            )
+            last_log = now
+        time.sleep(2)  # nosemgrep: arbitrary-sleep -- node startup gate
+    print("[bootstrap] node is stable and ready for Firecracker", flush=True)
 
 
 def _vm_op_lock(sandbox_id: str) -> threading.RLock:
@@ -303,7 +411,13 @@ def _tap_idx_from_d(d: str) -> int:
 
 # ---------- Firecracker UDS HTTP ----------
 
-def _fc(sock: str, method: str, path: str, body=None, timeout: int = 15) -> dict:
+def _fc(
+    sock: str,
+    method: str,
+    path: str,
+    body=None,
+    timeout: float = 15,
+) -> dict:
     conn = http.client.HTTPConnection("localhost", timeout=timeout)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -774,43 +888,61 @@ def op_suspend(body: dict) -> dict:
     diff_mem   = f"{snap_dir}/vm.mem"
     has_base   = os.path.exists(base_mem)
 
-    # snapshot/create 超时:内存越大越久;多个并发共享 EBS 带宽会显著拉长。留足 600s。
-    SNAP_TIMEOUT = 600
+    # 正常 suspend 留足 600s；Spot 疏散会传入剩余 deadline，确保阻塞中的
+    # Firecracker API 调用不会越过 120s 终止窗口。
+    snapshot_budget_s = max(
+        0.1, min(600.0, float(body.get("snapshot_timeout_s", 600)))
+    )
+    snapshot_started = time.monotonic()
+
+    def remaining_snapshot_timeout() -> float:
+        remaining = snapshot_budget_s - (
+            time.monotonic() - snapshot_started
+        )
+        if remaining <= 0:
+            raise TimeoutError("snapshot deadline exhausted")
+        return max(0.1, remaining)
 
     t0 = time.monotonic()
     snap_type = "diff"
-    if not has_base:
-        # 无 base:Full 快照,同时保留一份作 base(供本 sandbox 后续 Diff)
-        snap_type = "full"
-        _fc(sock, "PUT", "/snapshot/create", {
-            "snapshot_type": "Full",
-            "snapshot_path": diff_snap,
-            "mem_file_path": diff_mem,
-        }, timeout=SNAP_TIMEOUT)
-        import shutil as _sh
-        _sh.copy2(diff_snap, base_snap)
-        _sh.copy2(diff_mem,  base_mem)
-    else:
-        # 有 base:Diff 快照(只写自 base 以来的脏页)
-        try:
-            _fc(sock, "PUT", "/snapshot/create", {
-                "snapshot_type": "Diff",
-                "snapshot_path": diff_snap,
-                "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
-        except Exception:
-            # Diff 失败(如未开 track_dirty_pages)→ 降级 Full
-            snap_type = "full-fallback"
+    try:
+        if not has_base:
+            # 无 base:Full 快照,同时保留一份作 base(供本 sandbox 后续 Diff)。
+            # 状态盘使用 reflink-enabled XFS，避免物理复制整份内存文件再次消耗
+            # EBS 吞吐和 120s 预算。
+            snap_type = "full"
             _fc(sock, "PUT", "/snapshot/create", {
                 "snapshot_type": "Full",
                 "snapshot_path": diff_snap,
                 "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
-    dt = time.monotonic() - t0
+            }, timeout=remaining_snapshot_timeout())
+            subprocess.run(
+                ["cp", "--reflink=auto", diff_snap, base_snap],
+                check=True,
+            )
+            subprocess.run(
+                ["cp", "--reflink=auto", diff_mem, base_mem],
+                check=True,
+            )
+        else:
+            # 有 base:Diff 快照(只写自 base 以来的脏页)
+            try:
+                _fc(sock, "PUT", "/snapshot/create", {
+                    "snapshot_type": "Diff",
+                    "snapshot_path": diff_snap,
+                    "mem_file_path": diff_mem,
+                }, timeout=remaining_snapshot_timeout())
+            except Exception:
+                # Diff 失败(如未开 track_dirty_pages)→ 降级 Full，但必须
+                # 继续复用原始硬截止时间，不能重新获得一整份 timeout。
+                snap_type = "full-fallback"
+                _fc(sock, "PUT", "/snapshot/create", {
+                    "snapshot_type": "Full",
+                    "snapshot_path": diff_snap,
+                    "mem_file_path": diff_mem,
+                }, timeout=remaining_snapshot_timeout())
 
-    # suspend 只有在完整性清单落盘并立即回读通过后才算成功。失败时 VMM
-    # 仍只是 Paused，先恢复运行再把错误交给控制面回滚状态。
-    try:
+        # suspend 只有在完整性清单落盘并立即回读通过后才算成功。
         _write_snapshot_manifest(snap_dir)
         _record_snapshot_verification(snap_dir)
     except Exception:
@@ -818,7 +950,10 @@ def op_suspend(body: dict) -> dict:
             _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
         except Exception:
             pass
+        with _LOCK:
+            vm["state"] = "running"
         raise
+    dt = time.monotonic() - t0
 
     # 方案C:快照写在持久状态 EBS 上(snap_dir),spot 终止后卷幸存,
     # 故【不传 S3】——删掉最慢的 S3 传输,是 120s 窗口内跑满 50 个的关键。
@@ -1261,7 +1396,21 @@ def op_health() -> dict:
     mem = _free_mem_mib()
     with _LOCK:
         count = len(_VMS)
-    return {"node_id": NODE_ID, "free_mem_mib": mem, "vm_count": count}
+        draining = bool(_RECLAIM_STATE.get("detected"))
+    recovery_role, recovery_group, _ = _node_recovery_identity()
+    state_volume_id = _state_volume_id()
+    return {
+        "node_id": NODE_ID,
+        "free_mem_mib": mem,
+        "vm_count": count,
+        "pool": _detect_pool(),
+        "draining": draining,
+        "recovery_role": _effective_recovery_role(recovery_role),
+        "recovery_group": recovery_group,
+        "instance_id": _instance_id(),
+        "availability_zone": _availability_zone(),
+        "state_volume_id": state_volume_id,
+    }
 
 
 def _scratch_bytes() -> tuple[int, int]:
@@ -1360,23 +1509,70 @@ def _heartbeat_once() -> None:
     只保证装了 awscli,容器里 python3 版本可能与 boto3 安装目标不一致(实测踩坑)。
     """
     global _HEARTBEAT_LAST_SUCCESS
-    from datetime import datetime, timezone
     with _LOCK:
         vm_count = len(_VMS)
-    item = {
-        "node_id":      {"S": NODE_ID},
-        "ip":           {"S": _advertise_ip()},
-        "free_mem_mib": {"N": str(_free_mem_mib())},
-        "vm_count":     {"N": str(vm_count)},
-        "last_seen":    {"S": datetime.now(timezone.utc).isoformat()},
+        draining = bool(_RECLAIM_STATE.get("detected"))
+        reclaim_phase = str(
+            (_RECLAIM_STATE.get("plan") or {}).get("phase", "")
+        )
+        reclaim_session_id = str(
+            (_RECLAIM_STATE.get("plan") or {}).get("session_id", "")
+        )
+    configured_role, recovery_group, identity_resolved = (
+        _node_recovery_identity()
+    )
+    if not identity_resolved:
+        raise RuntimeError(
+            f"cannot resolve recovery identity for Kubernetes node {NODE_ID}"
+        )
+    state_volume_id = _state_volume_id()
+    # 用 UpdateItem 而不是 PutItem：恢复控制器会在同一节点记录上原子写入
+    # recovery_claim_id。心跳必须保留该字段，不能每 30 秒整条覆盖掉。
+    names = {
+        "#ip": "ip",
+        "#free": "free_mem_mib",
+        "#vms": "vm_count",
+        "#seen": "last_seen",
+        "#pool": "pool",
+        "#iid": "instance_id",
+        "#az": "availability_zone",
+        "#vol": "state_volume_id",
+        "#role": "recovery_role",
+        "#recovery_group": "recovery_group",
+        "#draining": "draining",
+        "#phase": "reclaim_phase",
+        "#session": "reclaim_session_id",
+    }
+    values = {
+        ":ip": {"S": _advertise_ip()},
+        ":free": {"N": str(_free_mem_mib())},
+        ":vms": {"N": str(vm_count)},
+        ":seen": {"S": datetime.now(timezone.utc).isoformat()},
         # M2:节点池归属(spot / protected),控制面据此做放置决策。
-        "pool":         {"S": _detect_pool()},
+        ":pool": {"S": _detect_pool()},
+        ":iid": {"S": _instance_id()},
+        ":az": {"S": _availability_zone()},
+        ":vol": {"S": state_volume_id},
+        ":role": {"S": _effective_recovery_role(configured_role)},
+        ":recovery_group": {"S": recovery_group},
+        ":draining": {"BOOL": draining},
+        ":phase": {"S": reclaim_phase},
+        ":session": {"S": reclaim_session_id},
     }
     subprocess.run(
-        ["aws", "dynamodb", "put-item",
+        ["aws", "dynamodb", "update-item",
          "--table-name", NODES_TABLE,
          "--region", AWS_REGION,
-         "--item", json.dumps(item)],
+         "--key", json.dumps({"node_id": {"S": NODE_ID}}),
+         "--update-expression",
+         (
+             "SET #ip=:ip, #free=:free, #vms=:vms, #seen=:seen, "
+             "#pool=:pool, #iid=:iid, #az=:az, #vol=:vol, #role=:role, "
+             "#recovery_group=:recovery_group, #draining=:draining, "
+             "#phase=:phase, #session=:session"
+         ),
+         "--expression-attribute-names", json.dumps(names),
+         "--expression-attribute-values", json.dumps(values)],
         check=True, capture_output=True, text=True,
     )
     _HEARTBEAT_LAST_SUCCESS = time.monotonic()
@@ -1493,6 +1689,301 @@ def _imds_get(path: str, token: str | None) -> tuple[int, str]:
         return 0, ""           # IMDS 不可达(本地/非 EC2)
 
 
+def _metadata_value(path: str) -> str:
+    token = _imds_token()
+    status, body = _imds_get(path, token)
+    return (body or "").strip() if status == 200 else ""
+
+
+def _instance_id() -> str:
+    global _INSTANCE_ID_CACHE
+    if not _INSTANCE_ID_CACHE:
+        _INSTANCE_ID_CACHE = _metadata_value(
+            "/latest/meta-data/instance-id"
+        )
+    return _INSTANCE_ID_CACHE
+
+
+def _availability_zone() -> str:
+    global _AZ_CACHE
+    if not _AZ_CACHE:
+        _AZ_CACHE = _metadata_value(
+            "/latest/meta-data/placement/availability-zone"
+        )
+    return _AZ_CACHE
+
+
+def _normalize_volume_id(raw: str) -> str:
+    value = (raw or "").strip().lower().replace(" ", "")
+    if not value:
+        return ""
+    if value.startswith("vol-"):
+        return value
+    if value.startswith("vol") and len(value) > 3:
+        return f"vol-{value[3:]}"
+    return ""
+
+
+def _fetch_node_object() -> dict:
+    """Read this pod's Kubernetes Node object through the in-cluster API."""
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+    if not host or not NODE_ID:
+        raise RuntimeError("Kubernetes service address or NODE_ID is missing")
+    token_path = os.path.join(K8S_SERVICE_ACCOUNT_DIR, "token")
+    ca_path = os.path.join(K8S_SERVICE_ACCOUNT_DIR, "ca.crt")
+    with open(token_path, encoding="utf-8") as token_file:
+        token = token_file.read().strip()
+    request = urllib.request.Request(
+        f"https://{host}:{port}/api/v1/nodes/{quote(NODE_ID, safe='')}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    context = ssl.create_default_context(cafile=ca_path)
+    with urllib.request.urlopen(
+        request, timeout=2, context=context
+    ) as response:
+        payload = json.loads(response.read().decode())
+    if not isinstance(payload, dict):
+        raise RuntimeError("Kubernetes Node response is not an object")
+    return payload
+
+
+def _fetch_node_labels() -> dict[str, str]:
+    """Read this pod's Kubernetes Node labels through the in-cluster API."""
+    payload = _fetch_node_object()
+    labels = payload.get("metadata", {}).get("labels", {})
+    return {
+        str(key): str(value)
+        for key, value in labels.items()
+    }
+
+
+def _node_recovery_identity(
+    force: bool = False,
+) -> tuple[str, str, bool]:
+    """Resolve role/group from Node labels, retaining the last good result.
+
+    Downward API metadata.labels refers to Pod labels, not Node labels. A
+    failed first lookup is therefore reported as unresolved instead of
+    guessing that a root-only standby is active.
+    """
+    now = time.monotonic()
+    with _NODE_RECOVERY_IDENTITY_LOCK:
+        cached = dict(_NODE_RECOVERY_IDENTITY_CACHE)
+    if (
+        not force
+        and bool(cached.get("resolved"))
+        and now - float(cached.get("fetched_at", 0.0))
+        < NODE_LABEL_REFRESH_S
+    ):
+        return (
+            str(cached.get("role", "")),
+            str(cached.get("group", "")),
+            True,
+        )
+    try:
+        labels = _fetch_node_labels()
+        role = (
+            labels.get("sandbox.memorion.ai/recovery-role")
+            or NODE_RECOVERY_ROLE
+            or "active"
+        ).strip().lower()
+        if role not in {"active", "standby"}:
+            raise RuntimeError(f"invalid recovery role label: {role!r}")
+        group = (
+            labels.get("sandbox.memorion.ai/recovery-group")
+            or NODE_RECOVERY_GROUP
+        ).strip()
+        resolved = {
+            "role": role,
+            "group": group,
+            "resolved": True,
+            "fetched_at": now,
+        }
+        with _NODE_RECOVERY_IDENTITY_LOCK:
+            _NODE_RECOVERY_IDENTITY_CACHE.update(resolved)
+        return role, group, True
+    except Exception:
+        if bool(cached.get("resolved")):
+            return (
+                str(cached.get("role", "")),
+                str(cached.get("group", "")),
+                True,
+            )
+        if NODE_RECOVERY_ROLE in {"active", "standby"}:
+            return NODE_RECOVERY_ROLE, NODE_RECOVERY_GROUP, True
+        return "unknown", "", False
+
+
+def _configured_recovery_role() -> str:
+    role, _, _ = _node_recovery_identity()
+    return role
+
+
+def _findmnt_field(target: str, field: str) -> str:
+    try:
+        return subprocess.run(
+            ["findmnt", "-n", "-o", field, "--target", target],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _state_volume_device(volume_id: str = "") -> str:
+    """Return the local NVMe device backing the state volume.
+
+    Nitro exposes EBS volumes as NVMe devices and the requested /dev/sdf name
+    is not stable. Match by EBS serial first; otherwise inspect the mounted
+    filesystem. ``/opt/sbx`` is a hostPath on the host root filesystem, so its
+    device identity is a stable baseline: an empty standby has the same
+    MAJ:MIN for ``/var/lib/sbx`` and ``/opt/sbx``; a recovered standby has a
+    distinct state-EBS MAJ:MIN even after the node-agent Pod restarts.
+    """
+    target = _normalize_volume_id(volume_id)
+    if target:
+        compact = target.replace("-", "")
+        for path in (
+            f"/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{compact}",
+            f"/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{target}",
+        ):
+            if os.path.exists(path):
+                return os.path.realpath(path)
+        try:
+            out = subprocess.run(
+                ["lsblk", "-ndo", "PATH,SERIAL"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and _normalize_volume_id(parts[-1]) == target:
+                    return parts[0]
+        except Exception:
+            return ""
+
+    source = _findmnt_field(SBX_BASE, "SOURCE")
+    state_device_id = _findmnt_field(SBX_BASE, "MAJ:MIN")
+    root_device_id = _findmnt_field(ROOTFS_DIR, "MAJ:MIN")
+    if (
+        not source.startswith("/dev/")
+        or not state_device_id
+        or not root_device_id
+        or state_device_id == root_device_id
+    ):
+        return ""
+    # Bind-mounted root paths can be rendered as
+    # /dev/nvme0n1p1[/var/lib/sbx]. Strip the optional bind suffix before
+    # resolving the device path.
+    return os.path.realpath(source.split("[", 1)[0])
+
+
+def _state_volume_id() -> str:
+    global _STATE_VOLUME_CACHE
+    if STATE_VOLUME_ID_OVERRIDE:
+        return _normalize_volume_id(STATE_VOLUME_ID_OVERRIDE)
+    if _STATE_VOLUME_CACHE:
+        return _STATE_VOLUME_CACHE
+    device = _state_volume_device()
+    if not device:
+        return ""
+    try:
+        serial = subprocess.run(
+            ["lsblk", "-ndo", "SERIAL", device],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _STATE_VOLUME_CACHE = _normalize_volume_id(serial)
+    except Exception:
+        _STATE_VOLUME_CACHE = ""
+    return _STATE_VOLUME_CACHE
+
+
+def _effective_recovery_role(configured: str) -> str:
+    # A standby becomes an active recovery node as soon as a state EBS is
+    # mounted. The Kubernetes label can stay immutable; heartbeat reflects the
+    # real role used for placement and atomic standby claiming.
+    attached_state_volume = (
+        _normalize_volume_id(STATE_VOLUME_ID_OVERRIDE)
+        or _STATE_VOLUME_CACHE
+    )
+    if configured == "standby" and attached_state_volume:
+        return "active"
+    return configured
+
+
+def _recovery_role() -> str:
+    _state_volume_id()
+    return _effective_recovery_role(_configured_recovery_role())
+
+
+def op_recovery_mount(body: dict) -> dict:
+    """Mount an attached, pre-existing state EBS on a warm standby.
+
+    EC2 attachment is performed by the control-plane IRSA role. This privileged
+    hostNetwork/hostPID DaemonSet only discovers the Nitro NVMe device by EBS
+    serial and mounts it at the canonical path required by Firecracker
+    snapshots. mountPropagation=Bidirectional makes the host see the mount.
+    """
+    global _STATE_VOLUME_CACHE
+    volume_id = _normalize_volume_id(str(body.get("volume_id", "")))
+    if not volume_id:
+        raise ValueError("volume_id is required")
+    with _LOCK:
+        resident = sorted(_VMS)
+    if resident:
+        raise RuntimeError(
+            "standby has resident sandboxes and cannot take over volume: "
+            f"{resident}"
+        )
+
+    timeout_s = max(1, min(180, int(body.get("timeout_s", 90))))
+    deadline = time.monotonic() + timeout_s
+    device = ""
+    while time.monotonic() < deadline:
+        device = _state_volume_device(volume_id)
+        if device:
+            break
+        time.sleep(1)  # nosemgrep: arbitrary-sleep -- wait Nitro device attach
+    if not device:
+        raise TimeoutError(f"attached device for {volume_id} not found")
+
+    try:
+        mounted_source = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", SBX_BASE],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except Exception:
+        mounted_source = ""
+    if mounted_source and os.path.realpath(mounted_source) == os.path.realpath(device):
+        _STATE_VOLUME_CACHE = volume_id
+        return {
+            "mounted": True,
+            "already_mounted": True,
+            "volume_id": volume_id,
+            "device": device,
+            "sandbox_dirs": sorted(os.listdir(SBX_BASE)),
+        }
+
+    os.makedirs(SBX_BASE, exist_ok=True)
+    subprocess.run(["sync"], check=False)
+    # The standby path initially lives on the root filesystem. Mounting the
+    # recovered XFS over it is safe because it contains no sandbox runtime.
+    subprocess.run(
+        ["mount", "-t", "xfs", "-o", "noatime,nouuid", device, SBX_BASE],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(["sync"], check=False)
+    _STATE_VOLUME_CACHE = volume_id
+    return {
+        "mounted": True,
+        "already_mounted": False,
+        "volume_id": volume_id,
+        "device": device,
+        "sandbox_dirs": sorted(os.listdir(SBX_BASE)),
+    }
+
+
 # ---------- 节点池归属(M2:受保护池 / 抢占池分离)----------
 # 每个节点属于一个"池":
 #   spot      —— 抢占实例,随时可能被回收。空闲/可疏散的沙盒优先放这里(便宜)。
@@ -1556,6 +2047,286 @@ def _local_running_vms() -> list[str]:
         return [sid for sid, vm in _VMS.items() if vm.get("state") == "running"]
 
 
+def _has_local_sandbox_state() -> bool:
+    """Return whether the state EBS contains any managed sandbox directory."""
+    try:
+        return any(
+            entry.is_dir(follow_symlinks=False)
+            and _managed_sandbox_dir(entry.path)
+            for entry in os.scandir(SBX_BASE)
+        )
+    except OSError:
+        return False
+
+
+def _dynamodb_attr(value) -> dict:
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, (int, float)):
+        return {"N": str(value)}
+    return {"S": str(value)}
+
+
+def _update_sandbox_recovery(sid: str, fields: dict) -> tuple[bool, str]:
+    """Best-effort durable progress journal for the 120s reclaim path.
+
+    Snapshot persistence must continue even if DynamoDB is briefly
+    unavailable, so callers record the error but never fail the local
+    checkpoint solely because the journal write failed.
+    """
+    if not SANDBOXES_TABLE:
+        return False, "DYNAMODB_TABLE is empty"
+    names = {"#id": "id"}
+    values: dict[str, dict] = {}
+    sets: list[str] = []
+    for idx, (key, value) in enumerate(fields.items()):
+        name = f"#f{idx}"
+        token = f":v{idx}"
+        names[name] = key
+        values[token] = _dynamodb_attr(value)
+        sets.append(f"{name}={token}")
+    try:
+        subprocess.run(
+            [
+                "aws", "dynamodb", "update-item",
+                "--table-name", SANDBOXES_TABLE,
+                "--region", AWS_REGION,
+                "--key", json.dumps({"id": {"S": sid}}),
+                "--update-expression", "SET " + ", ".join(sets),
+                "--condition-expression", "attribute_exists(#id)",
+                "--expression-attribute-names", json.dumps(names),
+                "--expression-attribute-values", json.dumps(values),
+            ],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:512]
+
+
+def _signal_deadline(signal: dict) -> tuple[datetime, datetime]:
+    """Return (termination_deadline, checkpoint_deadline).
+
+    EC2 interruption notices normally include the future termination time.
+    Rebalance recommendations and local simulations may not, so those receive
+    the configured 120-second budget from detection.
+    """
+    now = datetime.now(timezone.utc)
+    termination = now + timedelta(seconds=RECLAIM_BUDGET_S)
+    raw = str(signal.get("time", "")).strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            # Ignore stale injection timestamps and implausibly distant times.
+            if now + timedelta(seconds=5) < parsed < now + timedelta(hours=1):
+                termination = parsed
+        except ValueError:
+            pass
+    checkpoint = termination - timedelta(seconds=RECLAIM_COMMIT_RESERVE_S)
+    return termination, max(checkpoint, now + timedelta(seconds=1))
+
+
+def _preserve_state_volume() -> dict:
+    """Make the state EBS survive this instance's imminent termination.
+
+    State disks are normally DeleteOnTermination=true so failed bootstrap and
+    ordinary unhealthy-node replacement cannot leak expensive orphan volumes.
+    The Spot critical path flips only the current state attachment to false
+    before checkpoint I/O starts, then verifies the EC2 attachment setting.
+    """
+    instance_id = _instance_id()
+    volume_id = _state_volume_id()
+    if not instance_id or not volume_id:
+        raise RuntimeError(
+            "cannot preserve state volume without instance_id and volume_id"
+        )
+
+    described = subprocess.run(
+        [
+            "aws", "ec2", "describe-volumes",
+            "--region", AWS_REGION,
+            "--volume-ids", volume_id,
+            "--output", "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(described.stdout or "{}")
+    attachments = (
+        (payload.get("Volumes") or [{}])[0].get("Attachments") or []
+    )
+    attachment = next(
+        (
+            item for item in attachments
+            if item.get("InstanceId") == instance_id
+        ),
+        None,
+    )
+    if not attachment or not attachment.get("Device"):
+        raise RuntimeError(
+            f"{volume_id} is not attached to {instance_id}"
+        )
+    device = str(attachment["Device"])
+    subprocess.run(
+        [
+            "aws", "ec2", "modify-instance-attribute",
+            "--region", AWS_REGION,
+            "--instance-id", instance_id,
+            "--block-device-mappings",
+            json.dumps([{
+                "DeviceName": device,
+                "Ebs": {"DeleteOnTermination": False},
+            }]),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    verified = subprocess.run(
+        [
+            "aws", "ec2", "describe-instances",
+            "--region", AWS_REGION,
+            "--instance-ids", instance_id,
+            "--output", "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    instances = [
+        item
+        for reservation in (
+            json.loads(verified.stdout or "{}").get("Reservations") or []
+        )
+        for item in reservation.get("Instances") or []
+    ]
+    mappings = instances[0].get("BlockDeviceMappings") if instances else []
+    mapping = next(
+        (
+            item for item in mappings or []
+            if item.get("Ebs", {}).get("VolumeId") == volume_id
+        ),
+        None,
+    )
+    if (
+        not mapping
+        or mapping.get("Ebs", {}).get("DeleteOnTermination") is not False
+    ):
+        raise RuntimeError(
+            f"failed to verify DeleteOnTermination=false for {volume_id}"
+        )
+    return {
+        "preserved": True,
+        "instance_id": instance_id,
+        "volume_id": volume_id,
+        "device": device,
+    }
+
+
+def _checkpoint_one(
+    sid: str,
+    *,
+    session_id: str,
+    signal: dict,
+    termination_deadline: datetime,
+    checkpoint_deadline: datetime,
+    expected_count: int,
+    monotonic_deadline: float,
+) -> dict:
+    started = time.monotonic()
+    common = {
+        "recovery_session_id": session_id,
+        "recovery_source_node": NODE_ID,
+        "recovery_source_instance_id": _instance_id(),
+        "recovery_source_volume_id": _state_volume_id(),
+        "recovery_az": _availability_zone(),
+        "recovery_expected_count": expected_count,
+        "interruption_type": signal.get("type", "spot-termination"),
+        "interruption_detected_at": _now_iso(),
+        "recovery_deadline_at": termination_deadline.isoformat(),
+        "recovery_checkpoint_only": bool(
+            signal.get("checkpoint_only", False)
+        ),
+    }
+    journal_errors: list[str] = []
+    ok, error = _update_sandbox_recovery(
+        sid,
+        {
+            **common,
+            "state": "checkpointing",
+            "recovery_phase": "checkpointing",
+            "recovery_error": "",
+            "updated_at": _now_iso(),
+        },
+    )
+    if not ok:
+        journal_errors.append(error)
+
+    try:
+        remaining = monotonic_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("checkpoint deadline exhausted before start")
+        op_lock = _vm_op_lock(sid)
+        with op_lock:
+            info = op_suspend({
+                "id": sid,
+                "snapshot_local_path": f"{SBX_BASE}/{sid}/snap",
+                "snapshot_timeout_s": max(1, int(remaining)),
+                # Spot critical path is EBS-only. Cross-AZ S3 replication is
+                # asynchronous and must not consume the 120-second window.
+                "upload_s3": False,
+                "s3_prefix": "",
+            })
+        elapsed = time.monotonic() - started
+        completed_at = _now_iso()
+        fields = {
+            **common,
+            **info,
+            "state": "checkpointed",
+            "recovery_phase": "checkpointed",
+            "checkpoint_completed_at": completed_at,
+            "checkpoint_elapsed_s": round(elapsed, 3),
+            "updated_at": completed_at,
+        }
+        ok, error = _update_sandbox_recovery(sid, fields)
+        if not ok:
+            journal_errors.append(error)
+        return {
+            "id": sid,
+            "ok": True,
+            "elapsed_s": round(elapsed, 3),
+            "actual_bytes": int(info.get("mem_actual_bytes", 0) or 0),
+            "snapshot_type": info.get("snapshot_type", ""),
+            "journal_errors": journal_errors,
+        }
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        message = str(exc)[:1024]
+        ok, error = _update_sandbox_recovery(
+            sid,
+            {
+                **common,
+                "state": "recovery_failed",
+                "recovery_phase": "checkpoint_failed",
+                "recovery_error": message,
+                "checkpoint_elapsed_s": round(elapsed, 3),
+                "updated_at": _now_iso(),
+            },
+        )
+        if not ok:
+            journal_errors.append(error)
+        return {
+            "id": sid,
+            "ok": False,
+            "elapsed_s": round(elapsed, 3),
+            "error": message,
+            "journal_errors": journal_errors,
+        }
+
+
 def _evacuate_local(signal: dict) -> dict:
     """
     收到回收信号 → 疏散本节点所有 running 沙盒。
@@ -1566,11 +2337,35 @@ def _evacuate_local(signal: dict) -> dict:
     """
     import sys
     sids = _local_running_vms()
-    # 疏散耗时粗估:满载 ~1.3GB/个 Diff、单卷 1000MB/s,实测 50 个并发 ~80s。
+    session_id = uuid.uuid4().hex
+    termination_deadline, checkpoint_deadline = _signal_deadline(signal)
+    budget_s = max(
+        1.0,
+        (checkpoint_deadline - datetime.now(timezone.utc)).total_seconds(),
+    )
+    monotonic_deadline = time.monotonic() + budget_s
+    # 疏散耗时粗估:历史满载约 1.3GB/个 Diff；实际验收以结果中的
+    # total_actual_bytes / wall_clock 为准，不再把该估算当成功判据。
     est_s = round(len(sids) * 1.3 + 20, 1)
     mode  = "REAL" if RECLAIM_AUTO_EVACUATE else "DRY-RUN"
-    plan  = {"node": NODE_ID, "signal": signal, "count": len(sids),
-             "sandboxes": sids, "est_evac_s": est_s, "mode": mode}
+    plan  = {
+        "session_id": session_id,
+        "node": NODE_ID,
+        "instance_id": _instance_id(),
+        "availability_zone": _availability_zone(),
+        "state_volume_id": _state_volume_id(),
+        "signal": signal,
+        "count": len(sids),
+        "sandboxes": sids,
+        "est_evac_s": est_s,
+        "mode": mode,
+        "phase": "detected",
+        "termination_deadline": termination_deadline.isoformat(),
+        "checkpoint_deadline": checkpoint_deadline.isoformat(),
+        "snapshot_concurrency": min(
+            RECLAIM_SNAPSHOT_CONCURRENCY, max(1, len(sids))
+        ),
+    }
     _RECLAIM_STATE.update({"detected": True, "signal": signal,
                            "at": _now_iso(), "plan": plan})
     print(f"[reclaim] SIGNAL={signal.get('type')} → evacuate {len(sids)} sandboxes "
@@ -1580,18 +2375,160 @@ def _evacuate_local(signal: dict) -> dict:
         print("[reclaim] DRY-RUN: 不实际疏散。设 RECLAIM_AUTO_EVACUATE=1 开启真疏散。",
               file=sys.stderr, flush=True)
         return plan
-    # REAL 疏散:逐个打 Diff 快照(方案C 落持久 EBS)。批量并发由控制面侧限流更合适,
-    # 这里节点自救走串行/尽力而为,保证内存先落盘幸存。
-    ok = 0
-    for sid in sids:
+
+    checkpoint_only = bool(signal.get("checkpoint_only", False))
+    if not sids and not checkpoint_only and not _has_local_sandbox_state():
+        # An empty replacement/test node has no state worth retaining. Keep
+        # DeleteOnTermination=true so a no-work interruption cannot leak EBS.
+        plan.update({
+            "phase": "checkpointed",
+            "volume_preservation": {
+                "preserved": False,
+                "skipped": True,
+                "reason": "no local sandbox state",
+                "elapsed_s": 0.0,
+            },
+            "completed": 0,
+            "evacuated_ok": 0,
+            "failed": 0,
+            "wall_clock_s": 0.0,
+            "total_actual_bytes": 0,
+            "effective_write_mib_s": 0,
+            "results": [],
+        })
+        _RECLAIM_STATE["evacuated"] = True
+        return plan
+
+    preserve_started = time.monotonic()
+    if checkpoint_only:
+        plan["volume_preservation"] = {
+            "preserved": False,
+            "skipped": True,
+            "reason": "checkpoint-only benchmark",
+            "elapsed_s": 0.0,
+        }
+    else:
         try:
-            op_suspend({"id": sid, "snapshot_local_path": f"{SBX_BASE}/{sid}/snap"})
-            ok += 1
-        except Exception as e:
-            print(f"[reclaim] evacuate {sid} failed: {e}", file=sys.stderr, flush=True)
-    plan["evacuated_ok"] = ok
-    _RECLAIM_STATE["evacuated"] = True
-    print(f"[reclaim] REAL evacuation done: {ok}/{len(sids)}", file=sys.stderr, flush=True)
+            plan["volume_preservation"] = {
+                **_preserve_state_volume(),
+                "elapsed_s": round(
+                    time.monotonic() - preserve_started,
+                    3,
+                ),
+            }
+        except Exception as exc:
+            message = str(exc)[:1024]
+            plan["volume_preservation"] = {
+                "preserved": False,
+                "error": message,
+                "elapsed_s": round(
+                    time.monotonic() - preserve_started,
+                    3,
+                ),
+            }
+            print(
+                "[reclaim] failed to preserve state EBS before termination: "
+                f"{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results = []
+            for sid in sids:
+                journal_errors: list[str] = []
+                ok, error = _update_sandbox_recovery(
+                    sid,
+                    {
+                        "recovery_session_id": session_id,
+                        "recovery_source_node": NODE_ID,
+                        "recovery_source_instance_id": _instance_id(),
+                        "recovery_source_volume_id": _state_volume_id(),
+                        "recovery_az": _availability_zone(),
+                        "recovery_expected_count": len(sids),
+                        "interruption_type": signal.get(
+                            "type", "spot-termination"
+                        ),
+                        "interruption_detected_at": _now_iso(),
+                        "recovery_deadline_at": (
+                            termination_deadline.isoformat()
+                        ),
+                        "recovery_checkpoint_only": False,
+                        "state": "recovery_failed",
+                        "recovery_phase": "volume_preservation_failed",
+                        "recovery_error": message,
+                        "updated_at": _now_iso(),
+                    },
+                )
+                if not ok:
+                    journal_errors.append(error)
+                results.append({
+                    "id": sid,
+                    "ok": False,
+                    "error": message,
+                    "journal_errors": journal_errors,
+                })
+            plan.update({
+                "phase": "volume_preservation_failed",
+                "completed": len(results),
+                "evacuated_ok": 0,
+                "failed": len(results),
+                "wall_clock_s": 0.0,
+                "total_actual_bytes": 0,
+                "effective_write_mib_s": 0,
+                "results": results,
+            })
+            _RECLAIM_STATE["evacuated"] = False
+            return plan
+
+    # REAL 疏散:并发打 Diff 快照以吃满单卷/实例 EBS 带宽。并发度只改变
+    # 饱和速度，不能突破实例 EBS 上限；因此必须同时记录真实写入量和墙钟。
+    wall_started = time.monotonic()
+    plan["phase"] = "checkpointing"
+    results: list[dict] = []
+    workers = min(RECLAIM_SNAPSHOT_CONCURRENCY, max(1, len(sids)))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="reclaim-snapshot"
+    ) as executor:
+        futures = [
+            executor.submit(
+                _checkpoint_one,
+                sid,
+                session_id=session_id,
+                signal=signal,
+                termination_deadline=termination_deadline,
+                checkpoint_deadline=checkpoint_deadline,
+                expected_count=len(sids),
+                monotonic_deadline=monotonic_deadline,
+            )
+            for sid in sids
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            plan["completed"] = len(results)
+            plan["evacuated_ok"] = sum(1 for item in results if item["ok"])
+            plan["failed"] = len(results) - plan["evacuated_ok"]
+
+    wall_s = time.monotonic() - wall_started
+    ok = sum(1 for item in results if item["ok"])
+    total_actual = sum(int(item.get("actual_bytes", 0)) for item in results)
+    plan.update({
+        "phase": "checkpointed" if ok == len(sids) else "partial",
+        "evacuated_ok": ok,
+        "failed": len(sids) - ok,
+        "wall_clock_s": round(wall_s, 3),
+        "total_actual_bytes": total_actual,
+        "effective_write_mib_s": round(
+            total_actual / 1024 / 1024 / wall_s, 3
+        ) if wall_s > 0 else 0,
+        "results": sorted(results, key=lambda item: item["id"]),
+    })
+    _RECLAIM_STATE["evacuated"] = ok == len(sids)
+    print(
+        f"[reclaim] REAL evacuation done: {ok}/{len(sids)} "
+        f"wall={wall_s:.3f}s actual={total_actual}B",
+        file=sys.stderr,
+        flush=True,
+    )
     return plan
 
 
@@ -1888,6 +2825,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_bytes(200, body, content_type)
             if path == "/reclaim/status":
                 return self._send(200, _RECLAIM_STATE)
+            if path == "/recovery/status":
+                configured_role, recovery_group, _ = (
+                    _node_recovery_identity()
+                )
+                state_volume_id = _state_volume_id()
+                return self._send(200, {
+                    "node": NODE_ID,
+                    "instance_id": _instance_id(),
+                    "availability_zone": _availability_zone(),
+                    "recovery_role": _effective_recovery_role(
+                        configured_role
+                    ),
+                    "recovery_group": recovery_group,
+                    "state_volume_id": state_volume_id,
+                    "draining": bool(_RECLAIM_STATE.get("detected")),
+                })
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "vm":
                 return self._send(200, op_get(parts[1]))
@@ -1938,10 +2891,15 @@ class Handler(BaseHTTPRequestHandler):
                     if path == "/vm/destroy":
                         _drop_vm_op_lock(sid, op_lock)
             # Block 1 测试:注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
+            if path == "/recovery/mount":
+                return self._send(200, op_recovery_mount(body))
             if path == "/reclaim/simulate":
                 sig = {"type": body.get("type", "spot-termination"),
                        "action": body.get("action", "terminate"),
                        "time": body.get("time", _now_iso()),
+                       "checkpoint_only": bool(
+                           body.get("checkpoint_only", False)
+                       ),
                        "injected": True}
                 _RECLAIM_STATE["detected"] = False  # 允许重复测试
                 return self._send(200, _evacuate_local(sig))
@@ -1978,6 +2936,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # EKS AL2023 can schedule DaemonSet pods while cloud-init is still
+    # downloading rootfs assets. When cloud-init finishes, kubelet/containerd
+    # may recreate every pod sandbox. Do not register this node or accept
+    # Firecracker workloads until the host bootstrap is fully complete.
+    _wait_for_node_bootstrap()
+
     # 启动自恢复:重建残留 VM 的操作句柄,避免重启后状态漂移(P0-1)
     try:
         n = _recover_vms()

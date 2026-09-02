@@ -117,6 +117,21 @@ def status_from_record(
         "restoreTimeSeconds": _float_or_zero(
             record.get("restore_time_s", 0)
         ),
+        "recoverySessionId": record.get("recovery_session_id", ""),
+        "recoveryPhase": record.get("recovery_phase", ""),
+        "recoverySourceNode": record.get("recovery_source_node", ""),
+        "recoverySourceInstanceId": record.get(
+            "recovery_source_instance_id", ""
+        ),
+        "recoverySourceVolumeId": record.get(
+            "recovery_source_volume_id", ""
+        ),
+        "recoveryTargetNode": record.get("recovery_target_node", ""),
+        "recoveryAvailabilityZone": record.get("recovery_az", ""),
+        "recoveryDeadline": record.get("recovery_deadline_at", ""),
+        "checkpointCompletedAt": record.get(
+            "checkpoint_completed_at", ""
+        ),
         "lastTransitionTime": record.get("updated_at", ""),
     }
     if observed_generation is not None:

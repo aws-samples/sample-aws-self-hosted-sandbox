@@ -424,6 +424,47 @@ class TestFirecrackerDriver(unittest.TestCase):
              if method == "POST"],
         )
 
+    def test_placement_group_is_a_hard_constraint(self):
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+
+        drv = FirecrackerDriver()
+        registry = [
+            ("10.0.1.10", 9000, "protected", ""),
+            ("10.0.1.20", 8000, "protected", "test-group"),
+        ]
+        with patch.object(drv, "_agent", return_value={}):
+            self.assertEqual(
+                drv._pick_from_registry(
+                    registry,
+                    "protected",
+                    "test-group",
+                ),
+                "10.0.1.20",
+            )
+            self.assertIsNone(
+                drv._pick_from_registry(
+                    registry,
+                    "protected",
+                    "missing-group",
+                )
+            )
+
+        with (
+            patch.object(
+                drv,
+                "_active_nodes_from_registry",
+                return_value=registry,
+            ),
+            patch.object(drv, "_agent", return_value={}),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "no reachable node in placement group"
+            ):
+                drv._pick_node(
+                    pool="protected",
+                    placement_group="missing-group",
+                )
+
     @mock_aws
     def test_suspend_and_resume(self):
         _create_tables()

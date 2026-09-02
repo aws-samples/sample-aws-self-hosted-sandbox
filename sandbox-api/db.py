@@ -279,6 +279,105 @@ def list_active_nodes(ttl_s: int = 90) -> list[dict]:
     return out
 
 
+def claim_recovery_standby(
+    availability_zone: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> dict | None:
+    """Atomically claim one live, empty standby in the requested AZ."""
+    now = _utcnow()
+    expires = _utcnow_plus(claim_ttl_s)
+    candidates = sorted(
+        list_active_nodes(),
+        key=lambda item: (
+            -int(item.get("free_mem_mib", 0)),
+            item.get("node_id", ""),
+        ),
+    )
+    for item in candidates:
+        if item.get("availability_zone") != availability_zone:
+            continue
+        if item.get("recovery_role") != "standby":
+            continue
+        if item.get("state_volume_id"):
+            continue
+        if int(item.get("vm_count", 0)) != 0:
+            continue
+        if bool(item.get("draining")):
+            continue
+        node_id = item.get("node_id")
+        if not node_id:
+            continue
+        try:
+            response = _nodes().update_item(
+                Key={"node_id": node_id},
+                UpdateExpression=(
+                    "SET recovery_claim_id=:session, "
+                    "recovery_claim_expires=:expires"
+                ),
+                ConditionExpression=(
+                    "#role=:standby AND #vms=:zero AND "
+                    "(attribute_not_exists(#draining) OR "
+                    "#draining=:false) AND "
+                    "(attribute_not_exists(#volume) OR #volume=:empty) AND "
+                    "(attribute_not_exists(recovery_claim_id) OR "
+                    "recovery_claim_expires < :now OR "
+                    "recovery_claim_id = :session)"
+                ),
+                ExpressionAttributeNames={
+                    "#role": "recovery_role",
+                    "#vms": "vm_count",
+                    "#draining": "draining",
+                    "#volume": "state_volume_id",
+                },
+                ExpressionAttributeValues={
+                    ":standby": "standby",
+                    ":zero": 0,
+                    ":false": False,
+                    ":empty": "",
+                    ":session": recovery_session_id,
+                    ":expires": expires,
+                    ":now": now,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return _from_dynamo(response.get("Attributes") or item)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def get_recovery_claim(recovery_session_id: str) -> dict | None:
+    for item in list_active_nodes():
+        if item.get("recovery_claim_id") == recovery_session_id:
+            return item
+    return None
+
+
+def release_recovery_claim(
+    node_id: str,
+    recovery_session_id: str,
+) -> None:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression=(
+                "REMOVE recovery_claim_id, recovery_claim_expires"
+            ),
+            ConditionExpression="recovery_claim_id = :session",
+            ExpressionAttributeValues={":session": recovery_session_id},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) != "ConditionalCheckFailedException":
+            raise
+
+
 # ---------- 分布式 leader 锁(P1-4:reconcile/暖池 loop 单实例) ----------
 # 复用 lease 的"条件写 + TTL 过期"模式,但作用于独立的 LOCKS_TABLE 单条 item,
 # 语义是"全局单 leader",区别于 per-sandbox 的 acquire_lease。

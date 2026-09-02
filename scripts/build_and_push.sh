@@ -3,6 +3,7 @@
 #
 # 用法:
 #   bash scripts/build_and_push.sh [--region us-east-1] [--cluster claude-sbx] \
+#     [--tag spot-recovery-20260901] \
 #     [--control-plane-platform linux/arm64] [--node-agent-platform linux/amd64]
 #
 # 架构:
@@ -29,6 +30,7 @@ LEGACY_PLATFORM="${PLATFORM:-}"
 CONTROL_PLANE_PLATFORM="${CONTROL_PLANE_PLATFORM:-${LEGACY_PLATFORM:-linux/arm64}}"
 NODE_AGENT_PLATFORM="${NODE_AGENT_PLATFORM:-${LEGACY_PLATFORM:-linux/arm64}}"
 COMPONENT="all"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region)                 REGION="$2";                 shift 2 ;;
@@ -37,11 +39,16 @@ while [[ $# -gt 0 ]]; do
     --control-plane-platform) CONTROL_PLANE_PLATFORM="$2"; shift 2 ;;
     --node-agent-platform)    NODE_AGENT_PLATFORM="$2";    shift 2 ;;
     --component)              COMPONENT="$2";              shift 2 ;;
+    --tag)                    IMAGE_TAG="$2";               shift 2 ;;
     *) shift ;;
   esac
 done
 if [[ ! "$COMPONENT" =~ ^(all|control-plane|node-agent)$ ]]; then
   echo "ERROR: --component must be all, control-plane, or node-agent" >&2
+  exit 1
+fi
+if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+  echo "ERROR: invalid Docker tag: $IMAGE_TAG" >&2
   exit 1
 fi
 
@@ -117,16 +124,16 @@ build_one() {
 
 # ---- 控制面镜像 ----
 if [[ "$COMPONENT" == "all" || "$COMPONENT" == "control-plane" ]]; then
-  build_one "${ECR_BASE}/sandbox-control-plane:latest" "${ROOT}/sandbox-api" "$CONTROL_PLANE_PLATFORM"
+  build_one "${ECR_BASE}/sandbox-control-plane:${IMAGE_TAG}" "${ROOT}/sandbox-api" "$CONTROL_PLANE_PLATFORM"
 fi
 
 # ---- node-agent 镜像 ----
 if [[ "$COMPONENT" == "all" || "$COMPONENT" == "node-agent" ]]; then
-  build_one "${ECR_BASE}/node-agent:latest" "${ROOT}/node-agent" "$NODE_AGENT_PLATFORM"
+  build_one "${ECR_BASE}/node-agent:${IMAGE_TAG}" "${ROOT}/node-agent" "$NODE_AGENT_PLATFORM"
 fi
 
 echo ""
 echo "==> Done. Use these in terraform apply:"
-echo "  -var=\"control_plane_image=${ECR_BASE}/sandbox-control-plane:latest\""
-echo "  -var=\"node_agent_image=${ECR_BASE}/node-agent:latest\""
+echo "  -var=\"control_plane_image=${ECR_BASE}/sandbox-control-plane:${IMAGE_TAG}\""
+echo "  -var=\"node_agent_image=${ECR_BASE}/node-agent:${IMAGE_TAG}\""
 echo "  -var=\"sandbox_image=${ECR_BASE}/claude-sbx:poc\""

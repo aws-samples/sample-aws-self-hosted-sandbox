@@ -383,11 +383,20 @@ def create_sandbox(body: dict) -> tuple[int, dict]:
         # 先尝试从暖池 resume(FC 模式 ~7ms);失败或不支持则冷建。
         # 暖池预热的是默认(min)rootfs;若请求了非默认 image,暖池的快照不匹配 →
         # 跳过暖池直接冷建,才会走 op_create 的模板选择(CoW 对应 rootfs-{name}.ext4)。
-        from sandbox_api.drivers.firecracker import normalize_image
+        from sandbox_api.drivers.firecracker import (
+            normalize_image,
+            requested_placement_group,
+        )
         wants_default = normalize_image(spec.image) == "min"
+        placement_group = requested_placement_group(spec)
         # 暖池条目带明确 protected/spot 归属，只在请求池匹配时 claim；
-        # spot 请求不会误拿 protected 预热 VM。
-        use_warm = wants_default and _warm_pool.can_claim(pool)
+        # spot 请求不会误拿 protected 预热 VM。显式恢复组的请求跳过通用
+        # 暖池，因为暖池条目没有恢复组归属，不能证明位于目标组。
+        use_warm = (
+            wants_default
+            and placement_group is None
+            and _warm_pool.can_claim(pool)
+        )
         claimed = _warm_pool.claim(sid, spec, pool=pool) if use_warm else False
         if not claimed:
             driver_fields = _driver.create(sid, spec, pool=pool)

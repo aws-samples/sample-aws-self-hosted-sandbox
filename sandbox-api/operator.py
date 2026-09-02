@@ -30,9 +30,14 @@ from sandbox_api.crd import (
     FirecrackerSandboxStore,
 )
 from sandbox_api.driver import SandboxSpec, ServiceSpec
-from sandbox_api.drivers.firecracker import FirecrackerDriver, normalize_image
+from sandbox_api.drivers.firecracker import (
+    FirecrackerDriver,
+    normalize_image,
+    requested_placement_group,
+)
 from sandbox_api.idle_detection import IdleDetector
 from sandbox_api.observability import log_event
+from sandbox_api.recovery import SpotRecoveryManager
 from sandbox_api.warm_pool import WarmPool
 
 
@@ -58,6 +63,9 @@ BASE_CONCURRENCY = max(
     1, int(os.environ.get("BASE_SNAPSHOT_CONCURRENCY", "2"))
 )
 RESUME_CONCURRENCY = max(1, int(os.environ.get("RESUME_CONCURRENCY", "12")))
+SPOT_RECOVERY_POLL_S = max(
+    1, int(os.environ.get("SPOT_RECOVERY_POLL_S", "2"))
+)
 
 _ACTIVE_STATES = [
     "creating",
@@ -69,6 +77,11 @@ _ACTIVE_STATES = [
     "failed",
     "orphaned",
     "needs_reschedule",
+    "checkpointing",
+    "checkpointed",
+    "attaching",
+    "recovering",
+    "recovery_failed",
 ]
 
 
@@ -81,6 +94,7 @@ class FirecrackerSandboxOperator:
         self.store = store or FirecrackerSandboxStore()
         self.driver = driver or FirecrackerDriver()
         self.warm_pool = WarmPool(DRIVER_NAME, self.driver)
+        self.spot_recovery = SpotRecoveryManager(self.driver)
         self.idle_detector = IdleDetector(
             lambda sid: db.force_update(
                 sid, {"last_active_at": db._utcnow()}
@@ -124,6 +138,11 @@ class FirecrackerSandboxOperator:
         threading.Thread(
             target=self._maintenance_loop,
             name="crd-maintenance",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._spot_recovery_loop,
+            name="spot-recovery",
             daemon=True,
         ).start()
 
@@ -200,6 +219,40 @@ class FirecrackerSandboxOperator:
                     conditions=_conditions(
                         False, "OperationFailed",
                         record.get("error", "operation failed"),
+                    ),
+                )
+                return
+            if state in {
+                "checkpointing",
+                "checkpointed",
+                "attaching",
+                "recovering",
+            }:
+                self._publish(
+                    sid,
+                    record,
+                    generation,
+                    operation_id,
+                    conditions=_conditions(
+                        False,
+                        "SpotRecoveryInProgress",
+                        record.get("recovery_phase", state),
+                    ),
+                )
+                return
+            if state == "recovery_failed":
+                self._publish(
+                    sid,
+                    record,
+                    generation,
+                    operation_id,
+                    conditions=_conditions(
+                        False,
+                        "SpotRecoveryFailed",
+                        record.get(
+                            "recovery_error",
+                            "spot checkpoint or recovery failed",
+                        ),
                     ),
                 )
                 return
@@ -314,9 +367,14 @@ class FirecrackerSandboxOperator:
             spec = _sandbox_spec(resource)
             pool = resource.get("spec", {}).get("pool") or None
             wants_default = normalize_image(spec.image) == "min"
+            placement_group = requested_placement_group(spec)
             claimed = (
                 self.warm_pool.claim(sid, spec, pool=pool)
-                if wants_default and self.warm_pool.can_claim(pool)
+                if (
+                    wants_default
+                    and placement_group is None
+                    and self.warm_pool.can_claim(pool)
+                )
                 else False
             )
             if not claimed:
@@ -842,6 +900,21 @@ class FirecrackerSandboxOperator:
                 )
             elapsed = time.monotonic() - started
             self._stop.wait(max(1.0, RESYNC_S - elapsed))
+
+    def _spot_recovery_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.is_leader:
+                    stats = self.spot_recovery.reconcile_once()
+                    for sid in stats.get("touched", []):
+                        self.enqueue(sid)
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "spot_recovery_loop_failed",
+                    error_type=type(exc).__name__,
+                )
+            self._stop.wait(SPOT_RECOVERY_POLL_S)
 
     def _leadership_loop(self) -> None:
         interval = max(2.0, LEADER_TTL_S / 3)

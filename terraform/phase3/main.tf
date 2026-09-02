@@ -120,6 +120,58 @@ variable "sandbox_az_index" {
   }
 }
 
+variable "sandbox_ebs_bandwidth_weighting" {
+  type        = string
+  default     = "default"
+  description = "实验项：支持该能力的 x86 实例使用的带宽权重。default 保持默认配比；ebs-1 在裸 EC2 有效，但 2026-09-02 实测 EKS Managed Node Group 最终实例仍为 default，生产必须检查实例实际值，不能只信 Terraform 配置。"
+  validation {
+    condition = contains(
+      ["default", "ebs-1"],
+      var.sandbox_ebs_bandwidth_weighting,
+    )
+    error_message = "sandbox_ebs_bandwidth_weighting 仅支持 default 或 ebs-1。"
+  }
+}
+
+variable "recovery_standby_enabled" {
+  type        = bool
+  default     = false
+  description = "是否创建同 AZ EBS 接管用的 On-Demand warm standby 节点组。默认关闭，避免改变现网成本。"
+}
+
+variable "recovery_standby_az_indices" {
+  type        = set(number)
+  default     = [0]
+  description = "需要保留 warm standby 的 AZ 索引集合。生产三 AZ 可设 [0,1,2]；必须覆盖所有 Spot 数据节点所在 AZ。"
+  validation {
+    condition = alltrue([
+      for index in var.recovery_standby_az_indices :
+      contains([0, 1, 2], index)
+    ])
+    error_message = "recovery_standby_az_indices 仅支持 0、1、2。"
+  }
+}
+
+variable "recovery_standby_count_per_az" {
+  type        = number
+  default     = 1
+  description = "每个目标 AZ 常驻的空闲恢复节点数。"
+  validation {
+    condition     = var.recovery_standby_count_per_az >= 1
+    error_message = "recovery_standby_count_per_az 至少为 1。"
+  }
+}
+
+variable "recovery_max_claimed_hosts_per_az" {
+  type        = number
+  default     = 4
+  description = "每个 standby 节点组允许同时承载的已接管主机数；为恢复后补充新 standby 预留 max_size。"
+  validation {
+    condition     = var.recovery_max_claimed_hosts_per_az >= 1
+    error_message = "recovery_max_claimed_hosts_per_az 至少为 1。"
+  }
+}
+
 locals {
   # 架构派生:AMI、默认实例、Firecracker/内核架构。
   arch_cfg = {
@@ -138,6 +190,19 @@ locals {
   }
   node_arch_cfg         = local.arch_cfg[var.node_arch]
   sandbox_instance_type = var.sandbox_instance_type != "" ? var.sandbox_instance_type : local.node_arch_cfg.default_instance
+  sandbox_network_performance_options = (
+    var.node_arch == "amd64" &&
+    var.sandbox_ebs_bandwidth_weighting != "default"
+    ? {
+      bandwidth_weighting = var.sandbox_ebs_bandwidth_weighting
+    }
+    : null
+  )
+  recovery_standby_az_indices = (
+    var.recovery_standby_enabled
+    ? var.recovery_standby_az_indices
+    : toset([])
+  )
 }
 
 variable "endpoint_public_access_cidrs" {
@@ -166,16 +231,38 @@ variable "state_ebs_size_gb" {
   type        = number
   default     = 400
   description = "每节点持久状态 EBS 容量(GB)。resume 时每 sandbox 峰值需 base(2G)+merged(2G)≈4G,50 个约 200G,再加 diff/rootfs/余量 → 400G。"
+  validation {
+    condition = (
+      var.state_ebs_size_gb >= 1 &&
+      var.state_ebs_size_gb <= 65536
+    )
+    error_message = "state_ebs_size_gb 必须在 gp3 支持的 1..65536 GiB。"
+  }
 }
 variable "state_ebs_iops" {
   type        = number
   default     = 4000
-  description = "状态 EBS 的 IOPS(gp3,1000MB/s 吞吐至少需 4000 IOPS)。"
+  description = "状态 EBS 的 IOPS。gp3 支持 3000..80000；吞吐需满足 IOPS:MiB/s 至少 4:1。"
+  validation {
+    condition = (
+      var.state_ebs_iops >= 3000 &&
+      var.state_ebs_iops <= 80000
+    )
+    error_message = "state_ebs_iops 必须在 gp3 支持的 3000..80000。"
+  }
 }
 variable "state_ebs_throughput" {
   type        = number
   default     = 1000
-  description = "状态 EBS 吞吐(MB/s)。1000=gp3 单卷上限,让 50 个 Diff 快照并发落盘 ~16s。"
+  description = "状态 EBS 吞吐(MiB/s)。当前 gp3 支持 125..2000；2000 MiB/s 至少需要 8000 IOPS。"
+  validation {
+    condition = (
+      var.state_ebs_throughput >= 125 &&
+      var.state_ebs_throughput <= 2000 &&
+      var.state_ebs_throughput <= var.state_ebs_iops / 4
+    )
+    error_message = "state_ebs_throughput 必须在 125..2000 MiB/s，且不能超过 state_ebs_iops / 4。"
+  }
 }
 
 # ---------- VPC(EKS 专用,3 AZ) ----------
@@ -237,7 +324,7 @@ module "eks" {
   # system 与 sandbox 数据面分组:
   # - system_arm64:固定 On-Demand Graviton，承载业务控制面和集群系统 Pod。
   # - sandbox_*:只承载 node-agent + Firecracker microVM，带 NoSchedule 污点。
-  eks_managed_node_groups = {
+  eks_managed_node_groups = merge({
     system_arm64 = {
       kubernetes_version = "1.31"
       ami_type           = "AL2023_ARM_64_STANDARD"
@@ -281,6 +368,8 @@ module "eks" {
         nested_virtualization = "enabled"
       } : {}
 
+      network_performance_options = local.sandbox_network_performance_options
+
       # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化。
       # 成本优先的单机 demo:降到 1 台(单机可测 create/exec/suspend/resume/destroy 全流程,
       # 仅跨机快照/spot 疏散演示需要 2 台)。由 sandbox_node_count 变量控制,默认 1。
@@ -307,9 +396,9 @@ module "eks" {
             volume_type = "gp3"
           }
         }
-        # 方案C:独立【持久状态 EBS】挂 /var/lib/sbx —— 存所有 sandbox 的内存快照(base+diff)+ rootfs。
-        # 高吞吐 gp3(1000MB/s)让 50 个 Diff 快照并发落盘 ~16s。
-        # delete_on_termination=false → spot 强制终止后卷幸存,可 attach 到新机恢复(方案C核心)。
+        # 方案C:独立状态 EBS 挂 /var/lib/sbx,存快照与 rootfs。
+        # 默认随普通终止删除，避免 bootstrap/健康检查失败留下孤儿卷；收到
+        # Spot 回收信号后 node-agent 会在 checkpoint 前原子改成 false。
         sbxdata = {
           device_name = "/dev/sdf"
           ebs = {
@@ -317,7 +406,7 @@ module "eks" {
             volume_type           = "gp3"
             iops                  = var.state_ebs_iops
             throughput            = var.state_ebs_throughput
-            delete_on_termination = false
+            delete_on_termination = true
           }
         }
       }
@@ -338,7 +427,8 @@ module "eks" {
         mkdir -p /opt/sbx /var/lib/sbx
 
         # 方案C:挂载【持久状态 EBS】到 /var/lib/sbx —— sandbox 快照(base+diff)+ rootfs 都落这块盘。
-        # 它 delete_on_termination=false,spot 终止后幸存,可 attach 到新机恢复。
+        # 正常情况下随实例删除；Spot checkpoint 开始时 node-agent 会先把
+        # 当前 attachment 改成 delete_on_termination=false。
         # 识别:只选择 Amazon EBS,避免 i7i 上把本地 NVMe instance store 误当状态盘格式化。
         # EBS NVMe 盘的 MODEL 为 "Amazon Elastic Block Store"。首次为空盘 → mkfs;
         # 已有文件系统(从旧节点迁移来的幸存卷)→ 直接挂,不格式化(否则抹掉数据!)。
@@ -441,6 +531,7 @@ module "eks" {
         # NAT
         sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 
+        touch /opt/sbx/.bootstrap-complete
         echo "[pre-bootstrap] DONE $(date)"
       EOT
       }]
@@ -460,7 +551,114 @@ module "eks" {
         }
       }
     }
-  }
+    }, {
+    for az_index in local.recovery_standby_az_indices :
+    "sandbox_standby_${az_index}" => {
+      name               = "${var.cluster_name}-recovery-${az_index}"
+      use_name_prefix    = false
+      kubernetes_version = "1.31"
+      ami_type           = local.node_arch_cfg.ami_type
+      instance_types     = [local.sandbox_instance_type]
+      capacity_type      = "ON_DEMAND"
+
+      cpu_options = var.node_arch == "amd64" ? {
+        nested_virtualization = "enabled"
+      } : {}
+
+      network_performance_options = local.sandbox_network_performance_options
+
+      min_size = var.recovery_standby_count_per_az
+      max_size = (
+        var.recovery_standby_count_per_az +
+        var.recovery_max_claimed_hosts_per_az
+      )
+      desired_size = var.recovery_standby_count_per_az
+      subnet_ids   = [module.vpc.public_subnets[az_index]]
+
+      iam_role_additional_policies = {
+        s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      }
+
+      # Standby 只有根盘；被认领后由恢复控制器把旧节点幸存的状态 EBS
+      # attach 过来，node-agent 再挂载到 /var/lib/sbx。
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size = 200
+            volume_type = "gp3"
+          }
+        }
+      }
+
+      cloudinit_pre_nodeadm = [{
+        content_type = "text/x-shellscript; charset=\"us-ascii\""
+        content      = <<-EOT
+        #!/bin/bash
+        set -u
+        exec >> /var/log/userdata-recovery-standby.log 2>&1
+        echo "[recovery-standby] START $(date)"
+
+        mkdir -p /opt/sbx /var/lib/sbx
+
+        ARCH=${local.node_arch_cfg.fc_arch}
+        VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
+        curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
+          -o /tmp/fc.tgz 2>/dev/null && \
+        tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
+        chmod +x /usr/local/bin/firecracker || true
+
+        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
+          -o /opt/sbx/vmlinux 2>/dev/null || true
+
+        aws s3 cp ${var.rootfs_s3_uri} \
+          /tmp/rootfs.tar.gz --region ${var.region} 2>/dev/null && \
+        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=2048 status=none 2>/dev/null && \
+        mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \
+        mkdir -p /tmp/rootfs_mount && \
+        mount /opt/sbx/rootfs.ext4 /tmp/rootfs_mount 2>/dev/null && \
+        tar -xzf /tmp/rootfs.tar.gz -C /tmp/rootfs_mount 2>/dev/null && \
+        umount /tmp/rootfs_mount 2>/dev/null || true
+
+        ROOTFS_PREFIX=$(dirname ${var.rootfs_s3_uri})
+        for IMG in $(echo "${var.rootfs_images}" | tr ',' ' '); do
+          [ "$IMG" = "min" ] && continue
+          aws s3 cp "$ROOTFS_PREFIX/rootfs-$IMG.tar.gz" /tmp/rootfs-$IMG.tar.gz --region ${var.region} 2>/dev/null && \
+          dd if=/dev/zero of=/opt/sbx/rootfs-$IMG.ext4 bs=1M count=2048 status=none 2>/dev/null && \
+          mkfs.ext4 /opt/sbx/rootfs-$IMG.ext4 -q 2>/dev/null && \
+          mkdir -p /tmp/rmnt-$IMG && mount /opt/sbx/rootfs-$IMG.ext4 /tmp/rmnt-$IMG 2>/dev/null && \
+          tar -xzf /tmp/rootfs-$IMG.tar.gz -C /tmp/rmnt-$IMG 2>/dev/null && \
+          umount /tmp/rmnt-$IMG 2>/dev/null || true
+        done
+
+        dnf install -y redis6 fuse3 2>/dev/null || true
+        systemctl enable --now redis6 2>/dev/null || true
+        curl -sSL https://d.juicefs.com/install | sh - 2>/dev/null || true
+        sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+        touch /opt/sbx/.bootstrap-complete
+        echo "[recovery-standby] DONE $(date)"
+      EOT
+      }]
+
+      labels = {
+        role                                    = "sandbox"
+        sandbox                                 = "true"
+        "workload-tier"                         = "data"
+        "sandbox.memorion.ai/recovery-role"     = "standby"
+        "sandbox.memorion.ai/recovery-group"    = "${var.cluster_name}-recovery-${az_index}"
+        "sandbox.memorion.ai/recovery-az-index" = tostring(az_index)
+      }
+      taints = {
+        dedicated_sandbox = {
+          key    = "dedicated"
+          value  = "sandbox"
+          effect = "NO_SCHEDULE"
+        }
+      }
+    }
+  })
 
   # 节点角色加 Bedrock 调用权限(沙盒走节点凭据链调 Bedrock;生产改 IRSA/出口代理)
   # 保留节点安全组的集群标签，供 Karpenter 安全组选择器使用
@@ -527,4 +725,13 @@ output "system_node_group_name" {
 
 output "sandbox_node_group_name" {
   value = module.eks.eks_managed_node_groups["sandbox_${var.node_arch}"].node_group_id
+}
+
+output "recovery_standby_node_group_names" {
+  value = {
+    for az_index in local.recovery_standby_az_indices :
+    tostring(az_index) => module.eks.eks_managed_node_groups[
+      "sandbox_standby_${az_index}"
+    ].node_group_id
+  }
 }

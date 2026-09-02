@@ -308,7 +308,9 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
 
 - Firecracker 是 node-agent 启动的子进程，并运行在 node-agent Pod 的 cgroup 中；因此
   “sandbox 不是 Pod”表示它不是独立的 Kubernetes 调度对象，并不表示它完全不受
-  node-agent Pod 或宿主节点生命周期影响。升级或重启 node-agent 前仍需执行安全疏散。
+  node-agent Pod 或宿主节点生命周期影响。node-agent DaemonSet 使用 `OnDelete`
+  更新策略，避免镜像或配置变更自动滚动杀死 microVM；升级或重启某个 node-agent
+  前仍需先安全疏散该节点，再手动删除对应 Pod。
 - suspend 快照默认上传 S3，同时保留节点状态 EBS。Operator 可消费可恢复的
   `needs_reschedule`；但运行中节点突然消失时，历史快照可能不是最新状态，系统会标
   `orphaned` 而不会静默回滚。Spot 中断前的最新快照/状态 CAS/排除 draining 节点仍需闭环。
