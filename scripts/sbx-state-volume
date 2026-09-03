@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# Persistently mount or unmount the Firecracker state EBS from the host
+# systemd namespace.  node-agent calls this through nsenter.
+set -euo pipefail
+
+SBX_BASE="${SBX_BASE:-/var/lib/sbx}"
+MOUNT_UNIT="/etc/systemd/system/var-lib-sbx.mount"
+
+die() {
+  echo "sbx-state-volume: $*" >&2
+  exit 1
+}
+
+validate_device() {
+  [[ "$1" == /dev/* ]] || die "invalid block device path: $1"
+  [[ -b "$1" ]] || die "block device does not exist: $1"
+}
+
+mounted_source() {
+  findmnt -n -o SOURCE --target "$SBX_BASE" 2>/dev/null || true
+}
+
+mount_volume() {
+  local device="${1:-}"
+  validate_device "$device"
+  mkdir -p "$SBX_BASE"
+
+  local current
+  current="$(mounted_source)"
+  if [[ -n "$current" && "$(readlink -f "$current")" == "$(readlink -f "$device")" ]]; then
+    printf '{"mounted":true,"already_mounted":true,"device":"%s"}\n' "$device"
+    return 0
+  fi
+  [[ -z "$current" ]] || die "$SBX_BASE is already mounted from $current"
+
+  local uuid
+  uuid="$(blkid -s UUID -o value "$device")"
+  [[ -n "$uuid" ]] || die "filesystem UUID is unavailable for $device"
+  local fs_type
+  fs_type="$(blkid -s TYPE -o value "$device")"
+  [[ "$fs_type" == "xfs" ]] || die "expected xfs on $device, found ${fs_type:-unknown}"
+
+  cat >"$MOUNT_UNIT" <<UNIT
+[Unit]
+Description=Sandbox persistent state EBS
+Before=kubelet.service
+
+[Mount]
+What=UUID=$uuid
+Where=$SBX_BASE
+Type=xfs
+Options=noatime,nouuid
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now var-lib-sbx.mount >/dev/null
+  current="$(mounted_source)"
+  [[ -n "$current" ]] || die "$SBX_BASE did not become a mountpoint"
+  printf '{"mounted":true,"already_mounted":false,"device":"%s","uuid":"%s"}\n' \
+    "$device" "$uuid"
+}
+
+unmount_volume() {
+  local expected_device="${1:-}"
+  [[ -z "$expected_device" || "$expected_device" == /dev/* ]] \
+    || die "invalid expected block device path"
+  local current
+  current="$(mounted_source)"
+  if [[ -z "$current" ]]; then
+    rm -f "$MOUNT_UNIT"
+    systemctl daemon-reload
+    echo '{"unmounted":true,"already_unmounted":true}'
+    return 0
+  fi
+  if [[ -n "$expected_device" ]]; then
+    validate_device "$expected_device"
+    [[ "$(readlink -f "$current")" == "$(readlink -f "$expected_device")" ]] \
+      || die "$SBX_BASE is mounted from $current, expected $expected_device"
+  fi
+
+  sync
+  systemctl disable --now var-lib-sbx.mount >/dev/null 2>&1 || umount "$SBX_BASE"
+  [[ -z "$(mounted_source)" ]] || die "failed to unmount $SBX_BASE"
+  rm -f "$MOUNT_UNIT"
+  systemctl daemon-reload
+  printf '{"unmounted":true,"already_unmounted":false,"device":"%s"}\n' "$current"
+}
+
+case "${1:-}" in
+  check)
+    command -v systemctl >/dev/null
+    command -v findmnt >/dev/null
+    command -v blkid >/dev/null
+    echo '{"ok":true}'
+    ;;
+  mount)
+    shift
+    [[ "${1:-}" == "--device" ]] || die "mount requires --device"
+    mount_volume "${2:-}"
+    ;;
+  unmount)
+    shift
+    if [[ $# -eq 0 ]]; then
+      unmount_volume ""
+    else
+      [[ "${1:-}" == "--device" ]] || die "unmount accepts only --device"
+      unmount_volume "${2:-}"
+    fi
+    ;;
+  status)
+    printf '{"source":"%s"}\n' "$(mounted_source)"
+    ;;
+  *)
+    die "usage: $0 {check|mount --device DEV|unmount [--device DEV]|status}"
+    ;;
+esac

@@ -270,7 +270,7 @@ resource "null_resource" "karpenter_nodepools" {
           consolidateAfter: 1m
       ---
       # NOTE: 承载 sandbox 的 Firecracker 节点当前由 phase3 的托管节点组提供
-      #       (固定 desired，打 sandbox=true label，node-agent DaemonSet 直起裸 Firecracker)。
+      #       (固定 desired，打 sandbox=true label，node-agent 编排宿主 systemd/jailer Firecracker)。
       #       因此这里【不再】定义 sandbox NodePool。
       #
       #       历史上曾有一个 `kata-metal` NodePool(带 kata-dedicated 污点，供 Kata pod 调度)，

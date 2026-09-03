@@ -43,6 +43,7 @@ from sandbox_api.crd import (
 )
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.idle_detection import IdleDetector
+from sandbox_api.node_agent_auth import auth_headers as node_agent_auth_headers
 from sandbox_api.observability import (
     RESUME_INFLIGHT,
     RESUME_QUEUE_WAIT,
@@ -1227,11 +1228,32 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         req_body = self.rfile.read(n) if n else None
 
-        hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-               "te", "trailers", "transfer-encoding", "upgrade", "host"}
+        hop = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "x-sbx-auth-version",
+            "x-sbx-timestamp",
+            "x-sbx-nonce",
+            "x-sbx-content-sha256",
+            "x-sbx-signature",
+        }
         fwd = {k: v for k, v in self.headers.items() if k.lower() not in hop}
         fwd["X-Request-ID"] = getattr(self, "request_id", "")
         inject_trace_headers(fwd)
+        fwd.update(
+            node_agent_auth_headers(
+                self.command,
+                upstream_path,
+                req_body,
+            )
+        )
 
         try:
             conn = http.client.HTTPConnection(node_host, timeout=30)
@@ -1266,7 +1288,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         lines = [f"{self.command} {upstream_path} HTTP/1.1"]
         for k, v in self.headers.items():
-            if k.lower() in {"host", "x-request-id"}:
+            if k.lower() in {
+                "host",
+                "x-request-id",
+                "x-sbx-auth-version",
+                "x-sbx-timestamp",
+                "x-sbx-nonce",
+                "x-sbx-content-sha256",
+                "x-sbx-signature",
+            }:
                 continue
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {node_host}")
@@ -1275,6 +1305,12 @@ class Handler(BaseHTTPRequestHandler):
         inject_trace_headers(trace_headers)
         if traceparent := trace_headers.get("traceparent"):
             lines.append(f"traceparent: {traceparent}")
+        for key, value in node_agent_auth_headers(
+            self.command,
+            upstream_path,
+            b"",
+        ).items():
+            lines.append(f"{key}: {value}")
         up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         with _idle_detector.connection(sid):
             _raw_tunnel(

@@ -11,7 +11,7 @@
 在 AWS 上复刻 Fly.io Firecracker microVM 架构，以更低成本、更高可控性运行 Claude Code 及各类 AI Agent。
 
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
-- **裸 Firecracker 后端**：node-agent 直管 microVM（jailer/tap/snapshot），成本优先；快照落持久状态 EBS，**默认再上传 S3 作权威副本(可关,`SNAPSHOT_TO_S3`)**,跨机恢复可从 S3 下载或靠 EBS 卷幸存（见下方"快照落盘与跨机恢复"说明）
+- **宿主管理的 Firecracker 后端**：node-agent 负责 tap/snapshot/API 编排，VMM 由宿主 systemd + jailer 以独立 cgroup/chroot 运行；快照落持久状态 EBS，**默认再上传 S3 作权威副本(可关,`SNAPSHOT_TO_S3`)**，跨机恢复可从 S3 下载或靠 EBS 卷幸存（见下方"快照落盘与跨机恢复"说明）
 - **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（当前默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
@@ -306,14 +306,13 @@ Kubernetes 仍负责平台组件的副本、滚动发布、服务发现和故障
 这条路径也意味着平台要承担 kubelet 不会替 microVM 完成的能力：节点选择、Firecracker
 状态机、网络代理、快照与恢复动作由 Operator/node-agent 实现。当前实现还有两个明确边界：
 
-- Firecracker 是 node-agent 启动的子进程，并运行在 node-agent Pod 的 cgroup 中；因此
-  “sandbox 不是 Pod”表示它不是独立的 Kubernetes 调度对象，并不表示它完全不受
-  node-agent Pod 或宿主节点生命周期影响。node-agent DaemonSet 使用 `OnDelete`
-  更新策略，避免镜像或配置变更自动滚动杀死 microVM；升级或重启某个 node-agent
-  前仍需先安全疏散该节点，再手动删除对应 Pod。
-- suspend 快照默认上传 S3，同时保留节点状态 EBS。Operator 可消费可恢复的
-  `needs_reschedule`；但运行中节点突然消失时，历史快照可能不是最新状态，系统会标
-  `orphaned` 而不会静默回滚。Spot 中断前的最新快照/状态 CAS/排除 draining 节点仍需闭环。
+- 新建/恢复的 VMM 由宿主 PID 1 管理为独立的 `sbx-vmm-<id>.service`，不再位于
+  node-agent Pod cgroup；Pod 重建不会直接杀死 live microVM。**但首次从旧版本升级时，
+  旧 VMM 仍在 Pod cgroup 中**，必须先 checkpoint/drain 旧节点，并先让 phase3
+  Launch Template 下发 jailer 和 host helper，再升级 node-agent。
+- 同 AZ Spot 中断已具备 EBS 接管、OD standby 恢复、迁回空闲 Spot、旧卷回收和 OD
+  精确缩容状态机；跨 AZ 故障仍依赖 S3/跨 AZ 权威副本。本轮 host-systemd、鉴权和
+  OD 回收改造已通过本地回归，尚未在更新后的真实节点上重新做破坏性 FIS 验证。
 
 ### 架构概览
 
@@ -384,8 +383,8 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 遇到错误时先排查根因，修复后再继续，不要跳过任何步骤。
 
 ⚠️ 关键注意事项（执行前必读）：
-1. 认证安全：Step 6 必须传入 api_keys 和 litellm_master_key（用 openssl rand -hex 32 生成），
-   不能留空——控制面无 key 时所有受保护接口返回 503。
+1. 认证安全：Step 6 必须分别传入 api_keys、litellm_master_key 和
+   node_agent_auth_secret（均可用 openssl rand -hex 32 生成），不能留空。
 2. rootfs 必须含 vsock agent：Step 1.5 的 min-rootfs（exec 走 vsock 通道），phase3 apply 需显式传 rootfs_s3_uri。
 3. system 节点固定为 On-Demand Graviton；`node_arch` 只描述 sandbox 数据节点：
    Graviton=`arm64` + `c6g.metal`，x86=`amd64` + `i7i.8xlarge`（可覆盖任意 `i7i.*`）。
@@ -459,7 +458,11 @@ python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
 python3 sandbox-api/crd_test.py
 python3 node-agent/observability_test.py
-# 期望：控制面 55/55 + CRD/operator 8/8 + node-agent 10/10 PASS
+python3 node-agent/reclaim_test.py
+python3 sandbox-api/recovery_test.py
+PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
+# 期望：控制面 57/57 + CRD/operator 16/16 + node-agent 22/22
+#      + reclaim 13/13 + recovery 13/13 + node-agent auth 2/2 PASS
 ```
 
 ---

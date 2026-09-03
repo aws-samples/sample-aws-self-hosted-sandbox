@@ -52,6 +52,16 @@ variable "node_arch" {
   }
 }
 
+variable "firecracker_version" {
+  type        = string
+  default     = "v1.16.1"
+  description = "固定的 Firecracker/jailer release。宿主 helper 另会拒绝低于 v1.14.1 的版本，避免使用已知 jailer chroot 安全缺陷版本。"
+  validation {
+    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.firecracker_version))
+    error_message = "firecracker_version 必须是 vMAJOR.MINOR.PATCH，例如 v1.16.1。"
+  }
+}
+
 variable "sandbox_instance_type" {
   type        = string
   default     = ""
@@ -482,14 +492,21 @@ module "eks" {
 
         # Firecracker (바이너리만, 빠름) —— 架构由 Terraform node_arch 注入
         ARCH=${local.node_arch_cfg.fc_arch}
-        VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
-          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
+        VER="${var.firecracker_version}"
         curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
           -o /tmp/fc.tgz 2>/dev/null && \
         tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
         mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
         chmod +x /usr/local/bin/firecracker && \
-        echo "[pre-bootstrap] Firecracker OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
+        chmod +x /usr/local/bin/firecracker-jailer && \
+        echo "[pre-bootstrap] Firecracker+jailer OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
+
+        echo "${base64encode(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
+          | base64 -d >/usr/local/sbin/sbx-vmm-runtime
+        echo "${base64encode(file("${path.module}/../../scripts/sbx-state-volume"))}" \
+          | base64 -d >/usr/local/sbin/sbx-state-volume
+        chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
         curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
@@ -536,12 +553,15 @@ module "eks" {
       EOT
       }]
 
-      # 本组只承载 node-agent + 裸 Firecracker microVM。NoSchedule 防止控制面、
+      # 本组只承载 node-agent + 宿主 systemd/jailer Firecracker microVM。NoSchedule 防止控制面、
       # CoreDNS、LiteLLM 等普通 Pod 在数据节点上落盘。
       labels = {
-        role            = "sandbox"
-        sandbox         = "true"
-        "workload-tier" = "data"
+        role                                    = "sandbox"
+        sandbox                                 = "true"
+        "workload-tier"                         = "data"
+        "sandbox.memorion.ai/recovery-role"     = "active"
+        "sandbox.memorion.ai/recovery-group"    = "${var.cluster_name}-recovery-${var.sandbox_az_index}"
+        "sandbox.memorion.ai/recovery-az-index" = tostring(var.sandbox_az_index)
       }
       taints = {
         dedicated_sandbox = {
@@ -602,13 +622,19 @@ module "eks" {
         mkdir -p /opt/sbx /var/lib/sbx
 
         ARCH=${local.node_arch_cfg.fc_arch}
-        VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
-          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
+        VER="${var.firecracker_version}"
         curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
           -o /tmp/fc.tgz 2>/dev/null && \
         tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
         mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
-        chmod +x /usr/local/bin/firecracker || true
+        mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
+        chmod +x /usr/local/bin/firecracker /usr/local/bin/firecracker-jailer || true
+
+        echo "${base64encode(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
+          | base64 -d >/usr/local/sbin/sbx-vmm-runtime
+        echo "${base64encode(file("${path.module}/../../scripts/sbx-state-volume"))}" \
+          | base64 -d >/usr/local/sbin/sbx-state-volume
+        chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
           -o /opt/sbx/vmlinux 2>/dev/null || true

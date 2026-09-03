@@ -5,11 +5,12 @@
 
 ---
 
-## 后端：裸 Firecracker microVM
+## 后端：宿主管理的 Firecracker microVM
 
-本平台后端为**裸 Firecracker microVM + node-agent DaemonSet**：支持 suspend/resume 亚秒恢复 +
-持久 EBS 跨机快照（状态卷落持久 EBS + Diff 增量内存快照），成本优先。控制面通过 HTTP 直管每台沙盒节点上的
-node-agent，不依赖 K8s 编排沙盒本身。
+本平台后端为 **Firecracker microVM + node-agent DaemonSet + 宿主 systemd/jailer**：
+支持 suspend/resume、持久 EBS 跨机快照（状态卷 + Diff 增量内存快照）。控制面通过
+签名 HTTP 请求调用每台沙盒节点上的 node-agent；VMM 则由宿主 PID 1 管理为独立 service，
+不随 node-agent Pod 重建而被杀死。
 
 部署者必须选择节点架构：
 
@@ -54,6 +55,14 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
 11. **Helm/Kubernetes 认证依赖 AWS CLI**：stage2 provider 使用 `aws eks get-token` 动态刷新凭据，避免 15 分钟 EKS token 在长时间 Helm upgrade 中过期。执行 Terraform 的环境必须能从 `PATH` 调用 `aws`，且当前身份可访问目标集群。
 12. **可观测性分三层**：`enable_observability_stack=true` 安装集群内监控；`enable_amp_remote_write=true` 创建 AMP；`enable_p2_observability=true` 增加 CloudWatch Logs、ADOT/X-Ray 和 AMG datasource/Dashboard 自动配置。AMG workspace 仍需预先存在。
+13. **node-agent 鉴权密钥独立生成**：stage2 必须传
+    `node_agent_auth_secret`（至少 32 字符），不要复用外部 API key 或 LiteLLM key。
+14. **首次从旧 Pod-cgroup 版本升级有固定顺序**：先 apply phase3 并替换/疏散旧
+    sandbox 与 recovery 节点，确认宿主存在 `/usr/local/sbin/sbx-vmm-runtime`、
+    `/usr/local/sbin/sbx-state-volume` 和固定版本的 `firecracker-jailer`，再升级
+    stage2/node-agent。当前默认固定 `v1.16.1`；宿主 helper 会拒绝低于
+    `v1.14.1` 的 Firecracker/jailer。
+    直接先删旧 node-agent Pod 会连带杀死仍在旧 Pod cgroup 内的 VMM。
 
 ---
 
@@ -233,6 +242,7 @@ aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
 # 生成随机 API key（生产必填，不能留空，否则写操作全 503）
 API_KEY=$(openssl rand -hex 32)
 LITELLM_KEY=$(openssl rand -hex 32)
+NODE_AGENT_AUTH_SECRET=$(openssl rand -hex 32)
 echo "API_KEY: $API_KEY  （保存好，后续 curl 鉴权用）"
 
 # FC 模式关键：只从【稳定 Ready】的 sandbox 数据节点取内网 IP
@@ -252,12 +262,13 @@ terraform apply -auto-approve \
   -var="create_ingress_nginx=false" \
   -var="sandbox_domain=sbx.example.com" \
   -var="api_keys=${API_KEY}" \
+  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}" \
   -var="litellm_master_key=${LITELLM_KEY}"
 
 # Terraform 自动完成：
 # - IRSA 角色（控制面 / node-agent / LiteLLM）
 # - K8s 资源（sandbox-system namespace + 控制面 Deployment + node-agent DaemonSet）
-# - api-keys Secret + ConfigMap（FC_NODES 经 env_from 注入控制面）
+# - api-keys / node-agent-auth Secret + ConfigMap（FC_NODES 经 env_from 注入控制面）
 ```
 
 > ⚠️ **FC_NODES 只填稳定的 sandbox 节点**：不能使用无 label 的 `kubectl get nodes`，
@@ -465,6 +476,7 @@ S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 FC_NODES="<Step 6 用的稳定节点 IP>"
 API_KEY="<Step 6 生成的 API_KEY>"
 LITELLM_KEY="<Step 6 生成的 LITELLM_KEY>"
+NODE_AGENT_AUTH_SECRET="<Step 6 生成的 NODE_AGENT_AUTH_SECRET>"
 
 # 1) 重新 apply，打开 create_ingress_nginx（拉起共享 NLB）。其余 var 与 Step 6 保持一致。
 terraform apply -auto-approve \
@@ -478,6 +490,7 @@ terraform apply -auto-approve \
   -var="create_ingress_nginx=true" \
   -var="sandbox_domain=sbx.example.com" \
   -var="api_keys=${API_KEY}" \
+  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}" \
   -var="litellm_master_key=${LITELLM_KEY}"
 
 # 2) 等 NLB 就绪，取它的自带域名（约 2-3 分钟才会 provision 出 hostname）
@@ -765,6 +778,7 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false" \
   -var="api_keys=placeholder" \
+  -var="node_agent_auth_secret=placeholder-placeholder-1234567890" \
   -var="litellm_master_key=placeholder"
 
 # 若启用了模式 A/B/C，上面的 destroy 还必须带同一组：

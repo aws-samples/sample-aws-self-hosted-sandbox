@@ -24,6 +24,7 @@ from sandbox_api.observability import (
     traced_client_request,
 )
 from sandbox_api.driver import Capabilities, SandboxSpec, UnsupportedOperation
+from sandbox_api.node_agent_auth import auth_headers
 
 # node-agent 监听端口(DaemonSet hostNetwork 模式)
 NODE_AGENT_PORT = int(os.environ.get("NODE_AGENT_PORT", "8002"))
@@ -337,6 +338,54 @@ class FirecrackerDriver:
             timeout=timeout_s + 15,
         )
 
+    def unmount_recovery_volume(
+        self,
+        node: str,
+        volume_id: str,
+        *,
+        timeout_s: int = 90,
+    ) -> dict:
+        return self._agent(
+            node,
+            "POST",
+            "/recovery/unmount",
+            {"volume_id": volume_id},
+            timeout=timeout_s,
+        )
+
+    def node_health(self, node: str) -> dict:
+        return self._agent(node, "GET", "/health", timeout=15)
+
+    def checkpoint_for_repatriation(
+        self,
+        sandbox_id: str,
+        record: dict,
+    ) -> dict:
+        """Create a fresh local checkpoint without an unnecessary S3 copy."""
+        node = record["node"]
+        response = self._agent(
+            node,
+            "POST",
+            "/vm/suspend",
+            {
+                "id": sandbox_id,
+                "snapshot_local_path": (
+                    f"{SBX_BASE}/{sandbox_id}/snap"
+                ),
+                "s3_prefix": "",
+                "upload_s3": False,
+            },
+            timeout=300,
+        )
+        return {
+            "snapshot_type": response.get("snapshot_type", ""),
+            "snapshot_size_bytes": response.get("mem_file_bytes", 0),
+            "snapshot_actual_bytes": response.get("mem_actual_bytes", 0),
+            "snapshot_create_time_s": response.get(
+                "snapshot_create_time_s", 0
+            ),
+        }
+
     # ------------------------------------------------------------------
     # exec
     # ------------------------------------------------------------------
@@ -482,6 +531,8 @@ class FirecrackerDriver:
                 ident
                 and not bool(n.get("draining"))
                 and (n.get("recovery_role") or "active") != "standby"
+                and not n.get("recovery_claim_id")
+                and not n.get("repatriation_claim_id")
             ):
                 node_pool = (n.get("pool") or "protected").strip().lower()
                 recovery_group = str(n.get("recovery_group") or "").strip()
@@ -516,6 +567,7 @@ class FirecrackerDriver:
             if request_id := current_request_id():
                 headers["X-Request-ID"] = request_id
             inject_trace_headers(headers)
+            headers.update(auth_headers(method, path, data))
             req = urllib.request.Request(
                 url, data=data, headers=headers, method=method
             )

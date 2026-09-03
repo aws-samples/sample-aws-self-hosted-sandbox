@@ -188,7 +188,8 @@ resource "kubernetes_deployment" "firecracker_operator" {
           "app.kubernetes.io/part-of" = "sandbox-platform"
         }
         annotations = {
-          "sandbox.platform/config-sha256" = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          "sandbox.platform/config-sha256"          = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
         }
       }
       spec {
@@ -216,6 +217,11 @@ resource "kubernetes_deployment" "firecracker_operator" {
           env_from {
             config_map_ref {
               name = kubernetes_config_map.control_plane.metadata[0].name
+            }
+          }
+          env_from {
+            secret_ref {
+              name = kubernetes_secret.node_agent_auth.metadata[0].name
             }
           }
           resources {

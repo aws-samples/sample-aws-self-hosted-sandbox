@@ -22,7 +22,8 @@
 #     -var="control_plane_image=<acct>.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
 #     -var="node_agent_image=<acct>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
 #     -var="litellm_url=http://litellm.litellm.svc.cluster.local:4000" \
-#     -var="snapshot_s3_bucket=<your-bucket>"
+#     -var="snapshot_s3_bucket=<your-bucket>" \
+#     -var="node_agent_auth_secret=<openssl-rand-hex-32>"
 
 terraform {
   required_version = ">= 1.5"
@@ -162,6 +163,12 @@ variable "spot_recovery_min_standby_per_az" {
   type        = number
   default     = 1
   description = "每个已启用恢复节点组需要维持的未认领 standby 数。"
+}
+
+variable "spot_recovery_od_recycle_enabled" {
+  type        = bool
+  default     = true
+  description = "恢复完成后把状态 EBS 迁回同 AZ 空闲 Spot 节点，并精确缩容被认领的 OD 实例。"
 }
 
 variable "control_plane_replicas" {
@@ -344,7 +351,11 @@ resource "aws_iam_role_policy" "control_plane" {
       },
       {
         Effect = "Allow"
-        Action = ["ec2:AttachVolume"]
+        Action = [
+          "ec2:AttachVolume",
+          "ec2:DetachVolume",
+          "ec2:DeleteVolume",
+        ]
         Resource = [
           "arn:aws:ec2:${var.region}:${local.account_id}:instance/*",
           "arn:aws:ec2:${var.region}:${local.account_id}:volume/*",
@@ -376,6 +387,16 @@ resource "aws_iam_role_policy" "control_plane" {
         ]
         Resource = [
           "arn:aws:eks:${var.region}:${local.account_id}:nodegroup/${var.cluster_name}/*/*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "autoscaling:TerminateInstanceInAutoScalingGroup",
+        ]
+        Resource = [
+          "arn:aws:autoscaling:${var.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/eks-${var.cluster_name}-recovery-*",
+          "arn:aws:autoscaling:${var.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/eks-sbx-standby-test-*",
         ]
       },
       # SSM SendCommand(备用:通过 SSM 调 node-agent)
@@ -682,6 +703,20 @@ variable "api_keys" {
   description = "逗号分隔的 Bearer token 列表，注入控制面 API_KEYS env（生产必填）"
 }
 
+variable "node_agent_auth_secret" {
+  type        = string
+  sensitive   = true
+  description = "控制面到 node-agent 的独立 HMAC 密钥，至少 32 字符。建议用 openssl rand -hex 32 生成。"
+  validation {
+    condition     = length(var.node_agent_auth_secret) >= 32
+    error_message = "node_agent_auth_secret 至少 32 个字符。"
+  }
+}
+
+locals {
+  node_agent_auth_secret = var.node_agent_auth_secret
+}
+
 resource "kubernetes_secret" "control_plane_api_keys" {
   metadata {
     name      = "control-plane-api-keys"
@@ -689,6 +724,17 @@ resource "kubernetes_secret" "control_plane_api_keys" {
   }
   data = {
     API_KEYS = var.api_keys
+  }
+  type = "Opaque"
+}
+
+resource "kubernetes_secret" "node_agent_auth" {
+  metadata {
+    name      = "node-agent-auth"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+  data = {
+    NODE_AGENT_AUTH_SECRET = local.node_agent_auth_secret
   }
   type = "Opaque"
 }
@@ -741,10 +787,12 @@ resource "kubernetes_config_map" "control_plane" {
     SPOT_RECOVERY_RESUME_CONCURRENCY = tostring(var.spot_recovery_resume_concurrency)
     SPOT_RECOVERY_REPLENISH_ENABLED  = var.spot_recovery_replenish_enabled ? "1" : "0"
     SPOT_RECOVERY_MIN_STANDBY_PER_AZ = tostring(var.spot_recovery_min_standby_per_az)
+    SPOT_RECOVERY_OD_RECYCLE_ENABLED = var.spot_recovery_od_recycle_enabled ? "1" : "0"
     EKS_CLUSTER_NAME                 = var.cluster_name
     LISTEN_PORT                      = "8000"
     LISTEN_HOST                      = "0.0.0.0"
     NODE_AGENT_PORT                  = "8002"
+    NODE_AGENT_AUTH_REQUIRED         = "1"
     # 端口暴露:对外访问前缀(NLB 自带域名)。供控制面 /admin/cluster 返回给 Portal 拼
     # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
     NLB_HOSTNAME = var.nlb_hostname
@@ -775,7 +823,8 @@ resource "kubernetes_deployment" "control_plane" {
       metadata {
         labels = { app = "sandbox-control-plane", fargate = "true" }
         annotations = {
-          "sandbox.platform/config-sha256" = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          "sandbox.platform/config-sha256"          = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
         }
       }
       spec {
@@ -807,6 +856,9 @@ resource "kubernetes_deployment" "control_plane" {
           # API_KEYS 从 Secret 注入（不进 ConfigMap 避免明文暴露）
           env_from {
             secret_ref { name = kubernetes_secret.control_plane_api_keys.metadata[0].name }
+          }
+          env_from {
+            secret_ref { name = kubernetes_secret.node_agent_auth.metadata[0].name }
           }
           resources {
             requests = { cpu = "250m", memory = "512Mi" }
@@ -885,15 +937,19 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
   }
   spec {
     selector { match_labels = { app = "node-agent" } }
-    # Firecracker VMMs are child processes in this Pod's cgroup. Automatic
-    # RollingUpdate would therefore kill live sandboxes when the agent image
-    # or configuration changes. OnDelete makes a node drain/checkpoint an
-    # explicit prerequisite for replacing that node's agent Pod.
+    # Host-systemd VMMs survive Pod replacement. Keep OnDelete so the first
+    # migration from legacy Pod-cgroup VMMs and secret/runtime changes remain
+    # an explicit, per-node checkpoint/drain operation.
     strategy {
       type = "OnDelete"
     }
     template {
-      metadata { labels = { app = "node-agent" } }
+      metadata {
+        labels = { app = "node-agent" }
+        annotations = {
+          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
+        }
+      }
       spec {
         service_account_name = kubernetes_service_account.node_agent.metadata[0].name
         # 只调度到 Firecracker 沙盒节点
@@ -923,6 +979,19 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             value = "8002"
           }
           env {
+            name  = "NODE_AGENT_AUTH_REQUIRED"
+            value = "1"
+          }
+          env {
+            name = "NODE_AGENT_AUTH_SECRET"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.node_agent_auth.metadata[0].name
+                key  = "NODE_AGENT_AUTH_SECRET"
+              }
+            }
+          }
+          env {
             name  = "SBX_BASE"
             value = "/var/lib/sbx"
           }
@@ -933,6 +1002,22 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "JAILER_BIN"
             value = "/usr/local/bin/firecracker-jailer"
+          }
+          env {
+            name  = "VMM_LAUNCH_MODE"
+            value = "host-systemd"
+          }
+          env {
+            name  = "VMM_USE_JAILER"
+            value = "1"
+          }
+          env {
+            name  = "HOST_VMM_CTL"
+            value = "/usr/local/sbin/sbx-vmm-runtime"
+          }
+          env {
+            name  = "HOST_STATE_CTL"
+            value = "/usr/local/sbin/sbx-state-volume"
           }
           env {
             name  = "AWS_REGION"
@@ -1017,6 +1102,12 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/usr/local/bin/firecracker"
             read_only  = true
           }
+          # jailer 把 API socket 放在宿主 /srv/jailer/<exec>/<id>/root/run。
+          # node-agent 需要访问该 UDS，并在 Pod 重建后据此恢复 _VMS。
+          volume_mount {
+            name       = "jailer-root"
+            mount_path = "/srv/jailer"
+          }
           # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
           volume_mount {
             name       = "fc-assets"
@@ -1027,11 +1118,9 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/host/var/lib/cloud/data"
             read_only  = true
           }
-          # ⚠️ 关键:所有 Firecracker microVM 作为 node-agent 的子进程,跑在【本 Pod 的 cgroup】内。
-          # 若设 memory limit,所有 guest 内存之和会被此 limit 卡住 → OOM 杀 microVM。
-          # 方案C:一台 metal 要跑 ~50 个 2GB sandbox(~100GB),故【不设 memory limit】,
-          # 让 node-agent(及其 microVM 子进程)可用到节点物理内存上限。
-          # 只保留 CPU request 用于调度;不设 cpu/memory limit。
+          # VMM 由宿主 PID 1 创建独立 systemd service/cgroup，不再是此 Pod 的
+          # 子进程。Pod 重建不会杀 live sandbox；这里仍只给 agent 自身 request，
+          # 每个 guest 的 MemoryMax 由宿主 runtime 按 mem_mib 单独设置。
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
           }
@@ -1081,6 +1170,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           host_path {
             path = "/usr/local/bin/firecracker"
             type = "File"
+          }
+        }
+        volume {
+          name = "jailer-root"
+          host_path {
+            path = "/srv/jailer"
+            type = "DirectoryOrCreate"
           }
         }
         volume {

@@ -1,6 +1,7 @@
 # Sandbox Control Plane
 
-统一沙盒控制面 API —— 后端为裸 Firecracker microVM（支持 suspend/resume 快照）。
+统一沙盒控制面 API —— CRD/Operator 管理期望态，node-agent 编排宿主
+systemd+jailer Firecracker microVM（支持 suspend/resume 快照）。
 
 ## 目录结构
 
@@ -73,10 +74,12 @@ bash scripts/build_and_push.sh \
 
 ```bash
 cd terraform/stage2-control-plane && terraform init
+NODE_AGENT_AUTH_SECRET=$(openssl rand -hex 32)  # 生成一次并安全保存，后续 apply 复用
 terraform apply \
   -var="sandbox_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/claude-sbx:poc" \
   -var="control_plane_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest"
+  -var="node_agent_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
+  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}"
 ```
 
 ### 4. 端到端测试
@@ -100,5 +103,8 @@ bash scripts/e2e_test.sh --api-key "$API_KEY"
 | FC_NODES | | 心跳表为空时的 fallback；只填 `sandbox=true` 节点内网 IP |
 | WARM_POOL_SIZE | 5 | 暖池沙盒数 |
 | NODE_AGENT_PORT | 8002 | node-agent 监听端口 |
+| NODE_AGENT_AUTH_SECRET | （生产必填） | 控制面/operator 到 node-agent 的 HMAC-SHA256 独立密钥 |
 
-本地测试当前期望 `50/50 PASS`；真实 E2E 还应验证 resume 后 exec 和状态保留。
+本地测试还应运行 `smoke_test.py`、`crd_test.py`、`recovery_test.py`、
+`node-agent/observability_test.py`、`node-agent/reclaim_test.py` 和
+`node_agent_auth_test.py`；真实 E2E 仍需验证 resume 后 exec、状态保留及节点升级。

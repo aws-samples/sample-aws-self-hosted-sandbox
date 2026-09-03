@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import http.client
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -37,7 +38,9 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlparse
@@ -70,6 +73,13 @@ LISTEN_PORT  = int(os.environ.get("NODE_AGENT_PORT", "8002"))
 LISTEN_HOST  = os.environ.get("NODE_AGENT_LISTEN_HOST", "0.0.0.0")  # 生产改为节点内网 IP
 # 允许调用的来源 CIDR（逗号分隔，空=不限制）——生产应设为控制面 Pod CIDR
 ALLOWED_CALLER_CIDR = os.environ.get("ALLOWED_CALLER_CIDR", "")
+NODE_AGENT_AUTH_SECRET = os.environ.get("NODE_AGENT_AUTH_SECRET", "")
+NODE_AGENT_AUTH_REQUIRED = os.environ.get(
+    "NODE_AGENT_AUTH_REQUIRED", "0"
+).strip().lower() in {"1", "true", "yes"}
+NODE_AGENT_AUTH_MAX_SKEW_S = max(
+    5, int(os.environ.get("NODE_AGENT_AUTH_MAX_SKEW_S", "60"))
+)
 SBX_BASE     = os.environ.get("SBX_BASE", "/var/lib/sbx")       # 统一路径约定
 ROOTFS       = os.environ.get("FC_ROOTFS",  "/opt/sbx/rootfs.ext4")  # 基础(默认)rootfs 模板
 ROOTFS_DIR   = os.environ.get("FC_ROOTFS_DIR", "/opt/sbx")      # 命名 rootfs 模板目录
@@ -106,6 +116,22 @@ def _rootfs_template_path(name: str) -> str:
     return _available_rootfs_templates().get(name, ROOTFS)
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
+VMM_LAUNCH_MODE = os.environ.get(
+    "VMM_LAUNCH_MODE", "subprocess"
+).strip().lower()
+# Keep the historical USE_BARE_FC switch as a compatibility fallback, while
+# making the positive production setting explicit.
+VMM_USE_JAILER = os.environ.get(
+    "VMM_USE_JAILER",
+    "0" if os.environ.get("USE_BARE_FC", "1") == "1" else "1",
+).strip().lower() in {"1", "true", "yes"}
+HOST_NSENTER = os.environ.get("HOST_NSENTER", "/usr/bin/nsenter")
+HOST_VMM_CTL = os.environ.get(
+    "HOST_VMM_CTL", "/usr/local/sbin/sbx-vmm-runtime"
+)
+HOST_STATE_CTL = os.environ.get(
+    "HOST_STATE_CTL", "/usr/local/sbin/sbx-state-volume"
+)
 HOST_IFACE   = os.environ.get("HOST_IFACE", "")                 # 空则自动探测
 AWS_REGION   = os.environ.get("AWS_REGION", "us-east-1")
 NODE_ID      = os.environ.get("NODE_ID", socket.gethostname())
@@ -185,6 +211,7 @@ JUICEFS_FS_NAME    = "sbxfs"                      # JuiceFS 文件系统名（�
 _VMS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 _VM_OP_LOCKS: dict[str, threading.RLock] = {}
+_VM_OP_LOCK_USERS: dict[str, int] = {}
 _HEARTBEAT_LAST_SUCCESS = 0.0
 _HEARTBEAT_LAST_ITERATION = time.monotonic()
 
@@ -253,16 +280,27 @@ def _wait_for_node_bootstrap() -> None:
     print("[bootstrap] node is stable and ready for Firecracker", flush=True)
 
 
-def _vm_op_lock(sandbox_id: str) -> threading.RLock:
-    """Serialize Firecracker API operations for one VM while allowing other VMs in parallel."""
+@contextmanager
+def _vm_operation_lock(sandbox_id: str):
+    """Serialize one VM's operations without dropping locks under waiters."""
     with _LOCK:
-        return _VM_OP_LOCKS.setdefault(sandbox_id, threading.RLock())
-
-
-def _drop_vm_op_lock(sandbox_id: str, lock: threading.RLock) -> None:
-    with _LOCK:
-        if _VM_OP_LOCKS.get(sandbox_id) is lock:
-            _VM_OP_LOCKS.pop(sandbox_id, None)
+        lock = _VM_OP_LOCKS.setdefault(sandbox_id, threading.RLock())
+        _VM_OP_LOCK_USERS[sandbox_id] = (
+            _VM_OP_LOCK_USERS.get(sandbox_id, 0) + 1
+        )
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _LOCK:
+            remaining = _VM_OP_LOCK_USERS.get(sandbox_id, 1) - 1
+            if remaining > 0:
+                _VM_OP_LOCK_USERS[sandbox_id] = remaining
+            else:
+                _VM_OP_LOCK_USERS.pop(sandbox_id, None)
+                if _VM_OP_LOCKS.get(sandbox_id) is lock:
+                    _VM_OP_LOCKS.pop(sandbox_id, None)
 
 
 # ---------- tap 网络 ----------
@@ -311,91 +349,320 @@ def _host_iface() -> str:
     return r.stdout.strip() or "eth0"
 
 
-# ---------- Firecracker 启动(jailer 包裹) ----------
+# ---------- Firecracker 宿主运行层(systemd + jailer) ----------
 
-def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
-               mem_mib: int, kernel: str, env: dict,
-               guest_ip: str = "", host_ip: str = "") -> tuple[int, str]:
-    """
-    用 jailer 启动 Firecracker,返回 (pid, api_sock)。
-    jailer 把 FC 进程放进独立 cgroup + chroot + seccomp,防止逃逸。
-    """
-    d    = f"{SBX_BASE}/{sandbox_id}"
-    sock = f"{d}/api.sock"
-    log  = f"{d}/vm.log"
+_VMM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+
+def _validated_vmm_id(sandbox_id: str) -> str:
+    if not _VMM_ID_RE.fullmatch(sandbox_id):
+        raise ValueError("sandbox id is not safe for the host runtime")
+    return sandbox_id
+
+
+def _host_control(
+    executable: str,
+    args: list[str],
+    *,
+    timeout: float = 30,
+) -> dict:
+    """Run a narrowly-scoped host helper through PID 1's namespaces."""
+    command = [
+        HOST_NSENTER,
+        "--target", "1",
+        "--mount",
+        "--uts",
+        "--ipc",
+        "--net",
+        "--pid",
+        "--",
+        executable,
+        *args,
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    output = completed.stdout.strip().splitlines()
+    if not output:
+        return {}
+    try:
+        return json.loads(output[-1])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"host helper returned invalid JSON: {output[-1][:512]}"
+        ) from exc
+
+
+def _runtime_unit_name(sandbox_id: str) -> str:
+    return f"sbx-vmm-{_validated_vmm_id(sandbox_id)}.service"
+
+
+def _runtime_uid(sandbox_id: str) -> int:
+    # Numeric IDs do not need host passwd entries. Use a 31-bit range so
+    # thousand-sandbox fleets have negligible collision probability.
+    digest = hashlib.sha256(sandbox_id.encode()).digest()
+    return 100000 + int.from_bytes(digest[:4], "big") % 2_000_000_000
+
+
+def _runtime_bind_dirs(sandbox_id: str, extra_dirs=None) -> list[str]:
+    candidates = [f"{SBX_BASE}/{sandbox_id}", *(extra_dirs or [])]
+    result: list[str] = []
+    for path in candidates:
+        managed = _managed_sandbox_dir(str(path))
+        if not managed:
+            raise ValueError(f"unsafe jail bind path: {path}")
+        if managed not in result:
+            result.append(managed)
+    return result
+
+
+def _link_runtime_socket(sandbox_id: str, socket_name: str, target: str) -> None:
+    """Keep the historical socket path stable for restart recovery."""
+    compatibility_path = f"{SBX_BASE}/{sandbox_id}/{socket_name}"
+    if os.path.abspath(compatibility_path) == os.path.abspath(target):
+        return
+    try:
+        if os.path.lexists(compatibility_path):
+            os.remove(compatibility_path)
+        os.symlink(target, compatibility_path)
+    except OSError:
+        # The actual target remains authoritative; the compatibility link only
+        # improves restart discovery and legacy diagnostics.
+        pass
+
+
+def _launch_vmm(
+    sandbox_id: str,
+    socket_name: str,
+    mem_mib: int,
+    *,
+    bind_dirs=None,
+    log_name: str = "vmm.log",
+) -> tuple[int, str, str]:
+    """Launch one VMM and return (pid, host_api_socket, runtime_unit)."""
+    sid = _validated_vmm_id(sandbox_id)
+    d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
+    if socket_name not in {"api.sock", "api-resume.sock"}:
+        raise ValueError("unsupported Firecracker API socket name")
 
+    if VMM_LAUNCH_MODE == "host-systemd":
+        uid = _runtime_uid(sid)
+        args = [
+            "start",
+            "--id", sid,
+            "--socket-name", socket_name,
+            # Guest memory plus VMM/device overhead. The service cgroup is
+            # independent from the node-agent Pod cgroup.
+            "--memory-mib", str(
+                int(mem_mib) + max(1024, int(mem_mib) // 4)
+            ),
+            "--uid", str(uid),
+            "--gid", str(uid),
+            "--jailer", "1" if VMM_USE_JAILER else "0",
+        ]
+        for path in _runtime_bind_dirs(sid, bind_dirs):
+            args.extend(["--bind-dir", path])
+        result = _host_control(HOST_VMM_CTL, args, timeout=45)
+        pid = int(result.get("pid", 0) or 0)
+        sock = str(result.get("socket", ""))
+        unit = str(result.get("unit", "")) or _runtime_unit_name(sid)
+        if pid <= 0 or not sock:
+            raise RuntimeError("host runtime did not return pid/socket")
+        _link_runtime_socket(sid, socket_name, sock)
+        return pid, sock, unit
+
+    if VMM_LAUNCH_MODE != "subprocess":
+        raise RuntimeError(
+            f"unsupported VMM_LAUNCH_MODE={VMM_LAUNCH_MODE!r}"
+        )
+    if VMM_USE_JAILER:
+        raise RuntimeError(
+            "VMM_USE_JAILER requires VMM_LAUNCH_MODE=host-systemd"
+        )
+
+    sock = f"{d}/{socket_name}"
     try:
         os.remove(sock)
     except FileNotFoundError:
         pass
+    with open(f"{d}/{log_name}", "w") as log_file:
+        process = subprocess.Popen(
+            [FC_BIN, "--api-sock", sock],
+            stdout=log_file,
+            stderr=log_file,
+        )
+    return process.pid, sock, ""
 
-    # jailer 参数:每个沙盒独立 uid(从 tap_idx 派生,避免 uid 碰撞)
-    # jailer 会把 FC 进程 chroot 到 /srv/jailer/firecracker/<id>/root/
-    # 注意:rootfs 和 kernel 需在 jailer chroot 内可见 → 用 --bind-path 或预先 cp
-    # POC 阶段用裸 FC(无 jailer chroot 复杂度);生产切换时去掉 USE_BARE_FC
-    USE_BARE_FC = os.environ.get("USE_BARE_FC", "1") == "1"
-    if not USE_BARE_FC and os.path.exists(JAILER_BIN):
-        cmd = [
-            JAILER_BIN,
-            "--id",          sandbox_id,
-            "--exec-file",   FC_BIN,
-            "--uid",         str(3000 + _tap_idx_from_d(d)),
-            "--gid",         str(3000 + _tap_idx_from_d(d)),
-            "--chroot-base-dir", SBX_BASE,
-            "--",
-            "--api-sock",    sock,
-        ]
-    else:
-        cmd = [FC_BIN, "--api-sock", sock]
 
-    with open(log, "w") as lf:
-        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- cmd 为固定 list(jailer/FC 二进制路径来自环境配置,非请求体);env 仅作为 boot_args 注入 guest,不参与 host 命令拼接
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
+def _runtime_status(sandbox_id: str, *, strict: bool = False) -> dict:
+    if VMM_LAUNCH_MODE != "host-systemd":
+        return {}
+    try:
+        return _host_control(
+            HOST_VMM_CTL,
+            ["status", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=5,
+        )
+    except Exception:
+        if strict:
+            raise
+        return {}
+
+
+def _legacy_vmm_pid(api_socket: str) -> int | None:
+    """Find a pre-systemd Firecracker child during an in-place rollout."""
+    expected = {
+        api_socket,
+        os.path.realpath(api_socket),
+    }
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError:
+        return None
+    with proc_entries:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = _read_proc_cmdline(
+                    f"/proc/{entry.name}/cmdline"
+                )
+                argv = [
+                    value.decode(errors="replace")
+                    for value in raw.split(b"\0")
+                    if value
+                ]
+                for index, value in enumerate(argv[:-1]):
+                    if value == "--api-sock" and argv[index + 1] in expected:
+                        return int(entry.name)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def _read_proc_cmdline(path: str) -> bytes:
+    """Small indirection kept patchable in unit tests."""
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
+def _stop_vmm(sandbox_id: str, vm: dict) -> None:
+    """Stop a host-owned service or the legacy child process."""
+    if vm.get("runtime_unit"):
+        _host_control(
+            HOST_VMM_CTL,
+            ["stop", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=30,
+        )
+        return
+    if vm.get("pid"):
+        try:
+            os.kill(int(vm["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, ValueError, TypeError):
+            pass
+        return
+    runtime = _runtime_status(sandbox_id)
+    if runtime.get("active"):
+        _host_control(
+            HOST_VMM_CTL,
+            ["stop", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=30,
+        )
+
+
+# ---------- Firecracker 启动 ----------
+
+def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
+               mem_mib: int, kernel: str, env: dict,
+               guest_ip: str = "", host_ip: str = "") -> tuple[int, str, str]:
+    """
+    启动 Firecracker，返回 (pid, api_sock, runtime_unit)。
+    生产模式由宿主 systemd + jailer 提供独立 cgroup/chroot。
+    """
+    d    = f"{SBX_BASE}/{sandbox_id}"
+    os.makedirs(d, exist_ok=True)
+    pid, sock, runtime_unit = _launch_vmm(
+        sandbox_id,
+        "api.sock",
+        mem_mib,
+        bind_dirs=[d],
+        log_name="vm.log",
+    )
 
     if not _wait_sock(sock, timeout=30.0):
-        proc.kill()
+        _stop_vmm(
+            sandbox_id,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
         raise RuntimeError("firecracker API socket 未就绪")
 
-    # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
-    # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
-    # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
-    net_args = f"SBX_IP={guest_ip} SBX_GW={host_ip} " if guest_ip and host_ip else ""
-    if JUICEFS_ENABLED and JUICEFS_REDIS_ADDR and JUICEFS_BUCKET:
-        jfs_env = (
-            f"JFS_REDIS={JUICEFS_REDIS_ADDR} "
-            f"JFS_BUCKET={JUICEFS_BUCKET} "
-            f"JFS_NAME={JUICEFS_FS_NAME} "
-            f"AWS_REGION={AWS_REGION} "
-        )
-        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}{jfs_env}"
-    else:
-        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}"
-
-    _fc(sock, "PUT", "/boot-source", {
-        "kernel_image_path": kernel,
-        "boot_args": boot_args,
-    })
-    _fc(sock, "PUT", "/drives/rootfs", {
-        "drive_id": "rootfs", "path_on_host": rootfs,
-        "is_root_device": True, "is_read_only": False,
-    })
-    # track_dirty_pages=True: 开启脏页跟踪,是 Diff 增量快照的前提。
-    # 不开则 PUT /snapshot/create {Diff} 会失败 → 方案C 疏散退化成全量 Full(慢一个量级)。
-    _fc(sock, "PUT", "/machine-config",
-        {"vcpu_count": cpu, "mem_size_mib": mem_mib, "track_dirty_pages": True})
-    _fc(sock, "PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap})
-    # vsock: host UDS = {d}/v.sock, guest CID=3, port=2222 供 exec 使用。
-    # exec 主通道走 vsock(不依赖 guest 网络/sshd)，SSH 仅兜底。
-    # 快照含 vsock 设备配置,resume 时由 op_resume 先 os.remove(v.sock) 避免 "Address in use"。
-    vsock_path = f"{d}/v.sock"
     try:
-        _fc(sock, "PUT", "/vsock", {"vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_path})
-    except Exception:
-        pass  # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)
-    _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
+        # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
+        # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
+        # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
+        net_args = (
+            f"SBX_IP={guest_ip} SBX_GW={host_ip} "
+            if guest_ip and host_ip else ""
+        )
+        if JUICEFS_ENABLED and JUICEFS_REDIS_ADDR and JUICEFS_BUCKET:
+            jfs_env = (
+                f"JFS_REDIS={JUICEFS_REDIS_ADDR} "
+                f"JFS_BUCKET={JUICEFS_BUCKET} "
+                f"JFS_NAME={JUICEFS_FS_NAME} "
+                f"AWS_REGION={AWS_REGION} "
+            )
+            boot_args = (
+                "console=ttyS0 reboot=k panic=1 pci=off "
+                f"init=/sbin/sbxinit {net_args}{jfs_env}"
+            )
+        else:
+            boot_args = (
+                "console=ttyS0 reboot=k panic=1 pci=off "
+                f"init=/sbin/sbxinit {net_args}"
+            )
 
-    return proc.pid, sock
+        _fc(sock, "PUT", "/boot-source", {
+            "kernel_image_path": kernel,
+            "boot_args": boot_args,
+        })
+        _fc(sock, "PUT", "/drives/rootfs", {
+            "drive_id": "rootfs", "path_on_host": rootfs,
+            "is_root_device": True, "is_read_only": False,
+        })
+        # track_dirty_pages=True:开启脏页跟踪,是 Diff 增量快照的前提。
+        _fc(sock, "PUT", "/machine-config", {
+            "vcpu_count": cpu,
+            "mem_size_mib": mem_mib,
+            "track_dirty_pages": True,
+        })
+        _fc(sock, "PUT", "/network-interfaces/eth0", {
+            "iface_id": "eth0",
+            "host_dev_name": tap,
+        })
+        # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)。
+        vsock_path = f"{d}/v.sock"
+        try:
+            _fc(sock, "PUT", "/vsock", {
+                "vsock_id": "vsock0",
+                "guest_cid": 3,
+                "uds_path": vsock_path,
+            })
+        except Exception:
+            pass
+        _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
+    except Exception:
+        _stop_vmm(
+            sandbox_id,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
+        raise
+
+    return pid, sock, runtime_unit
 
 
 def _tap_idx_from_d(d: str) -> int:
@@ -679,19 +946,43 @@ def op_create(body: dict) -> dict:
 
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
 
-    pid, sock = _start_fc(sid, dest_rootfs, tap, cpu, mem_mib, kernel, env,
-                          guest_ip=guest_ip, host_ip=host_ip)
+    try:
+        pid, sock, runtime_unit = _start_fc(
+            sid,
+            dest_rootfs,
+            tap,
+            cpu,
+            mem_mib,
+            kernel,
+            env,
+            guest_ip=guest_ip,
+            host_ip=host_ip,
+        )
+    except Exception:
+        _teardown_tap(tap)
+        raise
 
+    vm = {
+        "state":   "running",
+        "pid":     pid,
+        "sock":    sock,
+        "tap":     tap,
+        "tap_idx": tap_idx,
+        "ip":      guest_ip,
+        "dir":     d,
+        "runtime_unit": runtime_unit,
+    }
     with _LOCK:
-        _VMS[sid] = {
-            "state":   "running",
-            "pid":     pid,
-            "sock":    sock,
-            "tap":     tap,
-            "tap_idx": tap_idx,
-            "ip":      guest_ip,
-            "dir":     d,
-        }
+        _VMS[sid] = vm
+    try:
+        _persist_runtime_metadata(sid, vm)
+    except Exception:
+        with _LOCK:
+            if _VMS.get(sid) is vm:
+                _VMS.pop(sid, None)
+        _stop_vmm(sid, vm)
+        _teardown_tap(tap)
+        raise
     return {"state": "running", "ip": guest_ip}
 
 
@@ -702,6 +993,76 @@ def _managed_sandbox_dir(path: str) -> str | None:
     if os.path.dirname(candidate) != base:
         return None
     return candidate
+
+
+def _runtime_metadata_path(sid: str) -> str:
+    return f"{SBX_BASE}/{_validated_vmm_id(sid)}/runtime.json"
+
+
+def _persist_runtime_metadata(sid: str, vm: dict) -> None:
+    """Persist host-network identity needed after node-agent Pod restart."""
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not sandbox_dir:
+        raise ValueError("unsafe sandbox runtime metadata path")
+    os.makedirs(sandbox_dir, exist_ok=True)
+    owned_dirs = [
+        managed
+        for path in vm.get("owned_dirs") or []
+        if (managed := _managed_sandbox_dir(str(path)))
+    ]
+    payload = {
+        "version": 1,
+        "state": str(vm.get("state", "")),
+        "tap": str(vm.get("tap", "")),
+        "tap_idx": int(vm.get("tap_idx", 0) or 0),
+        "ip": str(vm.get("ip", "")),
+        "runtime_unit": str(vm.get("runtime_unit", "")),
+        "owned_dirs": sorted(set(owned_dirs)),
+    }
+    target = _runtime_metadata_path(sid)
+    temporary = (
+        f"{target}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _load_runtime_metadata(sid: str) -> dict:
+    try:
+        with open(
+            _runtime_metadata_path(sid),
+            encoding="utf-8",
+        ) as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if payload.get("version") != 1:
+        return {}
+    return payload
+
+
+def _try_persist_runtime_metadata(sid: str, vm: dict) -> bool:
+    try:
+        _persist_runtime_metadata(sid, vm)
+        return True
+    except Exception as exc:
+        log_event(
+            "error",
+            "runtime_metadata_persist_failed",
+            sandbox_id=sid,
+            error_type=type(exc).__name__,
+        )
+        return False
 
 
 def _snapshot_source(sid: str, snap_dir: str) -> tuple[str | None, str | None]:
@@ -750,6 +1111,7 @@ def _register_resumed_vm(sid: str, vm: dict, snap_dir: str) -> None:
             source = _VMS.get(source_sid)
             if source and source.get("state") == "suspended":
                 _VMS.pop(source_sid, None)
+    _persist_runtime_metadata(sid, vm)
 
 
 def _owned_runtime_dirs(sid: str, vm: dict) -> list[str]:
@@ -774,21 +1136,42 @@ def _live_runtime_socket(sandbox_dir: str) -> str | None:
 
 def op_destroy(body: dict) -> dict:
     sid = body["id"]
+    with _vm_operation_lock(sid):
+        return _op_destroy_locked(sid)
+
+
+def _op_destroy_locked(sid: str) -> dict:
     with _LOCK:
-        vm = _VMS.pop(sid, None)
+        vm = _VMS.get(sid)
     sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not vm and VMM_LAUNCH_MODE == "host-systemd":
+        runtime = _runtime_status(sid, strict=True)
+        if runtime.get("active"):
+            metadata = _load_runtime_metadata(sid)
+            vm = {
+                "state": "running",
+                "pid": int(runtime.get("pid", 0) or 0),
+                "sock": str(runtime.get("socket", "")),
+                "tap": str(metadata.get("tap", "")),
+                "tap_idx": int(metadata.get("tap_idx", 0) or 0),
+                "ip": str(metadata.get("ip", "")),
+                "dir": sandbox_dir or "",
+                "runtime_unit": (
+                    str(runtime.get("unit", ""))
+                    or _runtime_unit_name(sid)
+                ),
+                "owned_dirs": metadata.get("owned_dirs", []),
+            }
     if not vm and sandbox_dir and _live_runtime_socket(sandbox_dir):
         raise RuntimeError(
             f"sandbox {sid} has a live Firecracker socket but is not tracked"
         )
     if vm:
-        if vm.get("pid"):
-            # os.kill 而非 subprocess(slim 镜像无 /bin/kill)
-            try:
-                os.kill(int(vm["pid"]), signal.SIGTERM)
-            except (ProcessLookupError, ValueError, TypeError):
-                pass
+        _stop_vmm(sid, vm)
         _teardown_tap(vm.get("tap", ""))
+        with _LOCK:
+            if _VMS.get(sid) is vm:
+                _VMS.pop(sid, None)
         # A warm claim restores from the warm source directory because the
         # Firecracker snapshot embeds paths to its rootfs/vsock/memory files.
         # The real sandbox therefore owns both its runtime directory and that
@@ -952,17 +1335,17 @@ def op_suspend(body: dict) -> dict:
             pass
         with _LOCK:
             vm["state"] = "running"
+        _try_persist_runtime_metadata(sid, vm)
         raise
     dt = time.monotonic() - t0
 
     # 方案C:快照写在持久状态 EBS 上(snap_dir),spot 终止后卷幸存,
     # 故【不传 S3】——删掉最慢的 S3 传输,是 120s 窗口内跑满 50 个的关键。
     # snapshot/create 同步完成即已落 EBS,数据已持久 → 可安全 kill VMM。
-    # kill VMM,释放 RAM。用 os.kill 而非 subprocess(slim 镜像无 /bin/kill)
-    try:
-        os.kill(int(vm["pid"]), signal.SIGTERM)
-    except (ProcessLookupError, ValueError, TypeError):
-        pass
+    # Stop the host-owned service (or legacy child process) after the durable
+    # snapshot is complete, releasing guest RAM without tying lifecycle to the
+    # node-agent Pod.
+    _stop_vmm(sid, vm)
     time.sleep(0.2)  # nosemgrep: arbitrary-sleep -- 等 VMM 退出释放 vm.mem 文件句柄后再读大小
 
     # diff.mem 是稀疏文件:apparent 是全量大小,真实占盘用 st_blocks*512
@@ -979,6 +1362,7 @@ def op_suspend(body: dict) -> dict:
     with _LOCK:
         vm["state"] = "suspended"
         vm["pid"]   = None
+    _try_persist_runtime_metadata(sid, vm)
 
     # 快照默认上传 S3 作权威副本(控制面 SNAPSHOT_TO_S3 开关决定是否传 upload_s3)。
     # 上传整份 snap_dir(base + diff + manifest),跨机 resume 时 node-agent 从此前缀
@@ -1066,6 +1450,8 @@ def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
     # start a second Firecracker process or rebuild tap/rootfs. A normal
     # suspend intentionally retains a lightweight _VMS entry with pid=None;
     # that exact suspended state is the valid input to snapshot restore.
+    persist_vm: dict | None = None
+    result: dict | None = None
     with _LOCK:
         existing = _VMS.get(sid)
         if existing and existing.get("state") == "running":
@@ -1082,7 +1468,8 @@ def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
                 source = _VMS.get(source_sid or "")
                 if source and source.get("state") == "suspended":
                     _VMS.pop(source_sid or "", None)
-            return {
+            persist_vm = existing
+            result = {
                 "state": "running",
                 "ip": existing.get("ip", ""),
                 "already_exists": True,
@@ -1092,12 +1479,14 @@ def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
                 "net_fix_ok": True,
                 "juicefs_mode": JUICEFS_ENABLED,
             }
-        if existing and existing.get("state") != "suspended":
+        elif existing and existing.get("state") != "suspended":
             raise RuntimeError(
                 f"sandbox {sid} already exists in state "
                 f"{existing.get('state', 'unknown')}"
             )
-    return None
+    if persist_vm is not None:
+        _persist_runtime_metadata(sid, persist_vm)
+    return result
 
 
 def op_resume(body: dict) -> dict:
@@ -1171,12 +1560,6 @@ def op_resume(body: dict) -> dict:
         merge_time = time.monotonic() - tm
         mem_backend_path = merged
 
-    sock = f"{d}/api-resume.sock"
-    try:
-        os.remove(sock)
-    except FileNotFoundError:
-        pass
-
     # resume 前清理旧 vsock socket(快照含 vsock 设备,残留的 v.sock 会导致
     # "Address in use" → snapshot load 失败)。这是 Firecracker 快照恢复已知坑。
     # 清理集合含:sid 目录、目录约定路径、以及从快照抠出的固化真实路径(暖池来源)。
@@ -1186,12 +1569,29 @@ def op_resume(body: dict) -> dict:
         except FileNotFoundError:
             pass
 
-    with open(f"{d}/vm-resume.log", "w") as lf:
-        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- 固定 list:FC_BIN 来自环境配置,sock 为本地派生路径,无用户输入
-        proc = subprocess.Popen([FC_BIN, "--api-sock", sock], stdout=lf, stderr=lf)
+    runtime_bind_dirs = [d, src_dir]
+    for path in stale_vsocks:
+        managed = _managed_sandbox_dir(os.path.dirname(path))
+        if managed:
+            runtime_bind_dirs.append(managed)
+    snapshot_mem_mib = max(
+        1,
+        (os.path.getsize(mem_backend_path) + 1024 * 1024 - 1)
+        // (1024 * 1024),
+    )
+    pid, sock, runtime_unit = _launch_vmm(
+        sid,
+        "api-resume.sock",
+        snapshot_mem_mib,
+        bind_dirs=runtime_bind_dirs,
+        log_name="vm-resume.log",
+    )
 
     if not _wait_sock(sock):
-        proc.kill()
+        _stop_vmm(
+            sid,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
         raise RuntimeError("firecracker resume socket 未就绪")
 
     # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
@@ -1207,21 +1607,31 @@ def op_resume(body: dict) -> dict:
     # 顺序关键:snapshot/load(resume_vm=True) 会立即恢复快照里保存的网络设备并
     # 打开宿主 tap(fctap{idx});若此时 tap 尚未就绪(或残留旧设备占用),FC 报
     # "Open tap device failed: Resource busy" → load 失败。因此必须先 setup_tap。
-    tap, _, guest_ip = _setup_tap(tap_idx)
+    tap = ""
+    try:
+        tap, _, guest_ip = _setup_tap(tap_idx)
 
-    # load 用 mem_backend_path:有 base(Diff 快照)时 = 上面合并出的 merged;
-    # 无 base(Full 快照,如暖池首份)时 = vm.mem 本身。合并只发生在存在 base 时,
-    # 是正确性所需(见上方 always-merge 说明),而非亚秒级恢复的阻碍。
-    t0 = time.monotonic()
-    _fc(sock, "PUT", "/snapshot/load", {
-        "snapshot_path": f"{snap_dir}/vm.snapshot",
-        "mem_backend":   {"backend_path": mem_backend_path, "backend_type": "File"},
-        # track_dirty_pages 不随快照保存 → load 时必须显式再设 True,
-        # 否则本次 resume 后的实例无法再打 Diff(多代接力断链)。FC 官方文档明确要求。
-        "track_dirty_pages": True,
-        "resume_vm":     True,
-    })
-    dt = time.monotonic() - t0
+        # load 用 mem_backend_path:有 base(Diff 快照)时 = 上面合并出的 merged;
+        # 无 base(Full 快照,如暖池首份)时 = vm.mem 本身。
+        t0 = time.monotonic()
+        _fc(sock, "PUT", "/snapshot/load", {
+            "snapshot_path": f"{snap_dir}/vm.snapshot",
+            "mem_backend": {
+                "backend_path": mem_backend_path,
+                "backend_type": "File",
+            },
+            "track_dirty_pages": True,
+            "resume_vm": True,
+        })
+        dt = time.monotonic() - t0
+    except Exception:
+        _stop_vmm(
+            sid,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
+        if tap:
+            _teardown_tap(tap)
+        raise
 
     # ---- P0: merged 转正为新 base(多代接力 + 存储减半)----
     # FC 语义(官方文档):load 时重置脏页位图 → resume 后的 Diff 基准 = 本次 load 的完整内存镜像。
@@ -1251,19 +1661,25 @@ def op_resume(body: dict) -> dict:
         except OSError:
             pass
 
-    _register_resumed_vm(
-        sid,
-        {
-            "state":   "running",
-            "pid":     proc.pid,
-            "sock":    sock,
-            "tap":     tap,
-            "tap_idx": tap_idx,
-            "ip":      guest_ip,
-            "dir":     d,
-        },
-        snap_dir,
-    )
+    resumed_vm = {
+        "state":   "running",
+        "pid":     pid,
+        "sock":    sock,
+        "tap":     tap,
+        "tap_idx": tap_idx,
+        "ip":      guest_ip,
+        "dir":     d,
+        "runtime_unit": runtime_unit,
+    }
+    try:
+        _register_resumed_vm(sid, resumed_vm, snap_dir)
+    except Exception:
+        with _LOCK:
+            if _VMS.get(sid) is resumed_vm:
+                _VMS.pop(sid, None)
+        _stop_vmm(sid, resumed_vm)
+        _teardown_tap(tap)
+        raise
 
     # ---- P1: resume 后经 vsock 加速 guest 网络收敛 ----
     # 跨机 resume 后,guest 内存快照固化了旧宿主 tap 的网关 MAC(stale ARP)。
@@ -1446,6 +1862,25 @@ def health_report(require_dependencies: bool) -> tuple[int, dict]:
     if require_dependencies:
         checks["kvm"] = os.path.exists("/dev/kvm")
         checks["firecracker"] = os.path.isfile(FC_BIN) and os.access(FC_BIN, os.X_OK)
+        if VMM_LAUNCH_MODE == "host-systemd":
+            checks["host_nsenter"] = (
+                os.path.isfile(HOST_NSENTER)
+                and os.access(HOST_NSENTER, os.X_OK)
+            )
+            try:
+                host_runtime = _host_control(
+                    HOST_VMM_CTL, ["check"], timeout=3
+                )
+                checks["host_runtime"] = bool(host_runtime.get("ok"))
+            except Exception:
+                checks["host_runtime"] = False
+        else:
+            checks["host_nsenter"] = True
+            checks["host_runtime"] = not VMM_USE_JAILER
+        checks["node_agent_auth"] = (
+            bool(NODE_AGENT_AUTH_SECRET)
+            if NODE_AGENT_AUTH_REQUIRED else True
+        )
         checks["state_path"] = os.path.isdir(SBX_BASE) and os.access(SBX_BASE, os.W_OK)
         heartbeat_age = (
             time.monotonic() - _HEARTBEAT_LAST_SUCCESS
@@ -1462,6 +1897,9 @@ def health_report(require_dependencies: bool) -> tuple[int, dict]:
         healthy = healthy and all((
             checks["kvm"],
             checks["firecracker"],
+            checks["host_nsenter"],
+            checks["host_runtime"],
+            checks["node_agent_auth"],
             checks["state_path"],
             heartbeat_ok,
         ))
@@ -1619,12 +2057,22 @@ def _recover_vms() -> int:
     if not os.path.isdir(SBX_BASE):
         return 0
     for sid in os.listdir(SBX_BASE):
+        if not _VMM_ID_RE.fullmatch(sid):
+            continue
         d = f"{SBX_BASE}/{sid}"
         if not os.path.isdir(d):
             continue
+        metadata = _load_runtime_metadata(sid)
+        runtime = _runtime_status(sid)
+        socket_candidates = [
+            f"{d}/api.sock",
+            f"{d}/api-resume.sock",
+        ]
+        runtime_socket = str(runtime.get("socket", ""))
+        if runtime_socket and runtime_socket not in socket_candidates:
+            socket_candidates.insert(0, runtime_socket)
         # create 用 api.sock,resume 用 api-resume.sock —— 依次探测
-        for sock_name in ("api.sock", "api-resume.sock"):
-            sock = f"{d}/{sock_name}"
+        for sock in socket_candidates:
             if not os.path.exists(sock):
                 continue
             if not _wait_sock(sock, timeout=1.0):
@@ -1635,28 +2083,51 @@ def _recover_vms() -> int:
                 state = "running" if info.get("state") == "Running" else "paused"
             except Exception:
                 state = "running"  # 探不到状态但 socket 通,保守当 running
+            recovered_pid = (
+                int(runtime.get("pid", 0) or 0)
+                or _legacy_vmm_pid(sock)
+            )
+            socket_name = os.path.basename(sock)
+            if socket_name in {"api.sock", "api-resume.sock"}:
+                _link_runtime_socket(sid, socket_name, sock)
             with _LOCK:
                 _VMS[sid] = {
                     "state": state,
-                    "pid":   None,   # 重启后无法拿回原 pid(destroy 会尽力 kill)
+                    "pid":   recovered_pid,
                     "sock":  sock,
-                    "tap":   f"fctap{_tap_idx_guess(sid)}",
-                    "ip":    "",
+                    # Never guess another VM's tap after restart. New
+                    # host-systemd runtimes always persist these fields; a
+                    # legacy/corrupt record leaves them empty so destroy may
+                    # leak one tap but cannot delete a neighbour's interface.
+                    "tap": str(metadata.get("tap", "")),
+                    "tap_idx": int(metadata.get("tap_idx", 0) or 0),
+                    "ip": str(metadata.get("ip", "")),
                     "dir":   d,
+                    "runtime_unit": (
+                        str(runtime.get("unit", ""))
+                        if runtime.get("active") else ""
+                    ),
                     # Warm-claimed VMs keep a symlink to the snapshot source
                     # vsock. Recover that source directory so a later destroy
                     # still removes all locally-owned state after restart.
-                    "owned_dirs": _recovered_owned_dirs(d),
+                    "owned_dirs": sorted(set(
+                        _recovered_owned_dirs(d)
+                        + [
+                            managed
+                            for path in metadata.get(
+                                "owned_dirs", []
+                            )
+                            if (
+                                managed := _managed_sandbox_dir(
+                                    str(path)
+                                )
+                            )
+                        ]
+                    )),
                 }
             recovered += 1
             break
     return recovered
-
-
-def _tap_idx_guess(sid: str) -> int:
-    """无内存态时无法精确知道 tap_idx;返回 1 占位(仅用于 destroy 尽力 teardown)。"""
-    return 1
-
 
 # ---------- Spot 回收信号监听 → 疏散(Block 1) ----------
 
@@ -1967,12 +2438,20 @@ def op_recovery_mount(body: dict) -> dict:
 
     os.makedirs(SBX_BASE, exist_ok=True)
     subprocess.run(["sync"], check=False)
-    # The standby path initially lives on the root filesystem. Mounting the
-    # recovered XFS over it is safe because it contains no sandbox runtime.
-    subprocess.run(
-        ["mount", "-t", "xfs", "-o", "noatime,nouuid", device, SBX_BASE],
-        check=True, capture_output=True, text=True,
-    )
+    # Production asks host systemd to own the mount, so it survives Pod and
+    # mount-namespace replacement and is correct after a host reboot.
+    if VMM_LAUNCH_MODE == "host-systemd":
+        _host_control(
+            HOST_STATE_CTL,
+            ["mount", "--device", device],
+            timeout=30,
+        )
+    else:
+        # Local/test compatibility path.
+        subprocess.run(
+            ["mount", "-t", "xfs", "-o", "noatime,nouuid", device, SBX_BASE],
+            check=True, capture_output=True, text=True,
+        )
     subprocess.run(["sync"], check=False)
     _STATE_VOLUME_CACHE = volume_id
     return {
@@ -1981,6 +2460,67 @@ def op_recovery_mount(body: dict) -> dict:
         "volume_id": volume_id,
         "device": device,
         "sandbox_dirs": sorted(os.listdir(SBX_BASE)),
+    }
+
+
+def op_recovery_unmount(body: dict) -> dict:
+    """Quiesce and unmount the current state EBS for a controlled handoff."""
+    global _STATE_VOLUME_CACHE
+    requested_volume = _normalize_volume_id(
+        str(body.get("volume_id", ""))
+    )
+    current_volume = _state_volume_id()
+    if requested_volume and current_volume and requested_volume != current_volume:
+        raise RuntimeError(
+            f"mounted state volume is {current_volume}, not {requested_volume}"
+        )
+
+    with _LOCK:
+        running = sorted(
+            sid for sid, vm in _VMS.items()
+            if vm.get("state") not in {"suspended", "stopped"}
+        )
+    if running:
+        raise RuntimeError(
+            "state volume still has running sandboxes: "
+            f"{running}"
+        )
+    if not current_volume:
+        return {
+            "unmounted": True,
+            "already_unmounted": True,
+            "volume_id": requested_volume,
+        }
+
+    device = _state_volume_device(current_volume)
+    if not device:
+        raise RuntimeError(
+            f"device for mounted state volume {current_volume} not found"
+        )
+    subprocess.run(["sync"], check=False)
+    if VMM_LAUNCH_MODE == "host-systemd":
+        result = _host_control(
+            HOST_STATE_CTL,
+            ["unmount", "--device", device],
+            timeout=30,
+        )
+    else:
+        subprocess.run(
+            ["umount", SBX_BASE],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = {"unmounted": True, "already_unmounted": False}
+    with _LOCK:
+        # Suspended entries have no VMM process and their durable state is now
+        # moving with the EBS. They will be reconstructed on the target.
+        _VMS.clear()
+    _STATE_VOLUME_CACHE = ""
+    return {
+        **result,
+        "volume_id": current_volume,
+        "device": device,
     }
 
 
@@ -2269,8 +2809,7 @@ def _checkpoint_one(
         remaining = monotonic_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("checkpoint deadline exhausted before start")
-        op_lock = _vm_op_lock(sid)
-        with op_lock:
+        with _vm_operation_lock(sid):
             info = op_suspend({
                 "id": sid,
                 "snapshot_local_path": f"{SBX_BASE}/{sid}/snap",
@@ -2611,6 +3150,93 @@ def _check_caller_allowed(client_ip: str) -> bool:
     return False
 
 
+_AUTH_VERSION = "v1"
+_AUTH_NONCES: OrderedDict[str, int] = OrderedDict()
+_AUTH_NONCES_LOCK = threading.Lock()
+
+
+def _auth_canonical_request(
+    method: str,
+    path: str,
+    timestamp: str,
+    nonce: str,
+    content_sha256: str,
+) -> bytes:
+    return "\n".join((
+        _AUTH_VERSION,
+        timestamp,
+        nonce,
+        method.upper(),
+        path,
+        content_sha256,
+    )).encode()
+
+
+def _verify_node_agent_auth(
+    method: str,
+    path: str,
+    body: bytes,
+    headers,
+    *,
+    now: int | None = None,
+) -> tuple[bool, str]:
+    """Verify HMAC integrity, freshness, and one-time nonce semantics."""
+    enabled = NODE_AGENT_AUTH_REQUIRED or bool(NODE_AGENT_AUTH_SECRET)
+    if not enabled:
+        return True, ""
+    if not NODE_AGENT_AUTH_SECRET:
+        return False, "node-agent authentication secret is not configured"
+
+    version = headers.get("X-SBX-Auth-Version", "")
+    timestamp_text = headers.get("X-SBX-Timestamp", "")
+    nonce = headers.get("X-SBX-Nonce", "")
+    content_sha256 = headers.get("X-SBX-Content-SHA256", "")
+    signature = headers.get("X-SBX-Signature", "")
+    if version != _AUTH_VERSION:
+        return False, "unsupported or missing auth version"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", nonce):
+        return False, "invalid or missing nonce"
+    if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+        return False, "invalid or missing content hash"
+    if not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return False, "invalid or missing signature"
+    try:
+        timestamp = int(timestamp_text)
+    except (TypeError, ValueError):
+        return False, "invalid or missing timestamp"
+    current = int(time.time() if now is None else now)
+    if abs(current - timestamp) > NODE_AGENT_AUTH_MAX_SKEW_S:
+        return False, "request timestamp is outside the allowed skew"
+    actual_content_sha256 = hashlib.sha256(body).hexdigest()
+    if not hmac.compare_digest(content_sha256, actual_content_sha256):
+        return False, "request body hash mismatch"
+    expected = hmac.new(
+        NODE_AGENT_AUTH_SECRET.encode(),
+        _auth_canonical_request(
+            method,
+            path,
+            timestamp_text,
+            nonce,
+            content_sha256,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False, "signature mismatch"
+
+    with _AUTH_NONCES_LOCK:
+        stale_before = current - NODE_AGENT_AUTH_MAX_SKEW_S
+        while _AUTH_NONCES:
+            seen_nonce, seen_at = next(iter(_AUTH_NONCES.items()))
+            if seen_at >= stale_before:
+                break
+            _AUTH_NONCES.pop(seen_nonce, None)
+        if nonce in _AUTH_NONCES:
+            return False, "request nonce was already used"
+        _AUTH_NONCES[nonce] = current
+    return True, ""
+
+
 class Handler(BaseHTTPRequestHandler):
     def parse_request(self) -> bool:
         parsed = super().parse_request()
@@ -2628,6 +3254,7 @@ class Handler(BaseHTTPRequestHandler):
         self.path = None
         self._otel_span = None
         self._otel_token = None
+        self._cached_request_body = None
         try:
             super().handle_one_request()
         finally:
@@ -2705,17 +3332,37 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot_type,
             )
 
-    def _body(self) -> dict:
+    def _request_body_bytes(self) -> bytes:
+        cached = getattr(self, "_cached_request_body", None)
+        if cached is not None:
+            return cached
         try:
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
             n = 0
-        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+        body = self.rfile.read(n) if n else b""
+        self._cached_request_body = body
+        return body
 
-    def _check_access(self) -> bool:
+    def _body(self) -> dict:
+        return json.loads(self._request_body_bytes() or b"{}")
+
+    def _check_access(self, body: bytes = b"") -> bool:
         client_ip = self.client_address[0]
         if not _check_caller_allowed(client_ip):
             self._send(403, {"error": "forbidden", "hint": f"caller {client_ip} not in ALLOWED_CALLER_CIDR"})
+            return False
+        allowed, reason = _verify_node_agent_auth(
+            self.command,
+            self.path,
+            body,
+            self.headers,
+        )
+        if not allowed:
+            self._send(401, {
+                "error": "unauthorized",
+                "hint": reason,
+            })
             return False
         return True
 
@@ -2750,11 +3397,13 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
         except (TypeError, ValueError):
             n = 0
-        req_body = self.rfile.read(n) if n else None
+        req_body = self._request_body_bytes() if n else None
 
         # 透传除 hop-by-hop 外的请求头
         hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-               "te", "trailers", "transfer-encoding", "upgrade", "host"}
+               "te", "trailers", "transfer-encoding", "upgrade", "host",
+               "x-sbx-auth-version", "x-sbx-timestamp", "x-sbx-nonce",
+               "x-sbx-content-sha256", "x-sbx-signature"}
         fwd_headers = {k: v for k, v in self.headers.items() if k.lower() not in hop}
         fwd_headers["Host"] = f"{guest_ip}:{port}"
 
@@ -2791,7 +3440,14 @@ class Handler(BaseHTTPRequestHandler):
         # 重放请求行 + 原始头(WS 握手头如 Sec-WebSocket-Key 必须原样带上;Host 改成 guest)
         lines = [f"{self.command} {upstream_path} HTTP/1.1"]
         for k, v in self.headers.items():
-            if k.lower() == "host":
+            if k.lower() in {
+                "host",
+                "x-sbx-auth-version",
+                "x-sbx-timestamp",
+                "x-sbx-nonce",
+                "x-sbx-content-sha256",
+                "x-sbx-signature",
+            }:
                 continue
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {guest_ip}:{port}")
@@ -2807,8 +3463,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self._maybe_proxy():
                 return
-        # 健康检查和指标不经过执行面 CIDR 校验；它们不含租户数据。
-        if path not in {"/health", "/livez", "/readyz", "/metrics"} and not self._check_access():
+        # K8s probes and metrics remain unauthenticated. /health includes node
+        # identity/capacity and is part of the signed control-plane API.
+        if path not in {"/livez", "/readyz", "/metrics"} and not self._check_access():
             return
         try:
             if path == "/health":
@@ -2856,9 +3513,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
-        if not self._check_access():
-            return
         path = urlparse(self.path).path
+        body_bytes = self._request_body_bytes()
+        if not self._check_access(body_bytes):
+            return
         if path.startswith("/proxy/"):
             if self._maybe_proxy():
                 return
@@ -2866,33 +3524,30 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/vm/") and body.get("id"):
                 sid = str(body["id"])
-                op_lock = _vm_op_lock(sid)
-                try:
-                    with op_lock:
-                        if path == "/vm/create":
-                            return self._send(200, self._run_vm_operation(
-                                "create", lambda: op_create(body)))
-                        if path == "/vm/destroy":
-                            return self._send(200, self._run_vm_operation(
-                                "destroy", lambda: op_destroy(body)))
-                        if path == "/vm/snapshot_base":
-                            return self._send(200, self._run_vm_operation(
-                                "snapshot_base", lambda: op_snapshot_base(body)))
-                        if path == "/vm/suspend":
-                            return self._send(200, self._run_vm_operation(
-                                "suspend", lambda: op_suspend(body)))
-                        if path == "/vm/resume":
-                            return self._send(200, self._run_vm_operation(
-                                "resume", lambda: op_resume(body)))
-                        if path == "/vm/exec":
-                            return self._send(200, self._run_vm_operation(
-                                "exec", lambda: op_exec(body)))
-                finally:
+                with _vm_operation_lock(sid):
+                    if path == "/vm/create":
+                        return self._send(200, self._run_vm_operation(
+                            "create", lambda: op_create(body)))
                     if path == "/vm/destroy":
-                        _drop_vm_op_lock(sid, op_lock)
+                        return self._send(200, self._run_vm_operation(
+                            "destroy", lambda: op_destroy(body)))
+                    if path == "/vm/snapshot_base":
+                        return self._send(200, self._run_vm_operation(
+                            "snapshot_base", lambda: op_snapshot_base(body)))
+                    if path == "/vm/suspend":
+                        return self._send(200, self._run_vm_operation(
+                            "suspend", lambda: op_suspend(body)))
+                    if path == "/vm/resume":
+                        return self._send(200, self._run_vm_operation(
+                            "resume", lambda: op_resume(body)))
+                    if path == "/vm/exec":
+                        return self._send(200, self._run_vm_operation(
+                            "exec", lambda: op_exec(body)))
             # Block 1 测试:注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
             if path == "/recovery/mount":
                 return self._send(200, op_recovery_mount(body))
+            if path == "/recovery/unmount":
+                return self._send(200, op_recovery_unmount(body))
             if path == "/reclaim/simulate":
                 sig = {"type": body.get("type", "spot-termination"),
                        "action": body.get("action", "terminate"),
@@ -2922,7 +3577,8 @@ class Handler(BaseHTTPRequestHandler):
     # 反代需要覆盖 web 常用的其余 method(PUT/DELETE/PATCH/HEAD/OPTIONS)。
     # 这些仅用于 /proxy/,非 proxy 路径返回 404。
     def _proxy_only(self):
-        if not self._check_access():
+        body = self._request_body_bytes()
+        if not self._check_access(body):
             return
         if urlparse(self.path).path.startswith("/proxy/") and self._maybe_proxy():
             return

@@ -123,6 +123,82 @@ def list_by_states(states: list[str]) -> list[dict]:
     return [_from_dynamo(i) for i in items]
 
 
+def list_by_recovery_target_instance(
+    instance_id: str,
+    *,
+    consistent: bool = False,
+) -> list[dict]:
+    """Return every durable sandbox still owned by one recovery host.
+
+    The GSI path is used for cheap polling. Destructive EBS handoff calls pass
+    ``consistent=True`` and scan the base table so an eventually-consistent
+    index can never hide a suspended sandbox from the OD recycle fence.
+    """
+    if not instance_id:
+        return []
+    if consistent:
+        return _scan_by_recovery_target_instance(instance_id)
+
+    items: list[dict] = []
+    query_kwargs: dict = {
+        "IndexName": (
+            "recovery_target_instance_id-updated_at-index"
+        ),
+        "KeyConditionExpression": "#target = :target",
+        "ExpressionAttributeNames": {
+            "#target": "recovery_target_instance_id",
+        },
+        "ExpressionAttributeValues": {
+            ":target": instance_id,
+        },
+    }
+    try:
+        while True:
+            response = _sb().query(**query_kwargs)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        if items:
+            return [_from_dynamo(item) for item in items]
+        # A GSI is eventually consistent. Confirm an apparently empty host
+        # with the strongly consistent base table before reclaiming its EBS.
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {
+            "ValidationException",
+            "ResourceNotFoundException",
+        }:
+            raise
+
+    # Rolling-upgrade fallback while the GSI is absent/building, and the
+    # strong empty-result confirmation described above.
+    return _scan_by_recovery_target_instance(instance_id)
+
+
+def _scan_by_recovery_target_instance(instance_id: str) -> list[dict]:
+    """Strongly consistent ownership fence used before destructive recycle."""
+    items: list[dict] = []
+    kwargs: dict = {
+        "ConsistentRead": True,
+        "FilterExpression": "#target = :target",
+        "ExpressionAttributeNames": {
+            "#target": "recovery_target_instance_id",
+        },
+        "ExpressionAttributeValues": {
+            ":target": instance_id,
+        },
+    }
+    while True:
+        response = _sb().scan(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return [_from_dynamo(item) for item in items]
+
+
 from decimal import Decimal
 
 
@@ -369,6 +445,146 @@ def release_recovery_claim(
                 "REMOVE recovery_claim_id, recovery_claim_expires"
             ),
             ConditionExpression="recovery_claim_id = :session",
+            ExpressionAttributeValues={":session": recovery_session_id},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) != "ConditionalCheckFailedException":
+            raise
+
+
+def claim_repatriation_target(
+    availability_zone: str,
+    recovery_group: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> dict | None:
+    """Atomically reserve one empty active Spot node for an EBS handoff."""
+    now = _utcnow()
+    expires = _utcnow_plus(claim_ttl_s)
+    candidates = sorted(
+        list_active_nodes(),
+        key=lambda item: (
+            -int(item.get("free_mem_mib", 0)),
+            item.get("node_id", ""),
+        ),
+    )
+    for item in candidates:
+        if item.get("availability_zone") != availability_zone:
+            continue
+        if item.get("recovery_group") != recovery_group:
+            continue
+        if item.get("recovery_role") != "active":
+            continue
+        if item.get("pool") != "spot":
+            continue
+        if not item.get("state_volume_id"):
+            continue
+        if int(item.get("vm_count", 0)) != 0:
+            continue
+        if bool(item.get("draining")):
+            continue
+        if item.get("recovery_claim_id"):
+            continue
+        node_id = item.get("node_id")
+        if not node_id:
+            continue
+        try:
+            response = _nodes().update_item(
+                Key={"node_id": node_id},
+                UpdateExpression=(
+                    "SET repatriation_claim_id=:session, "
+                    "repatriation_claim_expires=:expires, "
+                    "repatriation_replaced_volume_id=#volume"
+                ),
+                ConditionExpression=(
+                    "#role=:active AND #pool=:spot AND #vms=:zero AND "
+                    "#az=:az AND #group=:group AND "
+                    "attribute_exists(#volume) AND #volume <> :empty AND "
+                    "(attribute_not_exists(#draining) OR "
+                    "#draining=:false) AND "
+                    "attribute_not_exists(recovery_claim_id) AND "
+                    "(attribute_not_exists(repatriation_claim_id) OR "
+                    "repatriation_claim_expires < :now OR "
+                    "repatriation_claim_id = :session)"
+                ),
+                ExpressionAttributeNames={
+                    "#role": "recovery_role",
+                    "#pool": "pool",
+                    "#vms": "vm_count",
+                    "#az": "availability_zone",
+                    "#group": "recovery_group",
+                    "#volume": "state_volume_id",
+                    "#draining": "draining",
+                },
+                ExpressionAttributeValues={
+                    ":active": "active",
+                    ":spot": "spot",
+                    ":zero": 0,
+                    ":az": availability_zone,
+                    ":group": recovery_group,
+                    ":empty": "",
+                    ":false": False,
+                    ":session": recovery_session_id,
+                    ":expires": expires,
+                    ":now": now,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return _from_dynamo(response.get("Attributes") or item)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def get_repatriation_claim(recovery_session_id: str) -> dict | None:
+    for item in list_active_nodes():
+        if item.get("repatriation_claim_id") == recovery_session_id:
+            return item
+    return None
+
+
+def renew_repatriation_claim(
+    node_id: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> bool:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression="SET repatriation_claim_expires=:expires",
+            ConditionExpression="repatriation_claim_id = :session",
+            ExpressionAttributeValues={
+                ":session": recovery_session_id,
+                ":expires": _utcnow_plus(claim_ttl_s),
+            },
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def release_repatriation_claim(
+    node_id: str,
+    recovery_session_id: str,
+) -> None:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression=(
+                "REMOVE repatriation_claim_id, repatriation_claim_expires, "
+                "repatriation_replaced_volume_id"
+            ),
+            ConditionExpression="repatriation_claim_id = :session",
             ExpressionAttributeValues={":session": recovery_session_id},
         )
     except ClientError as exc:

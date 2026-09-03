@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 from sandbox_api import db
 from sandbox_api.observability import log_event
@@ -30,6 +32,12 @@ MIN_STANDBY_PER_AZ = max(
     1, int(os.environ.get("SPOT_RECOVERY_MIN_STANDBY_PER_AZ", "1"))
 )
 EKS_CLUSTER_NAME = os.environ.get("EKS_CLUSTER_NAME", "").strip()
+OD_RECYCLE_ENABLED = os.environ.get(
+    "SPOT_RECOVERY_OD_RECYCLE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes"}
+REPATRIATION_LEASE_S = max(
+    120, int(os.environ.get("SPOT_REPATRIATION_LEASE_S", "900"))
+)
 RECOVERY_STATES = [
     "checkpointing",
     "checkpointed",
@@ -37,6 +45,95 @@ RECOVERY_STATES = [
     "recovering",
     "recovery_failed",
 ]
+
+
+def _required_cluster_name() -> str:
+    cluster_name = EKS_CLUSTER_NAME.strip()
+    if not cluster_name:
+        raise RuntimeError(
+            "EKS_CLUSTER_NAME is required when Spot recovery is enabled"
+        )
+    return cluster_name
+
+
+class _SandboxLeaseSet:
+    """Fence every sandbox while its shared state EBS moves between hosts."""
+
+    def __init__(self, records: list[dict]):
+        self.sandbox_ids = sorted({
+            str(record.get("id", "")).strip()
+            for record in records
+            if str(record.get("id", "")).strip()
+        })
+        self.leases: dict[str, str] = {}
+        self.stop_event = threading.Event()
+        self.lost_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def acquire(self) -> bool:
+        for sandbox_id in self.sandbox_ids:
+            try:
+                self.leases[sandbox_id] = db.acquire_lease(
+                    sandbox_id,
+                    duration_s=REPATRIATION_LEASE_S,
+                )
+            except ClientError as exc:
+                self.release()
+                if exc.response.get("Error", {}).get(
+                    "Code"
+                ) == "ConditionalCheckFailedException":
+                    return False
+                raise
+            except Exception:
+                self.release()
+                raise
+        if self.leases:
+            self._start_renewer()
+        return True
+
+    def _start_renewer(self) -> None:
+        interval = max(10.0, REPATRIATION_LEASE_S / 3)
+
+        def renew() -> None:
+            while not self.stop_event.wait(interval):
+                for sandbox_id, lease_id in self.leases.items():
+                    try:
+                        held = db.renew_lease(
+                            sandbox_id,
+                            lease_id,
+                            duration_s=REPATRIATION_LEASE_S,
+                        )
+                    except Exception as exc:
+                        held = False
+                        log_event(
+                            "error",
+                            "spot_repatriation_lease_renew_failed",
+                            sandbox_id=sandbox_id,
+                            error_type=type(exc).__name__,
+                        )
+                    if not held:
+                        self.lost_event.set()
+                        return
+
+        self.thread = threading.Thread(
+            target=renew,
+            name="spot-repatriation-lease-renewer",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def assert_held(self) -> None:
+        if self.lost_event.is_set():
+            raise RuntimeError("sandbox repatriation lease was lost")
+
+    def release(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+            self.thread = None
+        for sandbox_id, lease_id in self.leases.items():
+            db.release_lease(sandbox_id, lease_id)
+        self.leases.clear()
 
 
 class SpotRecoveryManager:
@@ -47,6 +144,7 @@ class SpotRecoveryManager:
         driver: Any,
         ec2: Any | None = None,
         eks: Any | None = None,
+        autoscaling: Any | None = None,
     ):
         self.driver = driver
         self.ec2 = ec2 or boto3.client(
@@ -54,6 +152,7 @@ class SpotRecoveryManager:
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
         )
         self.eks = eks
+        self.autoscaling = autoscaling
 
     def reconcile_once(self) -> dict[str, Any]:
         stats: dict[str, Any] = {
@@ -62,10 +161,14 @@ class SpotRecoveryManager:
             "waiting": 0,
             "recovered": 0,
             "failed": 0,
+            "repatriation_waiting": 0,
+            "repatriated": 0,
+            "recycle_failed": 0,
             "touched": [],
         }
         if not ENABLED:
             return stats
+        _required_cluster_name()
 
         grouped: dict[str, list[dict]] = defaultdict(list)
         for record in db.list_by_states(RECOVERY_STATES):
@@ -83,6 +186,14 @@ class SpotRecoveryManager:
             result = self._recover_session(session_id, records)
             stats[result["outcome"]] += 1
             stats["touched"].extend(result.get("touched", []))
+        recycle = self._repatriate_recovery_hosts()
+        for key in (
+            "repatriation_waiting",
+            "repatriated",
+            "recycle_failed",
+        ):
+            stats[key] += int(recycle.get(key, 0))
+        stats["touched"].extend(recycle.get("touched", []))
         stats["touched"] = sorted(set(stats["touched"]))
         return stats
 
@@ -317,6 +428,666 @@ class SpotRecoveryManager:
                 + [record["id"] for record in failed]
             ),
         }
+
+    def _repatriate_recovery_hosts(self) -> dict[str, Any]:
+        stats: dict[str, Any] = {
+            "repatriation_waiting": 0,
+            "repatriated": 0,
+            "recycle_failed": 0,
+            "touched": [],
+        }
+        if not OD_RECYCLE_ENABLED:
+            return stats
+        for source in db.list_active_nodes():
+            session_id = str(source.get("recovery_claim_id", "")).strip()
+            source_instance = str(source.get("instance_id", "")).strip()
+            if (
+                not session_id
+                or not source_instance
+                or source.get("pool") == "spot"
+            ):
+                continue
+            records = db.list_by_recovery_target_instance(source_instance)
+            expected_vm_count = int(source.get("vm_count", 0) or 0)
+            if expected_vm_count > len(records):
+                # The recovery-target GSI is eventually consistent and the
+                # heartbeat is the host's current runtime count. Never move or
+                # reclaim the shared EBS from a partial ownership view.
+                stats["repatriation_waiting"] += 1
+                continue
+            if any(
+                record.get("state") in {
+                    "checkpointing",
+                    "checkpointed",
+                    "attaching",
+                    "recovering",
+                }
+                for record in records
+            ):
+                stats["repatriation_waiting"] += 1
+                continue
+            try:
+                outcome = self._repatriate_host(
+                    session_id,
+                    source,
+                    records,
+                )
+                stats[outcome] += 1
+                stats["touched"].extend(
+                    record["id"] for record in records
+                )
+            except Exception as exc:
+                stats["recycle_failed"] += 1
+                stats["touched"].extend(
+                    record["id"] for record in records
+                )
+                for record in records:
+                    db.force_update(record["id"], {
+                        "recovery_phase": "repatriation_failed",
+                        "recovery_error": str(exc)[:2048],
+                    })
+                log_event(
+                    "error",
+                    "spot_recovery_od_recycle_failed",
+                    recovery_session_id=session_id,
+                    source_instance_id=source_instance,
+                    error_type=type(exc).__name__,
+                )
+        return stats
+
+    def _repatriate_host(
+        self,
+        session_id: str,
+        source: dict,
+        records: list[dict],
+    ) -> str:
+        source_instance = str(source.get("instance_id", ""))
+        # GSI polling keeps the steady-state loop cheap, but the ownership set
+        # that fences an EBS handoff must come from a strongly consistent base
+        # table read. This catches suspended sandboxes after an agent restart,
+        # when heartbeat vm_count alone is not an authoritative record count.
+        records = db.list_by_recovery_target_instance(
+            source_instance,
+            consistent=True,
+        )
+        leases = _SandboxLeaseSet(records)
+        if not leases.acquire():
+            return "repatriation_waiting"
+        try:
+            fresh_records: list[dict] = []
+            for record in records:
+                fresh = db.get(record["id"])
+                if (
+                    not fresh
+                    or str(
+                        fresh.get("recovery_target_instance_id", "")
+                    ) != source_instance
+                ):
+                    return "repatriation_waiting"
+                fresh_records.append(fresh)
+            return self._repatriate_host_locked(
+                session_id,
+                source,
+                fresh_records,
+                leases,
+            )
+        finally:
+            leases.release()
+
+    def _repatriate_host_locked(
+        self,
+        session_id: str,
+        source: dict,
+        records: list[dict],
+        leases: _SandboxLeaseSet,
+    ) -> str:
+        source_instance = str(source.get("instance_id", ""))
+        source_ip = str(source.get("ip") or source.get("node_id") or "")
+        source_volume = str(source.get("state_volume_id", ""))
+        availability_zone = str(source.get("availability_zone", ""))
+        recovery_group = str(source.get("recovery_group", ""))
+        if not source_ip or not availability_zone or not recovery_group:
+            raise RuntimeError("recovery host metadata is incomplete")
+
+        # If every sandbox has already left this host, only the exact OD
+        # instance and any now-unused state volume remain to be reclaimed.
+        if not records:
+            target = db.get_repatriation_claim(session_id)
+            if target is not None:
+                replaced_volume = str(
+                    target.get("repatriation_replaced_volume_id", "")
+                )
+                if replaced_volume:
+                    self._delete_cluster_volume(replaced_volume)
+                db.release_repatriation_claim(
+                    str(target.get("node_id", "")),
+                    session_id,
+                )
+            if source_volume:
+                source_attachment = self._volume_attachment(
+                    source_volume,
+                    source_instance,
+                    missing_ok=True,
+                )
+                if source_attachment:
+                    self.driver.unmount_recovery_volume(
+                        source_ip,
+                        source_volume,
+                        timeout_s=ATTACH_TIMEOUT_S,
+                    )
+                    self._detach_volume(source_volume, source_instance)
+                    self._delete_cluster_volume(source_volume)
+                else:
+                    try:
+                        volume = self._volume(source_volume)
+                    except RuntimeError:
+                        volume = {}
+                    if (
+                        volume.get("State") == "available"
+                        and not (volume.get("Attachments") or [])
+                    ):
+                        self._delete_cluster_volume(source_volume)
+            self._terminate_recovery_instance(source, recovery_group)
+            log_event(
+                "info",
+                "spot_recovery_empty_od_recycled",
+                recovery_session_id=session_id,
+                source_instance_id=source_instance,
+            )
+            return "repatriated"
+
+        target = db.get_repatriation_claim(session_id)
+        if target is None:
+            target = db.claim_repatriation_target(
+                availability_zone,
+                recovery_group,
+                session_id,
+            )
+        if target is None:
+            # Recovery is already complete and the sandbox remains usable on
+            # OD. Waiting for a replacement Spot node is a capacity condition,
+            # not a sandbox lifecycle regression, so keep the public
+            # recovery_phase="recovered" until a target is actually claimed.
+            return "repatriation_waiting"
+
+        target_node_id = str(target.get("node_id", ""))
+        target_ip = str(target.get("ip") or target_node_id or "")
+        target_instance = str(target.get("instance_id", ""))
+        replacement_volume = str(
+            target.get("repatriation_replaced_volume_id")
+            or target.get("state_volume_id", "")
+        )
+        if (
+            not target_node_id
+            or not target_ip
+            or not target_instance
+            or not replacement_volume
+        ):
+            raise RuntimeError("Spot repatriation target metadata is incomplete")
+        self._validate_spot_target(
+            target_instance,
+            target_ip,
+            availability_zone,
+            recovery_group,
+        )
+
+        for record in records:
+            original_state = str(
+                record.get("repatriation_original_state")
+                or record.get("state")
+                or "running"
+            )
+            db.force_update(record["id"], {
+                "state": "repatriating",
+                "recovery_phase": "repatriation_checkpointing",
+                "repatriation_original_state": original_state,
+                "repatriation_source_instance_id": source_instance,
+                "repatriation_target_node": target_ip,
+                "repatriation_target_instance_id": target_instance,
+                "repatriation_replaced_volume_id": replacement_volume,
+                "recovery_error": "",
+            })
+
+        # Running guests receive one fresh local checkpoint. Already-suspended
+        # guests need no VMM work; their complete state is already on this EBS.
+        running_records = [
+            record for record in records
+            if (
+                record.get("repatriation_original_state")
+                or record.get("state")
+            ) == "running"
+            and not bool(record.get("repatriation_checkpointed"))
+        ]
+        checkpoint_failures: list[str] = []
+        if running_records:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    RESUME_CONCURRENCY,
+                    len(running_records),
+                ),
+                thread_name_prefix="spot-repatriate-checkpoint",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._checkpoint_for_repatriation,
+                        record,
+                        source_ip,
+                    ): record["id"]
+                    for record in running_records
+                }
+                for future in as_completed(futures):
+                    sid = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        checkpoint_failures.append(sid)
+        if checkpoint_failures:
+            raise RuntimeError(
+                "repatriation checkpoint failed for "
+                + ", ".join(sorted(checkpoint_failures))
+            )
+
+        for record in records:
+            db.force_update(record["id"], {
+                "recovery_phase": "repatriation_volume_handoff",
+            })
+
+        # The operations below are intentionally level-triggered. If the
+        # operator restarts between detach/attach/mount, the next pass observes
+        # EC2 attachment state and continues without creating another volume.
+        source_volume = (
+            str(records[0].get("recovery_source_volume_id", ""))
+            or source_volume
+        )
+        if not source_volume:
+            raise RuntimeError("recovery source volume is missing")
+        if replacement_volume == source_volume:
+            raise RuntimeError(
+                "refusing repatriation because source and replacement "
+                "volume identities are equal"
+            )
+        leases.assert_held()
+        if not db.renew_repatriation_claim(
+            target_node_id,
+            session_id,
+        ):
+            raise RuntimeError("Spot repatriation target claim was lost")
+        source_attachment = self._volume_attachment(
+            source_volume, source_instance
+        )
+        if source_attachment:
+            self.driver.unmount_recovery_volume(
+                source_ip,
+                source_volume,
+                timeout_s=ATTACH_TIMEOUT_S,
+            )
+            self._detach_volume(source_volume, source_instance)
+
+        replacement_attachment = self._volume_attachment(
+            replacement_volume,
+            target_instance,
+            missing_ok=True,
+        )
+        if replacement_attachment:
+            self.driver.unmount_recovery_volume(
+                target_ip,
+                replacement_volume,
+                timeout_s=ATTACH_TIMEOUT_S,
+            )
+            self._detach_volume(replacement_volume, target_instance)
+
+        source_attachment = self._volume_attachment(
+            source_volume,
+            target_instance,
+        )
+        if not source_attachment:
+            volume = self._volume(source_volume)
+            if volume.get("State") != "available":
+                raise RuntimeError(
+                    f"source volume {source_volume} is not available for Spot"
+                )
+            self.ec2.attach_volume(
+                VolumeId=source_volume,
+                InstanceId=target_instance,
+                Device="/dev/sdf",
+            )
+        self._wait_attached(source_volume, target_instance)
+        self.driver.mount_recovery_volume(
+            target_ip,
+            source_volume,
+            timeout_s=ATTACH_TIMEOUT_S,
+        )
+
+        resume_failures: list[str] = []
+        running_records = []
+        for record in records:
+            fresh = db.get(record["id"]) or record
+            original_state = str(
+                fresh.get("repatriation_original_state") or "running"
+            )
+            db.force_update(record["id"], {
+                "recovery_phase": "repatriation_resuming",
+            })
+            if original_state == "running":
+                running_records.append(fresh)
+            else:
+                db.force_update(record["id"], {
+                    "state": original_state,
+                    "node": target_ip,
+                    "recovery_target_node": target_ip,
+                    "recovery_target_instance_id": target_instance,
+                    "recovery_phase": "repatriated",
+                    "repatriated_at": db._utcnow(),
+                    "recovery_error": "",
+                })
+
+        if running_records:
+            if not db.renew_repatriation_claim(
+                target_node_id,
+                session_id,
+            ):
+                raise RuntimeError("Spot repatriation target claim was lost")
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    RESUME_CONCURRENCY,
+                    len(running_records),
+                ),
+                thread_name_prefix="spot-repatriate-resume",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._resume_repatriated,
+                        record,
+                        target_ip,
+                        target_instance,
+                    ): record["id"]
+                    for record in running_records
+                }
+                for future in as_completed(futures):
+                    sid = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        resume_failures.append(sid)
+        if resume_failures:
+            raise RuntimeError(
+                "repatriation resume failed for "
+                + ", ".join(sorted(resume_failures))
+            )
+
+        expected_running = sum(
+            1
+            for record in records
+            if (
+                record.get("repatriation_original_state")
+                or record.get("state")
+            ) == "running"
+        )
+        target_health = self.driver.node_health(target_ip)
+        if target_health.get("state_volume_id") != source_volume:
+            raise RuntimeError(
+                "Spot target has not published the repatriated state volume"
+            )
+        if int(target_health.get("vm_count", 0)) < expected_running:
+            raise RuntimeError(
+                "Spot target has not published all resumed sandboxes"
+            )
+
+        leases.assert_held()
+        self._delete_cluster_volume(replacement_volume)
+        db.release_repatriation_claim(
+            target_node_id,
+            session_id,
+        )
+        self._terminate_recovery_instance(source, recovery_group)
+        log_event(
+            "info",
+            "spot_recovery_od_repatriated",
+            recovery_session_id=session_id,
+            source_instance_id=source_instance,
+            target_instance_id=target_instance,
+            state_volume_id=source_volume,
+            sandboxes=len(records),
+        )
+        return "repatriated"
+
+    def _checkpoint_for_repatriation(
+        self,
+        record: dict,
+        source_ip: str,
+    ) -> None:
+        sid = record["id"]
+        fresh = db.get(sid) or record
+        runtime = self.driver.get_runtime_state(sid, {
+            **fresh,
+            "node": source_ip,
+        })
+        fields: dict[str, Any] = {}
+        if runtime == "running":
+            fields.update(
+                self.driver.checkpoint_for_repatriation(
+                    sid,
+                    {**fresh, "node": source_ip},
+                )
+            )
+        elif runtime != "suspended":
+            raise RuntimeError(
+                f"sandbox {sid} runtime is {runtime}, cannot repatriate"
+            )
+        db.force_update(sid, {
+            **fields,
+            "state": "repatriating",
+            "repatriation_checkpointed": True,
+            "recovery_phase": "repatriation_checkpointed",
+        })
+
+    def _resume_repatriated(
+        self,
+        record: dict,
+        target_ip: str,
+        target_instance: str,
+    ) -> None:
+        sid = record["id"]
+        fresh = db.get(sid) or record
+        fields = self.driver.resume(sid, {
+            **fresh,
+            "node": target_ip,
+            "recovery_target_node": target_ip,
+        })
+        db.force_update(sid, {
+            **fields,
+            "state": "running",
+            "node": target_ip,
+            "recovery_target_node": target_ip,
+            "recovery_target_instance_id": target_instance,
+            "recovery_phase": "repatriated",
+            "repatriated_at": db._utcnow(),
+            "recovery_error": "",
+            "last_active_at": db._utcnow(),
+        })
+        db.write_event(
+            sid,
+            "spot_repatriated",
+            "repatriating",
+            {
+                "target_node": target_ip,
+                "target_instance_id": target_instance,
+            },
+        )
+
+    def _validate_spot_target(
+        self,
+        instance_id: str,
+        target_ip: str,
+        availability_zone: str,
+        recovery_group: str,
+    ) -> None:
+        instance = self._instance(instance_id)
+        tags = _resource_tags(instance)
+        if instance.get("State", {}).get("Name") != "running":
+            raise RuntimeError(
+                f"Spot target {instance_id} is not running"
+            )
+        if instance.get("InstanceLifecycle") != "spot":
+            raise RuntimeError(
+                f"repatriation target {instance_id} is not Spot"
+            )
+        if instance.get("PrivateIpAddress") != target_ip:
+            raise RuntimeError("Spot target IP does not match heartbeat")
+        if instance.get("Placement", {}).get(
+            "AvailabilityZone"
+        ) != availability_zone:
+            raise RuntimeError("Spot target is in a different AZ")
+        if tags.get("eks:nodegroup-name") == recovery_group:
+            raise RuntimeError(
+                "Spot target unexpectedly belongs to the OD recovery group"
+            )
+        if EKS_CLUSTER_NAME and (
+            tags.get("eks:cluster-name") != EKS_CLUSTER_NAME
+        ):
+            raise RuntimeError(
+                f"Spot target does not belong to {EKS_CLUSTER_NAME}"
+            )
+
+    def _instance(self, instance_id: str) -> dict:
+        response = self.ec2.describe_instances(
+            InstanceIds=[instance_id]
+        )
+        instances = [
+            instance
+            for reservation in response.get("Reservations") or []
+            for instance in reservation.get("Instances") or []
+        ]
+        if len(instances) != 1:
+            raise RuntimeError(f"instance {instance_id} was not found")
+        return instances[0]
+
+    def _volume_attachment(
+        self,
+        volume_id: str,
+        instance_id: str,
+        *,
+        missing_ok: bool = False,
+    ) -> dict | None:
+        try:
+            volume = self._volume(volume_id)
+        except RuntimeError:
+            if missing_ok:
+                return None
+            raise
+        return next(
+            (
+                attachment
+                for attachment in volume.get("Attachments") or []
+                if attachment.get("InstanceId") == instance_id
+                and attachment.get("State") in {
+                    "attaching", "attached", "detaching"
+                }
+            ),
+            None,
+        )
+
+    def _detach_volume(
+        self,
+        volume_id: str,
+        instance_id: str,
+    ) -> None:
+        attachment = self._volume_attachment(
+            volume_id,
+            instance_id,
+            missing_ok=True,
+        )
+        if attachment and attachment.get("State") != "detaching":
+            self.ec2.detach_volume(
+                VolumeId=volume_id,
+                InstanceId=instance_id,
+            )
+        deadline = time.monotonic() + ATTACH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                volume = self._volume(volume_id)
+            except RuntimeError:
+                return
+            if (
+                volume.get("State") == "available"
+                and not (volume.get("Attachments") or [])
+            ):
+                return
+            time.sleep(2)  # nosemgrep: arbitrary-sleep -- EBS detach poll
+        raise TimeoutError(
+            f"volume {volume_id} did not detach from {instance_id}"
+        )
+
+    def _delete_cluster_volume(self, volume_id: str) -> None:
+        cluster_name = _required_cluster_name()
+        try:
+            volume = self._volume(volume_id)
+        except RuntimeError:
+            return
+        if volume.get("State") != "available":
+            raise RuntimeError(
+                f"volume {volume_id} is not available for deletion"
+            )
+        if (
+            _resource_tags(volume).get("eks:cluster-name")
+            != cluster_name
+        ):
+            raise RuntimeError(
+                f"refusing to delete volume outside {cluster_name}"
+            )
+        self.ec2.delete_volume(VolumeId=volume_id)
+
+    def _terminate_recovery_instance(
+        self,
+        source: dict,
+        recovery_group: str,
+    ) -> None:
+        cluster_name = _required_cluster_name()
+        instance_id = str(source.get("instance_id", ""))
+        instance = self._instance(instance_id)
+        tags = _resource_tags(instance)
+        if instance.get("InstanceLifecycle") == "spot":
+            raise RuntimeError("refusing to recycle a Spot source as OD")
+        if tags.get("eks:nodegroup-name") != recovery_group:
+            raise RuntimeError(
+                "recovery instance no longer belongs to the claimed node group"
+            )
+        if tags.get("eks:cluster-name") != cluster_name:
+            raise RuntimeError(
+                f"recovery instance does not belong to {cluster_name}"
+            )
+        autoscaling_group = tags.get("aws:autoscaling:groupName", "")
+        if not autoscaling_group:
+            raise RuntimeError(
+                f"recovery instance {instance_id} has no ASG identity"
+            )
+        autoscaling = self.autoscaling or boto3.client(
+            "autoscaling",
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        self.autoscaling = autoscaling
+        should_decrement = False
+        if REPLENISH_ENABLED:
+            eks = self.eks or boto3.client(
+                "eks",
+                region_name=os.environ.get("AWS_REGION", "us-east-1"),
+            )
+            self.eks = eks
+            response = eks.describe_nodegroup(
+                clusterName=cluster_name,
+                nodegroupName=recovery_group,
+            )
+            scaling = response["nodegroup"]["scalingConfig"]
+            desired = int(scaling["desiredSize"])
+            minimum = int(scaling["minSize"])
+            # Replenishment normally raised desired above min while the claimed
+            # OD host was busy. If that scale-up failed, keep desired unchanged
+            # so ASG replaces the terminated host instead of shrinking to zero.
+            should_decrement = desired > minimum
+        autoscaling.terminate_instance_in_auto_scaling_group(
+            InstanceId=instance_id,
+            ShouldDecrementDesiredCapacity=should_decrement,
+        )
 
     def _ensure_standby_capacity(self, claimed: dict) -> None:
         """Keep at least MIN_STANDBY_PER_AZ unclaimed nodes in the group.

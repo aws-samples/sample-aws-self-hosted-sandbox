@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+#
+# Host-side Firecracker runtime controller.
+#
+# node-agent enters the host namespaces and calls this script.  The script
+# asks PID 1/systemd to own each VMM as an independent service, so replacing
+# the node-agent Pod does not kill live microVMs.
+set -euo pipefail
+
+SBX_BASE="${SBX_BASE:-/var/lib/sbx}"
+JAILER_BASE="${JAILER_BASE:-/srv/jailer}"
+FC_BIN="${FC_BIN:-/usr/local/bin/firecracker}"
+JAILER_BIN="${JAILER_BIN:-/usr/local/bin/firecracker-jailer}"
+FC_MIN_VERSION="${FC_MIN_VERSION:-1.14.1}"
+JAILER_EXEC_NAME="${FC_BIN##*/}"
+
+die() {
+  echo "sbx-vmm-runtime: $*" >&2
+  exit 1
+}
+
+valid_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,63}$ ]]
+}
+
+unit_for() {
+  printf 'sbx-vmm-%s.service' "$1"
+}
+
+jail_dir_for() {
+  printf '%s/%s/%s' "$JAILER_BASE" "$JAILER_EXEC_NAME" "$1"
+}
+
+socket_for() {
+  local sid="$1"
+  local socket_name="$2"
+  local jailed="$3"
+  if [[ "$jailed" == "1" ]]; then
+    printf '%s/root/run/%s' "$(jail_dir_for "$sid")" "$socket_name"
+  else
+    printf '%s/%s/%s' "$SBX_BASE" "$sid" "$socket_name"
+  fi
+}
+
+binary_version() {
+  local binary="$1"
+  "$binary" --version 2>&1 \
+    | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' \
+    | head -n 1
+}
+
+version_at_least() {
+  local actual="$1"
+  local minimum="$2"
+  [[ -n "$actual" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n 1)" == "$minimum" ]]
+}
+
+check_runtime() {
+  command -v systemd-run >/dev/null
+  command -v systemctl >/dev/null
+  command -v mount >/dev/null
+  command -v sort >/dev/null
+  [[ -x "$FC_BIN" ]] || die "Firecracker binary is unavailable: $FC_BIN"
+  [[ -x "$JAILER_BIN" ]] || die "jailer binary is unavailable: $JAILER_BIN"
+
+  local firecracker_version jailer_version
+  firecracker_version="$(binary_version "$FC_BIN")"
+  jailer_version="$(binary_version "$JAILER_BIN")"
+  version_at_least "$firecracker_version" "$FC_MIN_VERSION" \
+    || die "Firecracker v${firecracker_version:-unknown} is below required v$FC_MIN_VERSION"
+  version_at_least "$jailer_version" "$FC_MIN_VERSION" \
+    || die "jailer v${jailer_version:-unknown} is below required v$FC_MIN_VERSION"
+}
+
+existing_socket_for() {
+  local sid="$1"
+  local candidate
+  for candidate in \
+    "$(jail_dir_for "$sid")/root/run/api.sock" \
+    "$(jail_dir_for "$sid")/root/run/api-resume.sock" \
+    "$SBX_BASE/$sid/api.sock" \
+    "$SBX_BASE/$sid/api-resume.sock"; do
+    if [[ -S "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_bind_dir() {
+  local path="$1"
+  [[ "$path" == "$SBX_BASE/"* ]] || die "bind dir is outside $SBX_BASE: $path"
+  local relative="${path#"$SBX_BASE/"}"
+  [[ -n "$relative" && "$relative" != */* ]] || die "bind dir must be a direct sandbox child: $path"
+  valid_id "$relative" || die "invalid bind sandbox id: $relative"
+  [[ -d "$path" ]] || die "bind dir does not exist: $path"
+}
+
+run_jailer() {
+  local sid=""
+  local socket_name=""
+  local uid=""
+  local gid=""
+  local bind_dirs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) sid="${2:-}"; shift 2 ;;
+      --socket-name) socket_name="${2:-}"; shift 2 ;;
+      --uid) uid="${2:-}"; shift 2 ;;
+      --gid) gid="${2:-}"; shift 2 ;;
+      --bind-dir) bind_dirs+=("${2:-}"); shift 2 ;;
+      *) die "unknown run-jailer argument: $1" ;;
+    esac
+  done
+
+  valid_id "$sid" || die "invalid sandbox id"
+  [[ "$socket_name" == "api.sock" || "$socket_name" == "api-resume.sock" ]] \
+    || die "invalid API socket name"
+  [[ "$uid" =~ ^[1-9][0-9]*$ && "$gid" =~ ^[1-9][0-9]*$ ]] \
+    || die "uid/gid must be positive integers"
+  [[ -x "$FC_BIN" ]] || die "Firecracker binary is unavailable: $FC_BIN"
+  [[ -x "$JAILER_BIN" ]] || die "jailer binary is unavailable: $JAILER_BIN"
+  [[ ${#bind_dirs[@]} -gt 0 ]] || die "at least one sandbox bind dir is required"
+
+  local jail_dir
+  jail_dir="$(jail_dir_for "$sid")"
+  local jail_root="$jail_dir/root"
+  mkdir -p "$jail_root/run" "$jail_root/var/lib/sbx" "$jail_root/opt/sbx"
+
+  local source name target
+  for source in "${bind_dirs[@]}"; do
+    validate_bind_dir "$source"
+    name="${source##*/}"
+    target="$jail_root/var/lib/sbx/$name"
+    mkdir -p "$target"
+    mount --bind "$source" "$target"
+    chown -R "$uid:$gid" "$source"
+  done
+
+  mount --bind /opt/sbx "$jail_root/opt/sbx"
+  mount -o remount,bind,ro "$jail_root/opt/sbx"
+
+  exec "$JAILER_BIN" \
+    --id "$sid" \
+    --exec-file "$FC_BIN" \
+    --uid "$uid" \
+    --gid "$gid" \
+    --chroot-base-dir "$JAILER_BASE" \
+    --cgroup-version 2 \
+    --new-pid-ns \
+    -- \
+    --api-sock "/run/$socket_name"
+}
+
+start_vmm() {
+  local sid=""
+  local socket_name=""
+  local memory_mib=""
+  local uid=""
+  local gid=""
+  local jailed="1"
+  local bind_dirs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) sid="${2:-}"; shift 2 ;;
+      --socket-name) socket_name="${2:-}"; shift 2 ;;
+      --memory-mib) memory_mib="${2:-}"; shift 2 ;;
+      --uid) uid="${2:-}"; shift 2 ;;
+      --gid) gid="${2:-}"; shift 2 ;;
+      --jailer) jailed="${2:-}"; shift 2 ;;
+      --bind-dir) bind_dirs+=("${2:-}"); shift 2 ;;
+      *) die "unknown start argument: $1" ;;
+    esac
+  done
+
+  valid_id "$sid" || die "invalid sandbox id"
+  [[ "$socket_name" == "api.sock" || "$socket_name" == "api-resume.sock" ]] \
+    || die "invalid API socket name"
+  [[ "$memory_mib" =~ ^[1-9][0-9]*$ ]] || die "memory-mib must be positive"
+  [[ "$uid" =~ ^[1-9][0-9]*$ && "$gid" =~ ^[1-9][0-9]*$ ]] \
+    || die "uid/gid must be positive integers"
+  [[ "$jailed" == "0" || "$jailed" == "1" ]] || die "jailer must be 0 or 1"
+  [[ ${#bind_dirs[@]} -gt 0 ]] || die "at least one sandbox bind dir is required"
+  check_runtime
+  local source
+  for source in "${bind_dirs[@]}"; do
+    validate_bind_dir "$source"
+  done
+
+  local unit socket_path log_path
+  unit="$(unit_for "$sid")"
+  socket_path="$(socket_for "$sid" "$socket_name" "$jailed")"
+  log_path="$SBX_BASE/$sid/vmm.log"
+
+  if systemctl is-active --quiet "$unit"; then
+    socket_path="$(existing_socket_for "$sid" || printf '%s' "$socket_path")"
+    printf '{"unit":"%s","pid":%s,"socket":"%s","already_running":true}\n' \
+      "$unit" "$(systemctl show "$unit" -p MainPID --value)" "$socket_path"
+    return 0
+  fi
+
+  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  rm -f "$SBX_BASE/$sid/$socket_name"
+  if [[ "$jailed" == "1" ]]; then
+    rm -rf "$(jail_dir_for "$sid")"
+  fi
+
+  local command=()
+  if [[ "$jailed" == "1" ]]; then
+    command=("$0" run-jailer
+      --id "$sid"
+      --socket-name "$socket_name"
+      --uid "$uid"
+      --gid "$gid")
+    for source in "${bind_dirs[@]}"; do
+      command+=(--bind-dir "$source")
+    done
+  else
+    command=("$FC_BIN" --api-sock "$socket_path")
+  fi
+
+  systemd-run \
+    --unit "$unit" \
+    --collect \
+    --service-type exec \
+    --property "Description=Firecracker sandbox $sid" \
+    --property "KillMode=mixed" \
+    --property "Delegate=yes" \
+    --property "PrivateMounts=yes" \
+    --property "Restart=no" \
+    --property "OOMPolicy=stop" \
+    --property "TasksMax=512" \
+    --property "MemoryMax=${memory_mib}M" \
+    --property "StandardOutput=append:$log_path" \
+    --property "StandardError=append:$log_path" \
+    -- "${command[@]}" >/dev/null
+
+  local attempt pid
+  pid=0
+  for attempt in $(seq 1 50); do
+    pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || echo 0)"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || {
+    systemctl status "$unit" --no-pager >&2 || true
+    die "systemd unit did not expose a MainPID: $unit"
+  }
+  printf '{"unit":"%s","pid":%s,"socket":"%s","already_running":false}\n' \
+    "$unit" "$pid" "$socket_path"
+}
+
+stop_vmm() {
+  local sid="${1:-}"
+  valid_id "$sid" || die "invalid sandbox id"
+  local unit jail_dir
+  unit="$(unit_for "$sid")"
+  jail_dir="$(jail_dir_for "$sid")"
+
+  if systemctl is-active --quiet "$unit"; then
+    systemctl stop "$unit" >/dev/null 2>&1 \
+      || die "failed to stop systemd unit: $unit"
+  fi
+  if systemctl is-active --quiet "$unit"; then
+    die "systemd unit is still active after stop: $unit"
+  fi
+
+  systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  rm -rf "$jail_dir"
+  printf '{"unit":"%s","stopped":true}\n' "$unit"
+}
+
+status_vmm() {
+  local sid="${1:-}"
+  valid_id "$sid" || die "invalid sandbox id"
+  local unit pid active socket
+  unit="$(unit_for "$sid")"
+  pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || echo 0)"
+  active=false
+  systemctl is-active --quiet "$unit" && active=true
+  socket="$(existing_socket_for "$sid" || true)"
+  printf '{"unit":"%s","pid":%s,"active":%s,"socket":"%s"}\n' \
+    "$unit" "${pid:-0}" "$active" "$socket"
+}
+
+case "${1:-}" in
+  check)
+    check_runtime
+    echo '{"ok":true}'
+    ;;
+  start)
+    shift
+    start_vmm "$@"
+    ;;
+  stop)
+    shift
+    [[ "${1:-}" == "--id" ]] || die "stop requires --id"
+    stop_vmm "${2:-}"
+    ;;
+  status)
+    shift
+    [[ "${1:-}" == "--id" ]] || die "status requires --id"
+    status_vmm "${2:-}"
+    ;;
+  run-jailer)
+    shift
+    run_jailer "$@"
+    ;;
+  *)
+    die "usage: $0 {check|start|stop|status|run-jailer} ..."
+    ;;
+esac

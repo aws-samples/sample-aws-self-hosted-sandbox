@@ -33,7 +33,28 @@ def _create_tables() -> None:
         KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
         AttributeDefinitions=[
             {"AttributeName": "id", "AttributeType": "S"},
+            {
+                "AttributeName": "recovery_target_instance_id",
+                "AttributeType": "S",
+            },
+            {"AttributeName": "updated_at", "AttributeType": "S"},
         ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": (
+                "recovery_target_instance_id-updated_at-index"
+            ),
+            "KeySchema": [
+                {
+                    "AttributeName": "recovery_target_instance_id",
+                    "KeyType": "HASH",
+                },
+                {
+                    "AttributeName": "updated_at",
+                    "KeyType": "RANGE",
+                },
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
     )
     ddb.create_table(
         TableName="sandbox_events",
@@ -158,6 +179,7 @@ class _FakeEKS:
             "nodegroup": {
                 "scalingConfig": {
                     "desiredSize": self.desired,
+                    "minSize": 1,
                     "maxSize": self.maximum,
                 }
             }
@@ -167,6 +189,173 @@ class _FakeEKS:
         self.update_calls.append(dict(kwargs))
         self.desired = kwargs["scalingConfig"]["desiredSize"]
         return {"update": {"status": "InProgress"}}
+
+
+class _RepatriationEC2:
+    def __init__(self):
+        common_tags = [
+            {"Key": "eks:cluster-name", "Value": "claude-sbx"},
+        ]
+        self.instances = {
+            "i-od": {
+                "InstanceId": "i-od",
+                "PrivateIpAddress": "10.0.1.20",
+                "State": {"Name": "running"},
+                "Placement": {"AvailabilityZone": "us-east-1a"},
+                "Tags": common_tags + [
+                    {
+                        "Key": "eks:nodegroup-name",
+                        "Value": "claude-sbx-recovery-0",
+                    },
+                    {
+                        "Key": "aws:autoscaling:groupName",
+                        "Value": "eks-claude-sbx-recovery-0-test",
+                    },
+                ],
+            },
+            "i-spot": {
+                "InstanceId": "i-spot",
+                "PrivateIpAddress": "10.0.1.30",
+                "InstanceLifecycle": "spot",
+                "State": {"Name": "running"},
+                "Placement": {"AvailabilityZone": "us-east-1a"},
+                "Tags": common_tags + [
+                    {
+                        "Key": "eks:nodegroup-name",
+                        "Value": "claude-sbx-active-0",
+                    },
+                ],
+            },
+        }
+        self.volumes = {
+            "vol-source": {
+                "VolumeId": "vol-source",
+                "AvailabilityZone": "us-east-1a",
+                "State": "in-use",
+                "Attachments": [{
+                    "InstanceId": "i-od",
+                    "State": "attached",
+                    "Device": "/dev/sdf",
+                }],
+                "Tags": copy.deepcopy(common_tags),
+            },
+            "vol-fresh": {
+                "VolumeId": "vol-fresh",
+                "AvailabilityZone": "us-east-1a",
+                "State": "in-use",
+                "Attachments": [{
+                    "InstanceId": "i-spot",
+                    "State": "attached",
+                    "Device": "/dev/sdf",
+                }],
+                "Tags": copy.deepcopy(common_tags),
+            },
+        }
+        self.detach_calls: list[dict] = []
+        self.attach_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
+
+    def describe_instances(self, InstanceIds: list[str]) -> dict:
+        instances = [
+            copy.deepcopy(self.instances[instance_id])
+            for instance_id in InstanceIds
+            if instance_id in self.instances
+        ]
+        return {"Reservations": [{"Instances": instances}]}
+
+    def describe_volumes(self, VolumeIds: list[str]) -> dict:
+        return {
+            "Volumes": [
+                copy.deepcopy(self.volumes[volume_id])
+                for volume_id in VolumeIds
+                if volume_id in self.volumes
+            ]
+        }
+
+    def detach_volume(self, **kwargs) -> dict:
+        self.detach_calls.append(dict(kwargs))
+        volume = self.volumes[kwargs["VolumeId"]]
+        volume["State"] = "available"
+        volume["Attachments"] = []
+        return {}
+
+    def attach_volume(self, **kwargs) -> dict:
+        self.attach_calls.append(dict(kwargs))
+        volume = self.volumes[kwargs["VolumeId"]]
+        volume["State"] = "in-use"
+        volume["Attachments"] = [{
+            "InstanceId": kwargs["InstanceId"],
+            "State": "attached",
+            "Device": kwargs["Device"],
+        }]
+        return {}
+
+    def delete_volume(self, **kwargs) -> dict:
+        self.delete_calls.append(dict(kwargs))
+        del self.volumes[kwargs["VolumeId"]]
+        return {}
+
+
+class _RepatriationDriver:
+    def __init__(self):
+        self.unmount_calls: list[tuple[str, str]] = []
+        self.mount_calls: list[tuple[str, str]] = []
+        self.checkpoint_calls: list[str] = []
+        self.resume_calls: list[str] = []
+
+    def get_runtime_state(self, sandbox_id: str, _record: dict) -> str:
+        return "running"
+
+    def checkpoint_for_repatriation(
+        self,
+        sandbox_id: str,
+        _record: dict,
+    ) -> dict:
+        self.checkpoint_calls.append(sandbox_id)
+        return {"snapshot_type": "diff"}
+
+    def unmount_recovery_volume(
+        self,
+        node: str,
+        volume_id: str,
+        *,
+        timeout_s: int,
+    ) -> dict:
+        self.unmount_calls.append((node, volume_id))
+        return {"unmounted": True}
+
+    def mount_recovery_volume(
+        self,
+        node: str,
+        volume_id: str,
+        *,
+        timeout_s: int,
+    ) -> dict:
+        self.mount_calls.append((node, volume_id))
+        return {"mounted": True}
+
+    def resume(self, sandbox_id: str, record: dict) -> dict:
+        self.resume_calls.append(sandbox_id)
+        return {
+            "node": record["recovery_target_node"],
+            "guest_ip": "172.18.1.2",
+            "restore_mode": "ebs-local",
+        }
+
+    def node_health(self, _node: str) -> dict:
+        return {
+            "state_volume_id": "vol-source",
+            "vm_count": len(self.resume_calls),
+        }
+
+
+class _FakeAutoscaling:
+    def __init__(self):
+        self.terminate_calls: list[dict] = []
+
+    def terminate_instance_in_auto_scaling_group(self, **kwargs) -> dict:
+        self.terminate_calls.append(dict(kwargs))
+        return {"Activity": {"StatusCode": "InProgress"}}
 
 
 def _seed_session(*, states: tuple[str, ...] = ("checkpointed", "checkpointed")):
@@ -206,6 +395,63 @@ def _seed_session(*, states: tuple[str, ...] = ("checkpointed", "checkpointed"))
 
 
 class TestSpotRecovery(unittest.TestCase):
+    def setUp(self) -> None:
+        from sandbox_api import recovery
+
+        cluster_name = patch.object(
+            recovery, "EKS_CLUSTER_NAME", "claude-sbx"
+        )
+        cluster_name.start()
+        self.addCleanup(cluster_name.stop)
+
+    def test_enabled_recovery_requires_cluster_name(self) -> None:
+        from sandbox_api import recovery
+
+        with (
+            patch.object(recovery, "ENABLED", True),
+            patch.object(recovery, "EKS_CLUSTER_NAME", ""),
+            patch.object(
+                recovery.db, "list_by_states"
+            ) as list_by_states,
+        ):
+            manager = recovery.SpotRecoveryManager(
+                _FakeDriver(), ec2=_FakeEC2()
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "EKS_CLUSTER_NAME is required"
+            ):
+                manager.reconcile_once()
+
+        list_by_states.assert_not_called()
+
+    def test_destructive_cleanup_requires_cluster_name(self) -> None:
+        from sandbox_api import recovery
+
+        ec2 = _RepatriationEC2()
+        ec2.volumes["vol-fresh"]["State"] = "available"
+        ec2.volumes["vol-fresh"]["Attachments"] = []
+        autoscaling = _FakeAutoscaling()
+        manager = recovery.SpotRecoveryManager(
+            _RepatriationDriver(),
+            ec2=ec2,
+            autoscaling=autoscaling,
+        )
+        with patch.object(recovery, "EKS_CLUSTER_NAME", ""):
+            with self.assertRaisesRegex(
+                RuntimeError, "EKS_CLUSTER_NAME is required"
+            ):
+                manager._delete_cluster_volume("vol-fresh")
+            with self.assertRaisesRegex(
+                RuntimeError, "EKS_CLUSTER_NAME is required"
+            ):
+                manager._terminate_recovery_instance(
+                    {"instance_id": "i-od"},
+                    "claude-sbx-recovery-0",
+                )
+
+        self.assertEqual(ec2.delete_calls, [])
+        self.assertEqual(autoscaling.terminate_calls, [])
+
     @mock_aws
     def test_checkpointed_session_attaches_mounts_and_resumes(self) -> None:
         _create_tables()
@@ -461,6 +707,219 @@ class TestSpotRecovery(unittest.TestCase):
             ).reconcile_once()
 
         self.assertEqual(eks.update_calls, [])
+
+    @mock_aws
+    def test_recovered_od_is_repatriated_to_spot_and_scaled_down(self) -> None:
+        _create_tables()
+        from sandbox_api import db, recovery
+
+        db.put({
+            "id": "sbx-repatriate",
+            "tenant_id": "tenant",
+            "driver": "firecracker",
+            "state": "running",
+            "node": "10.0.1.20",
+            "tap_idx": 7,
+            "recovery_session_id": "session-repatriate",
+            "recovery_source_volume_id": "vol-source",
+            "recovery_target_instance_id": "i-od",
+            "recovery_target_node": "10.0.1.20",
+            "recovery_az": "us-east-1a",
+            "updated_at": db._utcnow(),
+        })
+        nodes = boto3.resource(
+            "dynamodb", region_name="us-east-1"
+        ).Table("sandbox_nodes")
+        nodes.put_item(Item={
+            "node_id": "od-node",
+            "ip": "10.0.1.20",
+            "instance_id": "i-od",
+            "availability_zone": "us-east-1a",
+            "recovery_role": "active",
+            "recovery_group": "claude-sbx-recovery-0",
+            "recovery_claim_id": "session-repatriate",
+            "recovery_claim_expires": db._utcnow_plus(1800),
+            "state_volume_id": "vol-source",
+            "pool": "protected",
+            "free_mem_mib": 200000,
+            "vm_count": 1,
+            "draining": False,
+            "last_seen": db._utcnow(),
+        })
+        nodes.put_item(Item={
+            "node_id": "spot-node",
+            "ip": "10.0.1.30",
+            "instance_id": "i-spot",
+            "availability_zone": "us-east-1a",
+            "recovery_role": "active",
+            "recovery_group": "claude-sbx-recovery-0",
+            "state_volume_id": "vol-fresh",
+            "pool": "spot",
+            "free_mem_mib": 200000,
+            "vm_count": 0,
+            "draining": False,
+            "last_seen": db._utcnow(),
+        })
+
+        ec2 = _RepatriationEC2()
+        driver = _RepatriationDriver()
+        autoscaling = _FakeAutoscaling()
+        eks = _FakeEKS()
+        eks.desired = 2
+        with (
+            patch.object(recovery, "ENABLED", True),
+            patch.object(recovery, "OD_RECYCLE_ENABLED", True),
+            patch.object(recovery, "EKS_CLUSTER_NAME", "claude-sbx"),
+        ):
+            result = recovery.SpotRecoveryManager(
+                driver,
+                ec2=ec2,
+                eks=eks,
+                autoscaling=autoscaling,
+            ).reconcile_once()
+
+        self.assertEqual(result["repatriated"], 1)
+        self.assertEqual(result["recycle_failed"], 0)
+        self.assertEqual(driver.checkpoint_calls, ["sbx-repatriate"])
+        self.assertEqual(driver.resume_calls, ["sbx-repatriate"])
+        self.assertEqual(
+            driver.unmount_calls,
+            [
+                ("10.0.1.20", "vol-source"),
+                ("10.0.1.30", "vol-fresh"),
+            ],
+        )
+        self.assertEqual(
+            driver.mount_calls,
+            [("10.0.1.30", "vol-source")],
+        )
+        self.assertEqual(
+            ec2.attach_calls[0]["InstanceId"],
+            "i-spot",
+        )
+        self.assertEqual(
+            ec2.delete_calls,
+            [{"VolumeId": "vol-fresh"}],
+        )
+        self.assertEqual(
+            autoscaling.terminate_calls,
+            [{
+                "InstanceId": "i-od",
+                "ShouldDecrementDesiredCapacity": True,
+            }],
+        )
+        record = db.get("sbx-repatriate")
+        self.assertEqual(record["state"], "running")
+        self.assertEqual(record["node"], "10.0.1.30")
+        self.assertEqual(record["recovery_phase"], "repatriated")
+        self.assertIsNone(
+            db.get_repatriation_claim("session-repatriate")
+        )
+
+    @mock_aws
+    def test_post_resume_retry_cleans_claim_and_recycles_od(self) -> None:
+        _create_tables()
+        from sandbox_api import db, recovery
+
+        nodes = boto3.resource(
+            "dynamodb", region_name="us-east-1"
+        ).Table("sandbox_nodes")
+        nodes.put_item(Item={
+            "node_id": "od-node",
+            "ip": "10.0.1.20",
+            "instance_id": "i-od",
+            "availability_zone": "us-east-1a",
+            "recovery_role": "standby",
+            "recovery_group": "claude-sbx-recovery-0",
+            "recovery_claim_id": "session-repatriate",
+            "recovery_claim_expires": db._utcnow_plus(1800),
+            # Simulate one stale heartbeat after the EBS already moved. The
+            # cleanup retry must not delete the volume now attached to Spot.
+            "state_volume_id": "vol-source",
+            "pool": "protected",
+            "free_mem_mib": 200000,
+            "vm_count": 0,
+            "draining": False,
+            "last_seen": db._utcnow(),
+        })
+        nodes.put_item(Item={
+            "node_id": "spot-node",
+            "ip": "10.0.1.30",
+            "instance_id": "i-spot",
+            "availability_zone": "us-east-1a",
+            "recovery_role": "active",
+            "recovery_group": "claude-sbx-recovery-0",
+            "repatriation_claim_id": "session-repatriate",
+            "repatriation_claim_expires": db._utcnow_plus(1800),
+            "repatriation_replaced_volume_id": "vol-fresh",
+            "state_volume_id": "vol-source",
+            "pool": "spot",
+            "free_mem_mib": 190000,
+            "vm_count": 1,
+            "draining": False,
+            "last_seen": db._utcnow(),
+        })
+
+        ec2 = _RepatriationEC2()
+        ec2.volumes["vol-source"]["Attachments"] = [{
+            "InstanceId": "i-spot",
+            "State": "attached",
+            "Device": "/dev/sdf",
+        }]
+        ec2.volumes["vol-fresh"]["State"] = "available"
+        ec2.volumes["vol-fresh"]["Attachments"] = []
+        autoscaling = _FakeAutoscaling()
+        eks = _FakeEKS()
+        # Simulate a failed pre-recovery scale-up: terminating the claimed host
+        # must keep desired=1 so ASG replaces the standby baseline.
+        eks.desired = 1
+        with (
+            patch.object(recovery, "ENABLED", True),
+            patch.object(recovery, "OD_RECYCLE_ENABLED", True),
+            patch.object(recovery, "EKS_CLUSTER_NAME", "claude-sbx"),
+        ):
+            result = recovery.SpotRecoveryManager(
+                _RepatriationDriver(),
+                ec2=ec2,
+                eks=eks,
+                autoscaling=autoscaling,
+            ).reconcile_once()
+
+        self.assertEqual(result["repatriated"], 1)
+        self.assertEqual(
+            ec2.delete_calls,
+            [{"VolumeId": "vol-fresh"}],
+        )
+        self.assertIn("vol-source", ec2.volumes)
+        self.assertEqual(
+            autoscaling.terminate_calls,
+            [{
+                "InstanceId": "i-od",
+                "ShouldDecrementDesiredCapacity": False,
+            }],
+        )
+        self.assertIsNone(
+            db.get_repatriation_claim("session-repatriate")
+        )
+
+    @mock_aws
+    def test_repatriation_waits_for_existing_sandbox_lease(self) -> None:
+        _create_tables()
+        from sandbox_api import db, recovery
+
+        db.put({
+            "id": "sbx-leased",
+            "tenant_id": "tenant",
+            "driver": "firecracker",
+            "state": "running",
+            "updated_at": db._utcnow(),
+        })
+        existing = db.acquire_lease("sbx-leased", duration_s=900)
+        leases = recovery._SandboxLeaseSet([{"id": "sbx-leased"}])
+
+        self.assertFalse(leases.acquire())
+        self.assertEqual(db.get("sbx-leased")["lease_id"], existing)
+        db.release_lease("sbx-leased", existing)
 
 
 if __name__ == "__main__":

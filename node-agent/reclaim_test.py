@@ -38,6 +38,7 @@ class TestSpotReclaim(unittest.TestCase):
     def setUp(self) -> None:
         agent._VMS.clear()
         agent._VM_OP_LOCKS.clear()
+        agent._VM_OP_LOCK_USERS.clear()
         agent._STATE_VOLUME_CACHE = ""
         agent._NODE_RECOVERY_IDENTITY_CACHE.update({
             "role": "",

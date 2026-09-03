@@ -81,6 +81,7 @@ _ACTIVE_STATES = [
     "checkpointed",
     "attaching",
     "recovering",
+    "repatriating",
     "recovery_failed",
 ]
 
@@ -227,6 +228,7 @@ class FirecrackerSandboxOperator:
                 "checkpointed",
                 "attaching",
                 "recovering",
+                "repatriating",
             }:
                 self._publish(
                     sid,

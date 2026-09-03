@@ -11,7 +11,7 @@
 A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and a Kubernetes-managed platform control plane.
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
-- **Bare Firecracker backend**: node-agent directly manages microVMs (jailer/tap/snapshot), cost-first; snapshots land on persistent state EBS (**not S3**), cross-node recovery relies on the EBS volume surviving + detach/attach (see "Snapshot persistence & cross-node recovery" below)
+- **Host-managed Firecracker backend**: node-agent orchestrates TAP, snapshots, and API calls, while host systemd + jailer run every VMM in an independent cgroup/chroot. Snapshots land on persistent state EBS and are uploaded to S3 by default (configurable).
 - **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes, using either bare-metal hosts or nested-virtualization-capable Intel x86 instances (`i7i.8xlarge` is the current default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
 - **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
@@ -84,11 +84,12 @@ the sandbox control plane schedules the microVMs.**
 For a create request, `sandbox-control-plane` selects a data node from node-agent heartbeats and remaining
 capacity, writes the sandbox state to DynamoDB, and calls that node's node-agent. The node-agent prepares
 the rootfs, TAP network, and vsock, assigns vCPU and memory, and starts Firecracker. kube-scheduler sees
-one node-agent DaemonSet Pod per data node; it does not create a Pod, PVC, Service, or CRD for every sandbox.
+one node-agent DaemonSet Pod per data node; each sandbox has a lightweight CRD identity but no matching
+Pod, PVC, or Service.
 
 | Dimension | Regular Pod | Firecracker sandbox in this project |
 |---|---|---|
-| Kubernetes identity | Each instance is a Pod, usually created by a Deployment, Job, or another controller | The sandbox is a DynamoDB record managed by the control plane and node-agent; no matching Pod exists |
+| Kubernetes identity | Each instance is a Pod, usually created by a Deployment, Job, or another controller | Each sandbox is a lightweight CRD backed by DynamoDB state; no matching Pod exists |
 | Placement | kube-scheduler uses requests, affinity, taints, and other cluster policies | The control plane selects a sandbox node from node-agent heartbeats, free memory, and VM count |
 | Isolation boundary | Containers use namespaces and cgroups and normally share the node kernel | KVM supplies a virtual hardware boundary; every microVM boots its own guest kernel |
 | Lifecycle | kubelet pulls an image, starts containers, and recreates them according to Pod policy | node-agent calls Firecracker APIs for create, snapshot, suspend, resume, and destroy |
@@ -106,12 +107,13 @@ The trade-off is that the platform must implement capabilities Kubernetes would 
 placement, the instance state machine, network proxying, health checks, garbage collection, and recovery.
 The current implementation also has two important boundaries:
 
-- Firecracker processes are children of node-agent and run inside the node-agent Pod's cgroup. "Not a Pod"
-  means a sandbox is not an independently scheduled Kubernetes object; it does not mean it is unaffected
-  by node-agent or host lifecycle. Drain sandboxes safely before restarting or upgrading node-agent.
-- Persistent state EBS in the same Availability Zone is currently authoritative. Cross-node EBS
-  detach/attach has been verified, but automatic Spot evacuation and recovery are not yet a closed loop.
-  This design must not be described as automatic cross-AZ rescheduling.
+- Newly created or resumed VMMs run as host-owned `sbx-vmm-<id>.service` units, outside the node-agent
+  Pod cgroup. During the first upgrade, old VMMs still use the legacy Pod cgroup and must be
+  checkpointed/drained before replacing node-agent. Roll out phase3 host helpers and jailer first.
+- Same-AZ recovery now includes EBS takeover, OD standby restore, repatriation to an empty Spot node,
+  old-volume cleanup, and exact OD scale-down. Cross-AZ failure still requires S3 or another cross-AZ
+  authority. These runtime/auth/recycle changes have local regression coverage but have not yet been
+  revalidated by a destructive FIS run on upgraded nodes.
 
 ### Architecture
 
@@ -221,7 +223,9 @@ S3_BUCKET="my-sandbox-snapshots-${ACCT}"
 aws s3 mb s3://${S3_BUCKET} --region us-east-1 2>/dev/null || true
 FC_NODES=$(kubectl get nodes -l sandbox=true \
   -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
-API_KEY=$(openssl rand -hex 32); LITELLM_KEY=$(openssl rand -hex 32)
+API_KEY=$(openssl rand -hex 32)
+LITELLM_KEY=$(openssl rand -hex 32)
+NODE_AGENT_AUTH_SECRET=$(openssl rand -hex 32)
 terraform apply -auto-approve \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
@@ -232,6 +236,7 @@ terraform apply -auto-approve \
   -var="create_ingress_nginx=false" \
   -var="sandbox_domain=sbx.example.com" \
   -var="api_keys=${API_KEY}" \
+  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}" \
   -var="litellm_master_key=${LITELLM_KEY}"
 # Terraform creates: IRSA roles, K8s resources (sandbox-system namespace +
 # control-plane Deployment + node-agent DaemonSet), api-keys Secret + ConfigMap.
@@ -323,6 +328,7 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false" \
   -var="api_keys=placeholder" \
+  -var="node_agent_auth_secret=placeholder-placeholder-1234567890" \
   -var="litellm_master_key=placeholder"
 
 # Delete orphaned pod ENIs left by terminated nodes (VPC CNI creates them; they are NOT
@@ -531,8 +537,13 @@ To avoid misunderstanding vs. the implementation, the current boundaries:
 ```bash
 python3 -m pip install -r requirements-dev.txt
 python3 sandbox-api/smoke_test.py
+python3 sandbox-api/crd_test.py
 python3 node-agent/observability_test.py
-# Expected: control plane 53/53 + node-agent 8/8 PASS
+python3 node-agent/reclaim_test.py
+python3 sandbox-api/recovery_test.py
+PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
+# Expected: control plane 57/57 + CRD/operator 16/16 + node-agent 22/22
+#           + reclaim 13/13 + recovery 13/13 + node-agent auth 2/2 PASS
 ```
 
 ---

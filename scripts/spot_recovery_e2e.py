@@ -10,8 +10,11 @@ and removes the sandboxes.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -47,9 +50,15 @@ def run_json(command: list[str]) -> Any:
 
 
 class HttpClient:
-    def __init__(self, base_url: str, api_key: str = ""):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        node_agent_auth_secret: str = "",
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.node_agent_auth_secret = node_agent_auth_secret
 
     def request(
         self,
@@ -62,6 +71,30 @@ class HttpClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.node_agent_auth_secret:
+            timestamp = str(int(time.time()))
+            nonce = uuid.uuid4().hex
+            content_hash = hashlib.sha256(payload or b"").hexdigest()
+            canonical = "\n".join((
+                "v1",
+                timestamp,
+                nonce,
+                method.upper(),
+                path,
+                content_hash,
+            )).encode()
+            signature = hmac.new(
+                self.node_agent_auth_secret.encode(),
+                canonical,
+                hashlib.sha256,
+            ).hexdigest()
+            headers.update({
+                "X-SBX-Auth-Version": "v1",
+                "X-SBX-Timestamp": timestamp,
+                "X-SBX-Nonce": nonce,
+                "X-SBX-Content-SHA256": content_hash,
+                "X-SBX-Signature": signature,
+            })
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=payload,
@@ -214,6 +247,79 @@ def find_node_agent_pod(namespace: str, source_node: str) -> str:
     raise RuntimeError(f"node-agent pod not found for source node {source_node}")
 
 
+def read_host_writeback_kib(namespace: str, pod: str) -> dict[str, int]:
+    result = subprocess.run(
+        [
+            "kubectl",
+            "-n",
+            namespace,
+            "exec",
+            pod,
+            "--",
+            "cat",
+            "/proc/meminfo",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    values: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        key, separator, raw = line.partition(":")
+        if not separator or key not in {
+            "Dirty",
+            "Writeback",
+            "WritebackTmp",
+        }:
+            continue
+        values[key] = int(raw.strip().split()[0])
+    return {
+        "dirty_kib": values.get("Dirty", 0),
+        "writeback_kib": values.get("Writeback", 0),
+        "writeback_tmp_kib": values.get("WritebackTmp", 0),
+    }
+
+
+def quiesce_host_writeback(
+    namespace: str,
+    pod: str,
+    *,
+    timeout_s: int,
+    threshold_mib: int,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    before = read_host_writeback_kib(namespace, pod)
+    sync_started = time.monotonic()
+    subprocess.run(
+        ["kubectl", "-n", namespace, "exec", pod, "--", "sync"],
+        check=True,
+    )
+    sync_elapsed_s = time.monotonic() - sync_started
+    threshold_kib = threshold_mib * 1024
+    deadline = time.monotonic() + timeout_s
+    after = read_host_writeback_kib(namespace, pod)
+    while (
+        after["dirty_kib"]
+        + after["writeback_kib"]
+        + after["writeback_tmp_kib"]
+        > threshold_kib
+    ):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "host writeback did not quiesce before checkpoint: "
+                f"{after}, threshold_mib={threshold_mib}"
+            )
+        time.sleep(2)
+        after = read_host_writeback_kib(namespace, pod)
+    return {
+        "threshold_mib": threshold_mib,
+        "before": before,
+        "after": after,
+        "sync_elapsed_s": round(sync_elapsed_s, 3),
+        "elapsed_s": round(time.monotonic() - started, 3),
+    }
+
+
 def verify_isolated_instance(
     instance_id: str,
     *,
@@ -271,6 +377,31 @@ def terminate_instance(instance_id: str, region: str) -> None:
     )
 
 
+def discover_node_agent_auth_secret(namespace: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "kubectl",
+                "-n",
+                namespace,
+                "get",
+                "secret",
+                "node-agent-auth",
+                "-o",
+                "jsonpath={.data.NODE_AGENT_AUTH_SECRET}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        encoded = result.stdout.strip()
+        return base64.b64decode(encoded).decode() if encoded else ""
+    except Exception:
+        # Backwards-compatible with clusters that have not enabled signed
+        # node-agent requests yet.
+        return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-url", default="")
@@ -307,7 +438,30 @@ def main() -> int:
     parser.add_argument("--base-timeout-s", type=int, default=1200)
     parser.add_argument("--checkpoint-timeout-s", type=int, default=150)
     parser.add_argument("--recovery-timeout-s", type=int, default=600)
+    parser.add_argument(
+        "--pre-checkpoint-quiesce-s",
+        type=int,
+        default=0,
+        help=(
+            "When positive, run host sync after dirty-fill and wait this many "
+            "seconds for Dirty+Writeback to fall below the configured limit."
+        ),
+    )
+    parser.add_argument(
+        "--pre-checkpoint-dirty-limit-mib",
+        type=int,
+        default=64,
+        help="Dirty+Writeback limit used by --pre-checkpoint-quiesce-s.",
+    )
     parser.add_argument("--node-agent-url", default="")
+    parser.add_argument(
+        "--node-agent-auth-secret",
+        default=os.environ.get("NODE_AGENT_AUTH_SECRET", ""),
+        help=(
+            "HMAC secret for direct node-agent calls. Prefer the "
+            "NODE_AGENT_AUTH_SECRET environment variable."
+        ),
+    )
     parser.add_argument(
         "--trigger-mode",
         choices=("simulate", "fis"),
@@ -342,12 +496,20 @@ def main() -> int:
         parser.error("--count must be positive")
     if args.dirty_mib >= args.memory_mib:
         parser.error("--dirty-mib must be less than --memory-mib")
+    if args.pre_checkpoint_quiesce_s < 0:
+        parser.error("--pre-checkpoint-quiesce-s must be non-negative")
+    if args.pre_checkpoint_dirty_limit_mib < 0:
+        parser.error("--pre-checkpoint-dirty-limit-mib must be non-negative")
     if args.terminate_source and not args.test_id:
         parser.error("--terminate-source requires --test-id")
     if args.trigger_mode == "fis" and not args.fis_template_id:
         parser.error("--trigger-mode=fis requires --fis-template-id")
     if args.trigger_mode == "fis" and args.pool != "spot":
         parser.error("--trigger-mode=fis requires --pool=spot")
+    if not args.node_agent_auth_secret:
+        args.node_agent_auth_secret = discover_node_agent_auth_secret(
+            args.namespace
+        )
 
     source_will_terminate = (
         args.trigger_mode == "fis" or args.terminate_source
@@ -361,6 +523,9 @@ def main() -> int:
         "config": {
             **vars(args),
             "api_key": "<redacted>" if args.api_key else "",
+            "node_agent_auth_secret": (
+                "<redacted>" if args.node_agent_auth_secret else ""
+            ),
         },
         "sandboxes": [],
     }
@@ -368,6 +533,7 @@ def main() -> int:
         args.output or f"/tmp/spot-recovery-{args.test_id}.json"
     )
     sandbox_ids: list[str] = []
+    node: HttpClient | None = None
 
     with contextlib.ExitStack() as stack:
         api_url = args.api_url
@@ -387,7 +553,7 @@ def main() -> int:
                 {"placement_group": args.placement_group}
                 if args.placement_group else {}
             )
-            return api.require(
+            code, result = api.request(
                 "POST",
                 "/sandboxes",
                 {
@@ -401,9 +567,11 @@ def main() -> int:
                         f"spot-recovery-{args.test_id}-{run_id}-{index}"
                     ),
                 },
-                expected=(200, 201),
                 timeout_s=300,
             )
+            result["_create_http_code"] = code
+            result["_create_index"] = index
+            return result
 
         try:
             created = parallel_map(
@@ -411,8 +579,36 @@ def main() -> int:
                 create,
                 args.create_concurrency,
             )
-            sandbox_ids = sorted(item["id"] for item in created)
+            sandbox_ids = sorted(
+                str(item["id"])
+                for item in created
+                if item.get("id")
+            )
             report["sandbox_ids"] = sandbox_ids
+            create_failures = [
+                {
+                    "index": item.get("_create_index"),
+                    "id": item.get("id"),
+                    "code": item.get("_create_http_code"),
+                    "state": item.get("state"),
+                    "error": (
+                        item.get("operation_error")
+                        or item.get("error")
+                    ),
+                }
+                for item in created
+                if (
+                    item.get("_create_http_code") not in {200, 201}
+                    or not item.get("id")
+                    or item.get("state") == "failed"
+                )
+            ]
+            if create_failures:
+                report["create_failures"] = create_failures
+                raise RuntimeError(
+                    "sandbox creation failures: "
+                    + json.dumps(create_failures)
+                )
 
             def wait_running(sid: str) -> dict:
                 def probe() -> dict | None:
@@ -521,14 +717,25 @@ def main() -> int:
             )
             report["dirty_total_mib"] = args.dirty_mib * args.count
 
+            pod = find_node_agent_pod(args.namespace, source_node)
+            report["source_node_agent_pod"] = pod
+            if args.pre_checkpoint_quiesce_s > 0:
+                report["pre_checkpoint_quiesce"] = quiesce_host_writeback(
+                    args.namespace,
+                    pod,
+                    timeout_s=args.pre_checkpoint_quiesce_s,
+                    threshold_mib=args.pre_checkpoint_dirty_limit_mib,
+                )
+
             node_url = args.node_agent_url
             if not node_url:
-                pod = find_node_agent_pod(args.namespace, source_node)
-                report["source_node_agent_pod"] = pod
                 node_url = stack.enter_context(
                     PortForward(args.namespace, f"pod/{pod}", 8002)
                 )
-            node = HttpClient(node_url)
+            node = HttpClient(
+                node_url,
+                node_agent_auth_secret=args.node_agent_auth_secret,
+            )
             node.require("POST", "/reclaim/reset", {}, expected=(200,))
 
             trigger_at = time.monotonic()
@@ -787,6 +994,21 @@ def main() -> int:
             raise
         finally:
             report["finished_at"] = utcnow()
+            if (
+                not source_will_terminate
+                and node is not None
+                and report.get("checkpoint_plan")
+                and not report.get("source_reset")
+            ):
+                try:
+                    report["source_reset"] = node.require(
+                        "POST",
+                        "/reclaim/reset",
+                        {},
+                        expected=(200,),
+                    )
+                except Exception as exc:
+                    report["source_reset_error"] = str(exc)
             cleanup_allowed = (
                 not args.keep_sandboxes
                 and (
