@@ -17,8 +17,22 @@ node-agent — 每台 .metal 节点上的 on-host 执行手。
   GET  /vm/{id}     → {pid, state, ip}
   GET  /health      → {node_id, free_mem_mib, vm_count}
 
-运行(需 root,在 .metal 宿主):
-  sudo python3 main.py   # 默认 :8002
+安全(V2401449830):node-agent 是 root 宿主执行面,只允许控制面调用。
+  - 除 /health /livez /readyz /metrics 外,所有路由要求 HMAC 签名(agent_auth.py),
+    且来源必须在 ALLOWED_CALLER_CIDR 内(空 = 拒绝);guest tap 网段 172.18.0.0/16 一律拒绝。
+  - 只监听节点管理网卡 IP(不再 0.0.0.0);启动时安装 SBX-GUEST-IN/FWD iptables 链,
+    guest 无法访问宿主端口 / IMDS / 其他 guest / 其他节点 node-agent。
+  - 请求里的 id / 宿主路径 / s3_prefix 必须符合服务端路径约定(见"请求参数校验")。
+  - /reclaim/simulate、/reclaim/reset 仅 NODE_AGENT_ENABLE_TEST_HOOKS=1 时可用。
+  任一前置条件缺失(密钥、白名单、防火墙)即拒绝启动。
+
+运行(需 root,在 .metal 宿主;生产走 terraform stage2 的 DaemonSet):
+  sudo env NODE_AGENT_AUTH_KEY_FILE=/etc/sbx/node-agent.key \
+           ALLOWED_CALLER_CIDR=10.0.0.0/16 SNAPSHOT_S3_BUCKET=<bucket> \
+           python3 main.py   # 默认 <节点内网 IP>:8002
+  密钥文件(>=32 字节,root 0600)须与控制面 NODE_AGENT_AUTH_KEY 一致。宿主进程模式下 aws CLI
+  使用实例角色:该角色只应授予快照桶 sbx/ 前缀的读写(同 stage2 aws_iam_role_policy.node_agent),
+  不要挂 AmazonS3ReadOnlyAccess 之类的宽权限。
 """
 from __future__ import annotations
 
@@ -52,6 +66,7 @@ from observability import (
     record_http,
     record_restore_mode,
     record_resume_stage,
+    record_security_event,
     record_snapshot_error,
     record_snapshot_legacy_migration,
     record_snapshot_transfer,
@@ -60,14 +75,34 @@ from observability import (
     start_server_span,
 )
 
+import agent_auth
+
 # ---------- 配置 ----------
 LISTEN_PORT  = int(os.environ.get("NODE_AGENT_PORT", "8002"))
-# 监听地址：默认只绑 127.0.0.1（本机回环），防止集群内其他 Pod 直接访问宿主级执行面
-# hostNetwork=true 模式下 127.0.0.1 对控制面 Pod 不可达；
-# 生产：通过 ALLOWED_CALLER_CIDR 限制可访问 IP，或走 NetworkPolicy 白名单控制面 Pod CIDR
-LISTEN_HOST  = os.environ.get("NODE_AGENT_LISTEN_HOST", "0.0.0.0")  # 生产改为节点内网 IP
-# 允许调用的来源 CIDR（逗号分隔，空=不限制）——生产应设为控制面 Pod CIDR
+# 监听地址:默认绑本节点主网卡内网 IP(管理面,见 _listen_host),不再绑 0.0.0.0。
+# DaemonSet 用 status.hostIP 显式注入。注意 Linux 弱主机模型下 guest 仍能经 tap 网关
+# 访问宿主任意本地地址,真正挡住 guest 的是 _install_guest_firewall 的 INPUT 规则 + 签名鉴权。
+LISTEN_HOST  = os.environ.get("NODE_AGENT_LISTEN_HOST", "")
+# 允许调用受保护路由的来源 CIDR(逗号分隔)。空 = 全部拒绝(fail closed);
+# 生产设为控制面 Pod 所在网段(terraform stage2 默认集群 VPC CIDR)。
 ALLOWED_CALLER_CIDR = os.environ.get("ALLOWED_CALLER_CIDR", "")
+# 永远拒绝的来源 CIDR:guest tap 网段(172.18.{tap_idx}.0/30),对所有路由(含健康检查)生效。
+DENIED_CALLER_CIDR  = os.environ.get("DENIED_CALLER_CIDR", "172.18.0.0/16")
+# 控制面 ↔ node-agent 共享的 HMAC 密钥(见 agent_auth.py)。缺失则拒绝启动。
+_AUTH = agent_auth.Verifier(
+    agent_auth.load_key(os.environ.get("NODE_AGENT_AUTH_KEY", ""),
+                        os.environ.get("NODE_AGENT_AUTH_KEY_FILE", "")),
+    max_skew_s=int(os.environ.get("NODE_AGENT_AUTH_MAX_SKEW_S", "300")),
+)
+# /reclaim/simulate、/reclaim/reset 仅测试用,生产默认关闭(返回 404)。
+ENABLE_TEST_HOOKS = os.environ.get("NODE_AGENT_ENABLE_TEST_HOOKS", "0").lower() in ("1", "true")
+# 启动时安装宿主 iptables 规则隔离 guest(禁止 guest 访问宿主/IMDS/其他 guest/其他节点 agent)。
+GUEST_FIREWALL = os.environ.get("NODE_AGENT_GUEST_FIREWALL", "1").lower() in ("1", "true")
+# 快照 S3 桶:s3_prefix 只允许 s3://{SNAPSHOT_S3_BUCKET}/sbx/{id}/,未配置则不允许任何 S3 前缀。
+SNAPSHOT_S3_BUCKET = os.environ.get("SNAPSHOT_S3_BUCKET", "").strip()
+# 控制类请求(/vm/*、/reclaim/*)body 上限;/proxy/ 透传 body 上限另设。
+MAX_CONTROL_BODY_BYTES = int(os.environ.get("NODE_AGENT_MAX_BODY_BYTES", str(1024 * 1024)))
+MAX_PROXY_BODY_BYTES   = int(os.environ.get("NODE_AGENT_MAX_PROXY_BODY_BYTES", str(512 * 1024 * 1024)))
 SBX_BASE     = os.environ.get("SBX_BASE", "/var/lib/sbx")       # 统一路径约定
 ROOTFS       = os.environ.get("FC_ROOTFS",  "/opt/sbx/rootfs.ext4")  # 基础(默认)rootfs 模板
 ROOTFS_DIR   = os.environ.get("FC_ROOTFS_DIR", "/opt/sbx")      # 命名 rootfs 模板目录
@@ -145,6 +180,108 @@ _HEARTBEAT_LAST_ITERATION = time.monotonic()
 os.makedirs(SBX_BASE, exist_ok=True)
 
 
+# ---------- 请求参数校验 ----------
+# node-agent 以 root 操作宿主文件:请求体里的 id / 路径 / S3 前缀全部按服务端路径约定
+# 严格校验,不接受任何"由调用方指定的宿主路径"。约定(与控制面 drivers/firecracker.py 一致):
+#   沙盒目录   {SBX_BASE}/{id}
+#   快照目录   {SBX_BASE}/{id}/snap
+#   rootfs    {SBX_BASE}/{id}/rootfs.ext4
+#   S3 前缀    s3://{SNAPSHOT_S3_BUCKET}/sbx/{id}/
+# id 是单个路径段(控制面生成 8 位 hex / warm-xxxxxxxx),拒绝 . / .. / 斜杠 / 符号链接。
+
+_SANDBOX_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")      # 用 fullmatch
+_KERNEL_NAME_RE = re.compile(r"vmlinux[A-Za-z0-9._-]*")              # 用 fullmatch
+# tap_idx 只做整数/范围合法性校验(tap 名 fctap{idx} ≤ 15 字符)。控制面 alloc_tap_idx 目前只增不减,
+# 不在这里按 172.18.{idx} 的 255 上限拒绝 —— 否则累计创建 ~255 个沙盒后全部 create/resume 失败。
+MAX_TAP_IDX = 9_999_999_999
+MAX_VCPU    = int(os.environ.get("NODE_AGENT_MAX_VCPU", "64"))
+MAX_MEM_MIB = int(os.environ.get("NODE_AGENT_MAX_MEM_MIB", str(512 * 1024)))
+
+
+class RequestValidationError(ValueError):
+    """请求参数不符合服务端约定 → 400。reason 为固定枚举,用于日志/指标。"""
+
+    def __init__(self, reason: str, field: str):
+        super().__init__(f"invalid {field}")
+        self.reason = reason
+        self.field = field
+
+
+def _sandbox_id(value, field: str = "id") -> str:
+    if not isinstance(value, str) or not _SANDBOX_ID_RE.fullmatch(value):
+        raise RequestValidationError("bad_id", field)
+    return value
+
+
+def _no_symlink(path: str, field: str) -> None:
+    """SBX_BASE 之下的每一级(已存在的)都不能是符号链接。SBX_BASE 自身属宿主配置,可信。"""
+    base = os.path.abspath(SBX_BASE)
+    rel = os.path.relpath(path, base)
+    cur = base
+    for part in rel.split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            raise RequestValidationError("symlink", field)
+
+
+def _sandbox_path(value, leaf: str, field: str) -> tuple[str, str]:
+    """校验 value == {SBX_BASE}/{id}/{leaf},返回 (path, id)。"""
+    if not isinstance(value, str) or not value:
+        raise RequestValidationError("missing_path", field)
+    if "\x00" in value or not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise RequestValidationError("bad_path", field)
+    base = os.path.abspath(SBX_BASE)
+    parent, name = os.path.split(value)
+    if name != leaf or os.path.dirname(parent) != base:
+        raise RequestValidationError("path_outside_sbx_base", field)
+    owner = _sandbox_id(os.path.basename(parent), field)
+    _no_symlink(value, field)
+    return value, owner
+
+
+def _owned_snapshot_dir(body: dict, sid: str) -> str:
+    """snapshot/suspend:快照目录必须是该沙盒自己的 {SBX_BASE}/{sid}/snap。"""
+    snap_dir, owner = _sandbox_path(body.get("snapshot_local_path"), "snap",
+                                    "snapshot_local_path")
+    if owner != sid:
+        raise RequestValidationError("path_owner_mismatch", "snapshot_local_path")
+    return snap_dir
+
+
+def _s3_prefix_for(owner: str, value, field: str = "s3_prefix") -> str:
+    """s3_prefix 只能是空串或本节点配置的快照桶下该沙盒的前缀。"""
+    if value in (None, ""):
+        return ""
+    expected = f"s3://{SNAPSHOT_S3_BUCKET}/sbx/{owner}/" if SNAPSHOT_S3_BUCKET else None
+    if not isinstance(value, str) or expected is None or value != expected:
+        raise RequestValidationError("bad_s3_prefix", field)
+    return value
+
+
+def _int_in_range(value, low: int, high: int, field: str) -> int:
+    if isinstance(value, bool):
+        raise RequestValidationError("bad_int", field)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise RequestValidationError("bad_int", field) from None
+    if not low <= number <= high:
+        raise RequestValidationError("out_of_range", field)
+    return number
+
+
+def _kernel_path(value) -> str:
+    """kernel 只能是 ROOTFS_DIR 下的 vmlinux* 文件(默认 /opt/sbx/vmlinux)。"""
+    if value in (None, ""):
+        return os.path.join(ROOTFS_DIR, "vmlinux")
+    if not isinstance(value, str) or os.path.normpath(value) != value \
+            or os.path.dirname(value) != os.path.abspath(ROOTFS_DIR) \
+            or not _KERNEL_NAME_RE.fullmatch(os.path.basename(value)) \
+            or os.path.islink(value):
+        raise RequestValidationError("bad_kernel", "kernel")
+    return value
+
+
 def _vm_op_lock(sandbox_id: str) -> threading.RLock:
     """Serialize Firecracker API operations for one VM while allowing other VMs in parallel."""
     with _LOCK:
@@ -172,6 +309,8 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
     subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "tuntap", "add", tap, "mode", "tap"],
                    stderr=subprocess.DEVNULL)
+    # guest 不用 IPv6:关掉 tap 上的 IPv6,避免 guest 经 link-local 访问宿主监听在 :: 的服务。
+    _disable_ipv6(tap)
     subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
                    stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "link", "set", tap, "up"])
@@ -189,6 +328,102 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
         shell=True,  # nosec B602
     )
     return tap, host_ip, guest_ip
+
+
+_GUEST_IN_CHAIN  = "SBX-GUEST-IN"
+_GUEST_FWD_CHAIN = "SBX-GUEST-FWD"
+# guest 绝不应直接访问的地址:IMDS(节点实例角色凭据)、EKS Pod Identity agent。
+# 169.254.169.253(VPC DNS)guest 需要用,不在此列。
+_GUEST_BLOCKED_DESTS = ("169.254.169.254/32", "169.254.170.23/32")
+
+
+def _guest_firewall_rules() -> list[list[str]]:
+    """宿主 iptables 规则(幂等:专用链每次 flush 重建,主链只插一次跳转)。
+
+    INPUT  -i fctap+ → SBX-GUEST-IN :只放行宿主主动发起连接的回包(SSH/反代进 guest),
+                                    其余全部丢弃 —— guest 无法访问宿主任何端口(含 node-agent)。
+    FORWARD -i fctap+ → SBX-GUEST-FWD:禁止 guest→其他 guest、guest→IMDS、guest→任意节点的
+                                    node-agent 端口;其余(公网/VPC 服务)照常 NAT 出去。
+    命中 node-agent 端口的探测先限速 LOG(前缀 sbx-guest-agent-probe),供告警检测。
+    """
+    port = str(LISTEN_PORT)
+    probe_log = ["-m", "limit", "--limit", "6/min", "--limit-burst", "10",
+                 "-j", "LOG", "--log-prefix", "sbx-guest-agent-probe "]
+    rules = [
+        ["-A", _GUEST_IN_CHAIN, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+         "-j", "ACCEPT"],
+        ["-A", _GUEST_IN_CHAIN, "-p", "tcp", "--dport", port, *probe_log],
+        ["-A", _GUEST_IN_CHAIN, "-j", "DROP"],
+        ["-A", _GUEST_FWD_CHAIN, "-o", "fctap+", "-j", "DROP"],
+    ]
+    for dest in _GUEST_BLOCKED_DESTS:
+        rules.append(["-A", _GUEST_FWD_CHAIN, "-d", dest, "-j", "DROP"])
+    rules += [
+        ["-A", _GUEST_FWD_CHAIN, "-p", "tcp", "--dport", port, *probe_log],
+        ["-A", _GUEST_FWD_CHAIN, "-p", "tcp", "--dport", port, "-j", "DROP"],
+        ["-A", _GUEST_FWD_CHAIN, "-j", "RETURN"],
+    ]
+    return rules
+
+
+def _restore_arg(arg: str) -> str:
+    return f'"{arg}"' if " " in arg else arg
+
+
+def _guest_firewall_restore_input() -> str:
+    """iptables-restore 输入:声明即 flush 并重建两条专用链,整表一次原子提交,无未防护窗口。"""
+    lines = ["*filter", f":{_GUEST_IN_CHAIN} - [0:0]", f":{_GUEST_FWD_CHAIN} - [0:0]"]
+    lines += [" ".join(_restore_arg(a) for a in rule) for rule in _guest_firewall_rules()]
+    lines += ["COMMIT", ""]
+    return "\n".join(lines)
+
+
+def _ensure_jump_first(parent: str, chain: str) -> None:
+    """保证 `-i fctap+ -j <chain>` 是 parent 链第 1 条且只有一条。
+    kube-proxy 等组件之后插到链首的规则(如 KUBE-FORWARD 的 ACCEPT)不得先于 guest 隔离生效。
+    先插到第 1 位再按行号删多余副本,任何时刻都至少有一条跳转生效。"""
+    want = f"-A {parent} -i fctap+ -j {chain}"
+    listed = subprocess.run(["iptables", "-S", parent], capture_output=True,
+                            text=True, check=True).stdout.splitlines()
+    rules = [line.strip() for line in listed if line.startswith("-A ")]
+    if not rules or rules[0] != want:
+        subprocess.run(["iptables", "-I", parent, "1", "-i", "fctap+", "-j", chain],
+                       check=True)
+        rules.insert(0, want)
+    for number in sorted((i + 1 for i, r in enumerate(rules) if r == want and i > 0),
+                         reverse=True):
+        subprocess.run(["iptables", "-D", parent, str(number)], check=True)
+
+
+def ensure_guest_firewall_jumps() -> None:
+    for parent, chain in (("INPUT", _GUEST_IN_CHAIN), ("FORWARD", _GUEST_FWD_CHAIN)):
+        _ensure_jump_first(parent, chain)
+
+
+def _install_guest_firewall() -> None:
+    """安装 guest 隔离规则;失败抛异常(调用方据此拒绝启动,fail closed)。"""
+    subprocess.run(["iptables-restore", "--noflush"], input=_guest_firewall_restore_input(),
+                   text=True, check=True)
+    ensure_guest_firewall_jumps()
+    # guest 不配 IPv6(tap 上也已 disable_ipv6):IPv6 方向一律丢弃(尽力而为,
+    # 宿主未启用 ip6tables 时忽略)。
+    for parent in ("INPUT", "FORWARD"):
+        drop = [parent, "-i", "fctap+", "-j", "DROP"]
+        try:
+            if subprocess.run(["ip6tables", "-C", *drop], stderr=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL).returncode != 0:
+                subprocess.run(["ip6tables", "-I", parent, "1", "-i", "fctap+", "-j", "DROP"],
+                               stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except OSError:
+            break
+
+
+def _disable_ipv6(tap: str) -> None:
+    try:
+        with open(f"/proc/sys/net/ipv6/conf/{tap}/disable_ipv6", "w") as f:
+            f.write("1")
+    except OSError:
+        pass  # 宿主未启用 IPv6 时该文件不存在,本就无 IPv6 面
 
 
 def _teardown_tap(tap: str) -> None:
@@ -375,9 +610,13 @@ def _s3_download(s3_prefix: str, local_dir: str) -> None:
         return
     os.makedirs(local_dir, exist_ok=True)
     started = time.monotonic()
+    # 只拉快照约定的顶层文件,前缀下其它 key(子目录、任意文件名)一律不落盘。
+    include_args: list[str] = ["--exclude", "*"]
+    for name in (*_SNAPSHOT_FILES, _SNAPSHOT_MANIFEST, "rootfs.ext4"):
+        include_args += ["--include", name]
     try:
         subprocess.run(
-            ["aws", "s3", "sync", s3_prefix, local_dir,
+            ["aws", "s3", "sync", s3_prefix, local_dir, *include_args,
              "--region", AWS_REGION, "--quiet"],
             check=True,
         )
@@ -529,14 +768,20 @@ def _record_snapshot_verification(snap_dir: str) -> dict:
 # ---------- 操作实现 ----------
 
 def op_create(body: dict) -> dict:
-    sid      = body["id"]
-    tap_idx  = int(body["tap_idx"])
-    cpu      = int(body.get("cpu", 2))
-    mem_mib  = int(body.get("mem_mib", 4096))
-    kernel   = body.get("kernel", "/opt/sbx/vmlinux")
+    sid      = _sandbox_id(body.get("id"))
+    tap_idx  = _int_in_range(body.get("tap_idx"), 0, MAX_TAP_IDX, "tap_idx")
+    cpu      = _int_in_range(body.get("cpu", 2), 1, MAX_VCPU, "cpu")
+    mem_mib  = _int_in_range(body.get("mem_mib", 4096), 128, MAX_MEM_MIB, "mem_mib")
+    kernel   = _kernel_path(body.get("kernel"))
     env      = body.get("env", {})
+    # rootfs 路径不由调用方决定:固定 {SBX_BASE}/{id}/rootfs.ext4;若传了必须与约定一致。
+    if body.get("rootfs_path") not in (None, ""):
+        _, owner = _sandbox_path(body["rootfs_path"], "rootfs.ext4", "rootfs_path")
+        if owner != sid:
+            raise RequestValidationError("path_owner_mismatch", "rootfs_path")
 
     d = f"{SBX_BASE}/{sid}"
+    _no_symlink(d, "id")
     os.makedirs(d, exist_ok=True)
 
     # CoW 复制基础 rootfs 到沙盒目录(src 是全局基础镜像,dst 是沙盒私有副本)。
@@ -564,7 +809,7 @@ def op_create(body: dict) -> dict:
 
 
 def op_destroy(body: dict) -> dict:
-    sid = body["id"]
+    sid = _sandbox_id(body.get("id"))
     with _LOCK:
         vm = _VMS.pop(sid, None)
     if vm:
@@ -587,8 +832,8 @@ def op_snapshot_base(body: dict) -> dict:
     目的:spot 疏散时才能走 Diff(只写脏页),而 Diff 的前提是已有 base。
     创建后由控制面异步调用一次;off 关键路径(~16s 无所谓)。
     """
-    sid      = body["id"]
-    snap_dir = body["snapshot_local_path"]
+    sid      = _sandbox_id(body.get("id"))
+    snap_dir = _owned_snapshot_dir(body, sid)
     with _LOCK:
         vm = _VMS.get(sid)
     if not vm:
@@ -621,9 +866,9 @@ def op_snapshot_base(body: dict) -> dict:
 
 
 def op_suspend(body: dict) -> dict:
-    sid       = body["id"]
-    snap_dir  = body["snapshot_local_path"]
-    s3_prefix = body.get("s3_prefix", "")
+    sid       = _sandbox_id(body.get("id"))
+    snap_dir  = _owned_snapshot_dir(body, sid)
+    s3_prefix = _s3_prefix_for(sid, body.get("s3_prefix", ""))
 
     with _LOCK:
         vm = _VMS.get(sid)
@@ -811,16 +1056,27 @@ def _vsock_uds_in_snapshot(snapshot_path: str) -> list[str]:
             blob = f.read()
     except OSError:
         return []
-    pat = re.escape(SBX_BASE.encode()) + rb"/[A-Za-z0-9._\-]+/v\.sock"
-    return sorted({m.decode("utf-8", "ignore") for m in re.findall(pat, blob)})
+    pat = re.escape(SBX_BASE.encode()) + rb"/([A-Za-z0-9._\-]+)/v\.sock"
+    # 快照文件可能来自 S3(不完全可信):目录段必须是合法沙盒 id,拒绝 "." / ".." 之类,
+    # 否则后续 os.remove / os.symlink 会作用到 SBX_BASE 之外。
+    owners = {m.decode("ascii", "ignore") for m in re.findall(pat, blob)}
+    return sorted(f"{SBX_BASE}/{o}/v.sock" for o in owners if _SANDBOX_ID_RE.fullmatch(o))
 
 
 def op_resume(body: dict) -> dict:
-    sid        = body["id"]
-    snap_dir   = body["snapshot_local_path"]
-    rootfs     = body["rootfs_path"]          # 统一路径约定
-    tap_idx    = int(body["tap_idx"])
-    s3_prefix  = body.get("s3_prefix", "")
+    sid        = _sandbox_id(body.get("id"))
+    # 快照来源 id(snap_owner)可与 sid 不同(暖池 claim:warm_id → real_id),
+    # 但 snapshot_local_path / rootfs_path / s3_prefix 三者必须指向同一个来源沙盒,
+    # 且都严格落在服务端路径约定内(见"请求参数校验")。
+    snap_dir, snap_owner = _sandbox_path(body.get("snapshot_local_path"), "snap",
+                                         "snapshot_local_path")
+    rootfs, rootfs_owner = _sandbox_path(body.get("rootfs_path"), "rootfs.ext4",
+                                         "rootfs_path")
+    if rootfs_owner != snap_owner:
+        raise RequestValidationError("path_owner_mismatch", "rootfs_path")
+    tap_idx    = _int_in_range(body.get("tap_idx"), 0, MAX_TAP_IDX, "tap_idx")
+    s3_prefix  = _s3_prefix_for(snap_owner, body.get("s3_prefix", ""))
+    _no_symlink(f"{SBX_BASE}/{sid}", "id")
 
     # 兜底:若本地无快照文件且传了 s3_prefix,从 S3 拉回。
     # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
@@ -1010,9 +1266,11 @@ def op_exec(body: dict) -> dict:
       1. vsock UDS(不依赖 guest 网络，优先)
       2. TAP 网络 SSH(兜底，需 rootfs 内 sshd)
     """
-    sid = body["id"]
+    sid = _sandbox_id(body.get("id"))
     cmd = body.get("cmd", "echo no-cmd")
-    timeout = int(body.get("timeout", 60))
+    if not isinstance(cmd, str):
+        raise RequestValidationError("bad_cmd", "cmd")
+    timeout = _int_in_range(body.get("timeout", 60), 1, 3600, "timeout")
 
     with _LOCK:
         vm = _VMS.get(sid)
@@ -1093,6 +1351,7 @@ def _vsock_exec(vsock_uds: str, cmd: str, timeout: int, port: int = 2222) -> dic
 
 
 def op_get(sid: str) -> dict:
+    sid = _sandbox_id(sid)
     with _LOCK:
         vm = _VMS.get(sid)
     if not vm:
@@ -1230,6 +1489,13 @@ def start_heartbeat_loop() -> None:
         global _HEARTBEAT_LAST_ITERATION
         while True:
             _HEARTBEAT_LAST_ITERATION = time.monotonic()
+            if GUEST_FIREWALL:
+                # 周期校正:kube-proxy 等重启后可能把自己的规则插回链首
+                try:
+                    ensure_guest_firewall_jumps()
+                except Exception as e:
+                    log_event("error", "guest_firewall_reassert_failed",
+                              error_type=type(e).__name__)
             try:
                 _heartbeat_once()
             except Exception as e:
@@ -1484,23 +1750,50 @@ def _raw_tunnel(a: socket.socket, b: socket.socket) -> None:
 
 # ---------- HTTP handler ----------
 
-def _check_caller_allowed(client_ip: str) -> bool:
-    """校验来源 IP 是否在 ALLOWED_CALLER_CIDR 白名单内。白名单为空则允许所有（仅适合内网隔离环境）。"""
-    if not ALLOWED_CALLER_CIDR:
-        return True
+# 无需鉴权的只读路由(kubelet 探针 / Prometheus 抓取 / 控制面存活探测),不含租户数据。
+# 仍对 guest tap 网段拒绝。其余所有路由都要过:tap 拒绝 → CIDR 白名单 → HMAC 签名。
+_PUBLIC_GET_ROUTES = frozenset({"/health", "/livez", "/readyz", "/metrics"})
+
+
+def _parse_cidrs(value: str) -> list:
+    """解析逗号分隔 CIDR;任一非法抛 ValueError(启动时校验,请求时视为拒绝)。"""
+    import ipaddress
+    return [ipaddress.ip_network(c.strip(), strict=False)
+            for c in (value or "").split(",") if c.strip()]
+
+
+def _ip_in(client_ip: str, cidrs: str) -> bool:
     import ipaddress
     try:
         addr = ipaddress.ip_address(client_ip)
-        for cidr in ALLOWED_CALLER_CIDR.split(","):
-            cidr = cidr.strip()
-            if cidr and addr in ipaddress.ip_network(cidr, strict=False):
-                return True
+        if getattr(addr, "ipv4_mapped", None):
+            addr = addr.ipv4_mapped
+        return any(addr in net for net in _parse_cidrs(cidrs))
     except ValueError:
-        pass
-    return False
+        return False
+
+
+def _check_caller_allowed(client_ip: str) -> bool:
+    """来源 IP 是否在 ALLOWED_CALLER_CIDR 白名单内。白名单为空 → 拒绝(fail closed)。"""
+    if not ALLOWED_CALLER_CIDR.strip():
+        return False
+    return _ip_in(client_ip, ALLOWED_CALLER_CIDR)
+
+
+def _caller_denied(client_ip: str) -> bool:
+    """来源是否属于 guest tap 网段(DENIED_CALLER_CIDR)。配置非法时按"拒绝"处理。"""
+    try:
+        _parse_cidrs(DENIED_CALLER_CIDR)
+    except ValueError:
+        return True
+    return _ip_in(client_ip, DENIED_CALLER_CIDR)
 
 
 class Handler(BaseHTTPRequestHandler):
+    # 单个 socket 读写超时:防止慢速连接(slowloris)占满线程。长耗时操作(suspend 等)
+    # 是服务端计算,不受影响;WebSocket 隧道走 select,空闲 300s 自行结束。
+    timeout = int(os.environ.get("NODE_AGENT_SOCKET_TIMEOUT_S", "120"))
+
     def parse_request(self) -> bool:
         parsed = super().parse_request()
         if parsed:
@@ -1594,22 +1887,67 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot_type,
             )
 
-    def _body(self) -> dict:
-        try:
-            n = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            n = 0
-        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+    def _deny(self, code: int, reason: str, kind: str = "auth_denied",
+              **extra) -> None:
+        """拒绝请求并留痕(结构化日志 + node_agent_security_events_total 指标,供告警)。"""
+        record_security_event(kind, reason)
+        log_event(
+            "warning", "node_agent_request_rejected",
+            kind=kind, reason=reason,
+            client_ip=self.client_address[0],
+            method=self.command,
+            route=normalize_route(urlparse(self.path).path),
+        )
+        self.close_connection = True
+        error = {401: "unauthorized", 403: "forbidden"}.get(code, reason)
+        self._send(code, {"error": error, **extra})
 
-    def _check_access(self) -> bool:
+    def _authorize(self) -> bool:
+        """受保护路由的准入:tap 网段 → CIDR 白名单(空=拒绝)→ HMAC 签名(读 body 之前)。"""
         client_ip = self.client_address[0]
+        if _caller_denied(client_ip):
+            self._deny(403, "guest_source")
+            return False
         if not _check_caller_allowed(client_ip):
-            self._send(403, {"error": "forbidden", "hint": f"caller {client_ip} not in ALLOWED_CALLER_CIDR"})
+            self._deny(403, "caller_not_allowed")
+            return False
+        try:
+            self._content_sha = _AUTH.verify_headers(self.headers, self.command, self.path)
+        except agent_auth.AuthError as e:
+            self._deny(401, e.reason)
             return False
         return True
 
+    def _read_body(self, limit: int) -> bytes | None:
+        """读请求体并比对签名里声明的 sha256。失败时已回包,返回 None。"""
+        if self.headers.get("Transfer-Encoding"):
+            self._deny(411, "length_required")
+            return None
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = -1
+        if n < 0:
+            self._deny(400, "bad_content_length")
+            return None
+        if n > limit:
+            self._deny(413, "body_too_large")
+            return None
+        raw = self.rfile.read(n) if n else b""
+        if not agent_auth.body_matches(raw, getattr(self, "_content_sha", "")):
+            self._deny(401, "body_mismatch")
+            return None
+        return raw
+
+    def _protected_body(self) -> bytes | None:
+        """鉴权 + 读 body(/proxy/ 与控制类路由上限不同)。失败返回 None。"""
+        if not self._authorize():
+            return None
+        is_proxy = urlparse(self.path).path.startswith("/proxy/")
+        return self._read_body(MAX_PROXY_BODY_BYTES if is_proxy else MAX_CONTROL_BODY_BYTES)
+
     # ---------- 入站反代:/proxy/{sid}/{port}/{rest...} → guest {ip}:{port}/{rest} ----------
-    def _maybe_proxy(self) -> bool:
+    def _maybe_proxy(self, req_body: bytes) -> bool:
         """若 path 命中 /proxy/{sid}/{port}/...,反代到 guest 并返回 True;否则返回 False。"""
         parsed = urlparse(self.path)
         parts = parsed.path.strip("/").split("/")
@@ -1634,17 +1972,13 @@ class Handler(BaseHTTPRequestHandler):
            self.headers.get("Upgrade", "").lower() == "websocket":
             return self._tunnel_ws(guest_ip, port, upstream_path)
 
-        # 读请求体(若有)
-        try:
-            n = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            n = 0
-        req_body = self.rfile.read(n) if n else None
+        req_body = req_body or None
 
-        # 透传除 hop-by-hop 外的请求头
+        # 透传除 hop-by-hop 与 node-agent 鉴权头外的请求头(签名不泄露给 guest)
         hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailers", "transfer-encoding", "upgrade", "host"}
-        fwd_headers = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+        fwd_headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in hop and k.lower() not in agent_auth.AUTH_HEADERS}
         fwd_headers["Host"] = f"{guest_ip}:{port}"
 
         try:
@@ -1680,7 +2014,7 @@ class Handler(BaseHTTPRequestHandler):
         # 重放请求行 + 原始头(WS 握手头如 Sec-WebSocket-Key 必须原样带上;Host 改成 guest)
         lines = [f"{self.command} {upstream_path} HTTP/1.1"]
         for k, v in self.headers.items():
-            if k.lower() == "host":
+            if k.lower() == "host" or k.lower() in agent_auth.AUTH_HEADERS:
                 continue
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {guest_ip}:{port}")
@@ -1691,15 +2025,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path.startswith("/proxy/"):
-            if not self._check_access():
-                return
-            if self._maybe_proxy():
-                return
-        # 健康检查和指标不经过执行面 CIDR 校验；它们不含租户数据。
-        if path not in {"/health", "/livez", "/readyz", "/metrics"} and not self._check_access():
-            return
-        try:
+        # 健康检查和指标:不需签名(kubelet / Prometheus 调用),不含租户数据;guest 网段仍拒绝。
+        if path in _PUBLIC_GET_ROUTES:
+            if _caller_denied(self.client_address[0]):
+                return self._deny(403, "guest_source")
             if path == "/health":
                 return self._send(200, op_health())
             if path == "/livez":
@@ -1708,16 +2037,23 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/readyz":
                 code, result = health_report(require_dependencies=True)
                 return self._send(code, result)
-            if path == "/metrics":
-                _refresh_metrics()
-                body, content_type = metrics_payload()
-                return self._send_bytes(200, body, content_type)
+            _refresh_metrics()
+            body, content_type = metrics_payload()
+            return self._send_bytes(200, body, content_type)
+        raw = self._protected_body()
+        if raw is None:
+            return
+        if path.startswith("/proxy/") and self._maybe_proxy(raw):
+            return
+        try:
             if path == "/reclaim/status":
                 return self._send(200, _RECLAIM_STATE)
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "vm":
                 return self._send(200, op_get(parts[1]))
             self._send(404, {"error": "not found"})
+        except RequestValidationError as e:
+            self._deny(400, e.reason, kind="invalid_request", field=e.field)
         except KeyError:
             self._send(404, {"error": "not found"})
         except Exception as e:
@@ -1729,16 +2065,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
     def do_POST(self):
-        if not self._check_access():
+        raw = self._protected_body()
+        if raw is None:
             return
         path = urlparse(self.path).path
-        if path.startswith("/proxy/"):
-            if self._maybe_proxy():
-                return
-        body = self._body()
+        if path.startswith("/proxy/") and self._maybe_proxy(raw):
+            return
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self._deny(400, "bad_json", kind="invalid_request")
+        if not isinstance(body, dict):
+            return self._deny(400, "bad_json", kind="invalid_request")
         try:
             if path.startswith("/vm/") and body.get("id"):
-                sid = str(body["id"])
+                sid = _sandbox_id(body.get("id"))
                 op_lock = _vm_op_lock(sid)
                 try:
                     with op_lock:
@@ -1763,20 +2104,23 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     if path == "/vm/destroy":
                         _drop_vm_op_lock(sid, op_lock)
-            # Block 1 测试:注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
-            if path == "/reclaim/simulate":
-                sig = {"type": body.get("type", "spot-termination"),
-                       "action": body.get("action", "terminate"),
-                       "time": body.get("time", _now_iso()),
+            # Block 1 测试钩子:仅 NODE_AGENT_ENABLE_TEST_HOOKS=1 时启用,生产默认 404。
+            if ENABLE_TEST_HOOKS and path == "/reclaim/simulate":
+                # 注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
+                sig = {"type": str(body.get("type", "spot-termination")),
+                       "action": str(body.get("action", "terminate")),
+                       "time": str(body.get("time", _now_iso())),
                        "injected": True}
                 _RECLAIM_STATE["detected"] = False  # 允许重复测试
                 return self._send(200, _evacuate_local(sig))
             # 清除检测态(测试用:恢复后重置,让 watch loop 可再次触发)
-            if path == "/reclaim/reset":
+            if ENABLE_TEST_HOOKS and path == "/reclaim/reset":
                 _RECLAIM_STATE.update({"detected": False, "signal": None, "at": None,
                                        "plan": None, "evacuated": False, "injected": None})
                 return self._send(200, {"reset": True})
             self._send(404, {"error": "not found"})
+        except RequestValidationError as e:
+            self._deny(400, e.reason, kind="invalid_request", field=e.field)
         except KeyError:
             self._send(404, {"error": "not found"})
         except Exception as e:
@@ -1790,9 +2134,10 @@ class Handler(BaseHTTPRequestHandler):
     # 反代需要覆盖 web 常用的其余 method(PUT/DELETE/PATCH/HEAD/OPTIONS)。
     # 这些仅用于 /proxy/,非 proxy 路径返回 404。
     def _proxy_only(self):
-        if not self._check_access():
+        raw = self._protected_body()
+        if raw is None:
             return
-        if urlparse(self.path).path.startswith("/proxy/") and self._maybe_proxy():
+        if urlparse(self.path).path.startswith("/proxy/") and self._maybe_proxy(raw):
             return
         self._send(404, {"error": "not found"})
 
@@ -1803,7 +2148,48 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD    = _proxy_only
 
 
+def _listen_host() -> str:
+    """监听地址:显式 NODE_AGENT_LISTEN_HOST 优先,否则本节点主网卡内网 IP(管理面)。"""
+    return LISTEN_HOST or _advertise_ip()
+
+
+def _startup_security_checks() -> None:
+    """启动前安全自检,任一不满足即拒绝启动(fail closed)。"""
+    import sys
+    problems = []
+    if not _AUTH.configured:
+        problems.append(
+            "NODE_AGENT_AUTH_KEY / NODE_AGENT_AUTH_KEY_FILE 未配置或短于 "
+            f"{agent_auth.MIN_KEY_BYTES} 字节(控制面与 node-agent 共享的 HMAC 密钥)")
+    for name, value in (("ALLOWED_CALLER_CIDR", ALLOWED_CALLER_CIDR),
+                        ("DENIED_CALLER_CIDR", DENIED_CALLER_CIDR)):
+        try:
+            _parse_cidrs(value)
+        except ValueError:
+            problems.append(f"{name} 不是合法的 CIDR 列表: {value!r}")
+    if not ALLOWED_CALLER_CIDR.strip():
+        problems.append("ALLOWED_CALLER_CIDR 为空 —— 设为控制面 Pod 所在网段(空值将拒绝全部调用)")
+    if _listen_host() in ("0.0.0.0", "::", ""):
+        problems.append("NODE_AGENT_LISTEN_HOST 不能是通配地址,设为节点管理网卡 IP")
+    if problems:
+        for p in problems:
+            print(f"[node-agent] FATAL: {p}", file=sys.stderr, flush=True)
+        sys.exit(2)
+    if GUEST_FIREWALL:
+        try:
+            _install_guest_firewall()
+        except Exception as e:
+            print(f"[node-agent] FATAL: 安装 guest 隔离 iptables 规则失败: {e}",
+                  file=sys.stderr, flush=True)
+            sys.exit(2)
+    else:
+        print("[node-agent] WARNING: NODE_AGENT_GUEST_FIREWALL=0,guest→宿主隔离规则需由外部保证",
+              file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
+    _startup_security_checks()
+
     # 启动自恢复:重建残留 VM 的操作句柄,避免重启后状态漂移(P0-1)
     try:
         n = _recover_vms()
@@ -1820,7 +2206,10 @@ if __name__ == "__main__":
     print(f"[reclaim] watch={'on' if RECLAIM_WATCH else 'off'} "
           f"poll={RECLAIM_POLL_S}s mode={'REAL' if RECLAIM_AUTO_EVACUATE else 'DRY-RUN'}")
 
-    print(f"node-agent [{NODE_ID}] 在 {LISTEN_HOST}:{LISTEN_PORT} "
-          f"(advertise: {_advertise_ip()}, "
-          f"allowed callers: {ALLOWED_CALLER_CIDR or 'all — set ALLOWED_CALLER_CIDR in production'})")
-    ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
+    listen_host = _listen_host()
+    print(f"node-agent [{NODE_ID}] 在 {listen_host}:{LISTEN_PORT} "
+          f"(advertise: {_advertise_ip()}, allowed callers: {ALLOWED_CALLER_CIDR}, "
+          f"denied: {DENIED_CALLER_CIDR}, auth: hmac-v1, "
+          f"test hooks: {'on' if ENABLE_TEST_HOOKS else 'off'}, "
+          f"guest firewall: {'on' if GUEST_FIREWALL else 'off'})")
+    ThreadingHTTPServer((listen_host, LISTEN_PORT), Handler).serve_forever()

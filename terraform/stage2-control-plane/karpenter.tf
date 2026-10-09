@@ -106,22 +106,8 @@ resource "aws_iam_role_policy_attachment" "karpenter_node_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# S3 快照访问（node-agent 上传/下载快照）
-resource "aws_iam_role_policy" "karpenter_node_s3" {
-  name = "karpenter-node-s3-snapshot"
-  role = aws_iam_role.karpenter_node.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-      Resource = local.snapshot_bucket != "" ? [
-        "arn:aws:s3:::${local.snapshot_bucket}",
-        "arn:aws:s3:::${local.snapshot_bucket}/*",
-      ] : ["arn:aws:s3:::placeholder"]
-    }]
-  })
-}
+# 不给 Karpenter 节点角色快照桶权限:node-agent 只用其 IRSA(stage2 main.tf aws_iam_role.node_agent)
+# 访问快照,实例角色凭据对节点上任何进程/经 NAT 出网的 guest 都可能可达(V2401449830)。
 
 # Karpenter controller 需要 PassRole 到 worker node role
 resource "aws_iam_role_policy" "karpenter_controller_node_role" {

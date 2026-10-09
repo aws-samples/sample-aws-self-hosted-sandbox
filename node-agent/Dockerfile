@@ -10,6 +10,6 @@ RUN pip install --no-cache-dir boto3 prometheus-client \
     opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
 WORKDIR /app
-COPY main.py observability.py /app/
+COPY main.py observability.py agent_auth.py /app/
 
 CMD ["python3", "/app/main.py"]

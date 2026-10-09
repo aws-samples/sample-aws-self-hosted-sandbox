@@ -18,6 +18,7 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
 - **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
+- **Hardened node-agent host plane** (V2401449830): HMAC-signed control-plane requests on every non-health route, fail-closed caller allowlist, management-IP bind, host iptables isolating guests from the host, IMDS, other guests and other nodes' agents, and strict server-side path / S3-prefix validation — see [docs/安全整改-V2401449830-node-agent宿主执行面.md](docs/安全整改-V2401449830-node-agent宿主执行面.md)
 - **Platform observability**: low-cardinality Prometheus metrics, centralized JSON logs in CloudWatch, cross-component OpenTelemetry/X-Ray traces, five alert classes, an eight-panel dashboard, SHA-256 snapshot verification, AMP remote-write, and automated AMG configuration
 
 ### Use Cases

@@ -18,6 +18,7 @@ import urllib.request
 from typing import Any
 
 from sandbox_api import db
+from sandbox_api import node_agent_auth
 from sandbox_api.observability import (
     current_request_id,
     inject_trace_headers,
@@ -352,6 +353,8 @@ class FirecrackerDriver:
             if request_id := current_request_id():
                 headers["X-Request-ID"] = request_id
             inject_trace_headers(headers)
+            # node-agent 对所有非健康检查路由强制 HMAC 签名(见 node_agent_auth.py)
+            headers.update(node_agent_auth.signed_headers(method, path, data))
             req = urllib.request.Request(
                 url, data=data, headers=headers, method=method
             )

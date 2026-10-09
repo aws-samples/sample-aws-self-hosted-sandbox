@@ -656,6 +656,8 @@ FC 官方文档印证:"Guest network connectivity is not guaranteed to be preser
 - `RECLAIM_AUTO_EVACUATE=1`:对每个本地 running VM 打 Diff 快照到持久 EBS(方案C,不传 S3)。
 
 ### 测试注入(EKS 托管节点非 spot,真 ITN 不触发)
+> 安全整改(V2401449830)后:以下 simulate/reset 测试钩子默认关闭(404),需 node-agent 设
+> `NODE_AGENT_ENABLE_TEST_HOOKS=1`;所有 `/reclaim/*` 调用均需控制面 HMAC 签名。
 - `POST /reclaim/simulate {type}`:注入一个模拟信号,立即算疏散计划(用于验证链路)。
 - `POST /reclaim/reset`:清检测态,便于重复测试。
 - `GET /reclaim/status`:看最近一次检测/计划。
