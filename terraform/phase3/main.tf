@@ -290,9 +290,18 @@ module "eks" {
       # 若所选 i7i 规格暂时无容量,可切到 1=region-b 或 2=region-c。
       subnet_ids = [module.vpc.public_subnets[var.sandbox_az_index]]
 
-      # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz。
-      iam_role_additional_policies = {
-        s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      # B2: 节点 userData 需从 S3 拉 rootfs.tar.gz —— 只授予 rootfs_s3_uri 所在目录的只读权限,
+      # 不再挂 AmazonS3ReadOnlyAccess(全账号桶可读)。快照读写走 node-agent 的 IRSA。
+      iam_role_additional_policies = var.rootfs_s3_uri != "" ? {
+        rootfs_read = aws_iam_policy.sandbox_node_rootfs_read[0].arn
+      } : {}
+
+      # IMDSv2 强制 + hop limit 1:经 tap NAT 转发的 guest 流量多一跳,拿不到 token 响应
+      # (宿主 iptables 另行丢弃 guest→169.254.169.254,双保险)。node-agent 为 hostNetwork 不受影响。
+      metadata_options = {
+        http_endpoint               = "enabled"
+        http_tokens                 = "required"
+        http_put_response_hop_limit = 1
       }
 
       block_device_mappings = {
@@ -437,6 +446,21 @@ module "eks" {
         # NAT
         sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 
+        # guest 隔离(V2401449830):guest 不得访问宿主任何端口(含 node-agent :8002)、IMDS、
+        # 其他 guest、其他节点的 node-agent。与 node-agent 启动时安装的链同名同内容(幂等重建)。
+        for CH in SBX-GUEST-IN SBX-GUEST-FWD; do iptables -N "$CH" 2>/dev/null || true; iptables -F "$CH" || true; done
+        iptables -A SBX-GUEST-IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
+        iptables -A SBX-GUEST-IN -p tcp --dport 8002 -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix "sbx-guest-agent-probe " || true
+        iptables -A SBX-GUEST-IN -j DROP || true
+        iptables -A SBX-GUEST-FWD -o fctap+ -j DROP || true
+        iptables -A SBX-GUEST-FWD -d 169.254.169.254/32 -j DROP || true
+        iptables -A SBX-GUEST-FWD -d 169.254.170.23/32 -j DROP || true
+        iptables -A SBX-GUEST-FWD -p tcp --dport 8002 -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix "sbx-guest-agent-probe " || true
+        iptables -A SBX-GUEST-FWD -p tcp --dport 8002 -j DROP || true
+        iptables -A SBX-GUEST-FWD -j RETURN || true
+        iptables -C INPUT -i fctap+ -j SBX-GUEST-IN 2>/dev/null || iptables -I INPUT 1 -i fctap+ -j SBX-GUEST-IN || true
+        iptables -C FORWARD -i fctap+ -j SBX-GUEST-FWD 2>/dev/null || iptables -I FORWARD 1 -i fctap+ -j SBX-GUEST-FWD || true
+
         echo "[pre-bootstrap] DONE $(date)"
       EOT
       }]
@@ -463,6 +487,33 @@ module "eks" {
   node_security_group_tags = {
     "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
+}
+
+# ---------- 沙盒节点 rootfs 模板只读权限(替代 AmazonS3ReadOnlyAccess) ----------
+locals {
+  # s3://bucket/rootfs/min-rootfs.tar.gz → bucket = "bucket", prefix = "rootfs"
+  rootfs_s3_path   = trimprefix(var.rootfs_s3_uri, "s3://")
+  rootfs_s3_bucket = split("/", local.rootfs_s3_path)[0]
+  rootfs_s3_dir    = try("${regex("^[^/]+/(.*)/[^/]*$", local.rootfs_s3_path)[0]}/", "")
+}
+
+resource "aws_iam_policy" "sandbox_node_rootfs_read" {
+  count       = var.rootfs_s3_uri != "" ? 1 : 0
+  name        = "${var.cluster_name}-sandbox-node-rootfs-read"
+  description = "Sandbox node userData: read rootfs templates only"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    # 默认模板(rootfs_s3_uri 本身)+ 同目录命名模板 rootfs-{name}.tar.gz(见 userData)
+    Statement = [{
+      Sid    = "RootfsTemplatesRead"
+      Effect = "Allow"
+      Action = ["s3:GetObject"]
+      Resource = [
+        "arn:aws:s3:::${local.rootfs_s3_path}",
+        "arn:aws:s3:::${local.rootfs_s3_bucket}/${local.rootfs_s3_dir}rootfs-*.tar.gz",
+      ]
+    }]
+  })
 }
 
 # Bedrock 权限已迁移到 LiteLLM IRSA(terraform/stage2-control-plane/litellm.tf)

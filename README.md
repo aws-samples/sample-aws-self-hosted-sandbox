@@ -237,6 +237,9 @@ GET  /admin/images                        # 可用镜像列表(供 Portal 下拉
 - 凭据零进沙盒：Bedrock 凭据只在 LiteLLM IRSA
 - Bearer token 认证，多 key 支持多租户
 - 强制 IMDSv2（`http_tokens=required`）：阻断 SSRF 经 IMDSv1 窃取宿主机实例凭据
+- node-agent 宿主执行面加固（V2401449830）：非健康检查路由强制控制面 HMAC 签名 + 来源白名单 fail closed；
+  只绑节点管理 IP；宿主 iptables 隔离 guest（禁止访问宿主端口 / IMDS / 其他 guest / 其他节点 node-agent）；
+  请求路径与 S3 前缀按服务端约定严格校验。详见 [docs/安全整改-V2401449830-node-agent宿主执行面.md](docs/安全整改-V2401449830-node-agent宿主执行面.md)
 
 #### 6. 高可用编排（控制面自愈，非"手搓 POC"）
 

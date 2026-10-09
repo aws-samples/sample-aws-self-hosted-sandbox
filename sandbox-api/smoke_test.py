@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
@@ -53,7 +54,27 @@ os.environ.update({
     "WARM_POOL_SIZE":            "2",
     "WARM_POOL_REFILL_S":        "9999",  # 禁止自动 refill 干扰测试
     "ALLOW_UNAUTHENTICATED":     "1",     # 测试环境跳过认证
+    # 控制面 → node-agent HMAC 签名密钥(stub agent 用同一把校验)
+    "NODE_AGENT_AUTH_KEY":       "smoke-test-node-agent-key-0123456789abcdef",
 })
+
+
+def _verify_agent_signature(handler, body: bytes) -> bool:
+    """按 node-agent 的 canonical 格式校验控制面签名(见 node-agent/agent_auth.py)。"""
+    import hashlib
+    import hmac
+    from sandbox_api import node_agent_auth
+    h = handler.headers
+    ts, nonce = h.get(node_agent_auth.HEADER_TIMESTAMP, ""), h.get(node_agent_auth.HEADER_NONCE, "")
+    content_sha = h.get(node_agent_auth.HEADER_CONTENT_SHA256, "")
+    if content_sha != hashlib.sha256(body).hexdigest():
+        return False
+    expected = hmac.new(
+        os.environ["NODE_AGENT_AUTH_KEY"].encode(),
+        node_agent_auth.canonical_string(ts, nonce, handler.command, handler.path, content_sha),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(f"v1={expected}", h.get(node_agent_auth.HEADER_SIGNATURE, ""))
 
 
 # ────────────────────────────────────────────────
@@ -65,12 +86,22 @@ class _AgentStub(BaseHTTPRequestHandler):
     calls: list[tuple[str, str, dict]] = []
     request_ids: list[str] = []
     traceparents: list[str] = []
+    unsigned: list[str] = []   # 未通过签名校验的请求路径(真实 node-agent 会 401)
 
     def log_message(self, *_): pass
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(n)) if n else {}
+        raw = self.rfile.read(n) if n else b""
+        self._signed = _verify_agent_signature(self, raw)
+        return json.loads(raw) if raw else {}
+
+    def _reject_unsigned(self) -> bool:
+        if self._signed:
+            return False
+        _AgentStub.unsigned.append(self.path)
+        self._send(401, {"error": "unauthorized"})
+        return True
 
     def _send(self, code: int, obj: dict):
         body = json.dumps(obj).encode()
@@ -85,6 +116,8 @@ class _AgentStub(BaseHTTPRequestHandler):
         _AgentStub.calls.append(("POST", self.path, b))
         _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
         _AgentStub.traceparents.append(self.headers.get("traceparent", ""))
+        if self._reject_unsigned():
+            return
         sid = b.get("id", "unknown")
         if self.path == "/vm/create":
             return self._send(200, {"state": "running", "ip": "172.18.1.2"})
@@ -105,6 +138,10 @@ class _AgentStub(BaseHTTPRequestHandler):
         _AgentStub.calls.append(("GET", self.path, {}))
         _AgentStub.request_ids.append(self.headers.get("X-Request-ID", ""))
         _AgentStub.traceparents.append(self.headers.get("traceparent", ""))
+        self._signed = _verify_agent_signature(self, b"")
+        # /health 在真实 node-agent 上是公开路由;其余 GET 必须签名
+        if self.path != "/health" and self._reject_unsigned():
+            return
         if self.path == "/health":
             return self._send(200, {"node_id": "mock-node", "free_mem_mib": 90000, "vm_count": 0})
         if self.path.startswith("/vm/"):
@@ -346,6 +383,29 @@ class TestFirecrackerDriver(unittest.TestCase):
 
     def setUp(self):
         _AgentStub.calls.clear()
+        _AgentStub.unsigned.clear()
+
+    @mock_aws
+    def test_agent_calls_are_signed(self):
+        """所有 driver → node-agent 调用都带有效 HMAC 签名;缺密钥时拒绝发出请求。"""
+        _create_tables()
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        from sandbox_api.driver import SandboxSpec
+        from sandbox_api import node_agent_auth
+        drv = FirecrackerDriver()
+        result = drv.create("sbx-signed", SandboxSpec(image="min", cpu=1, mem_mib=256))
+        drv.exec("sbx-signed", result, "true")
+        self.assertGreaterEqual(len(_AgentStub.calls), 3)
+        self.assertEqual(_AgentStub.unsigned, [])
+
+        cached = node_agent_auth._KEY_CACHE
+        node_agent_auth._KEY_CACHE = None
+        try:
+            with patch.dict(os.environ, {"NODE_AGENT_AUTH_KEY": "short"}):
+                with self.assertRaises(RuntimeError):
+                    node_agent_auth.signed_headers("GET", "/vm/x")
+        finally:
+            node_agent_auth._KEY_CACHE = cached
 
     @mock_aws
     def test_create_and_destroy(self):
@@ -681,6 +741,32 @@ class TestAdminAggregates(unittest.TestCase):
                 srv.shutdown()
         finally:
             app_module.EXPOSE_TOKEN = ""
+
+    @mock_aws
+    def test_gateway_proxy_signs_and_drops_client_agent_headers(self):
+        """/s/ 网关转发到 node-agent 时由控制面签名;客户端伪造的 X-Sbx-Agent-* 头被丢弃。"""
+        _create_tables()
+        from sandbox_api import db
+        db.put({"id": "px9", "tenant_id": "t", "state": "running",
+                "driver": "firecracker", "node": f"127.0.0.1:{_STUB_PORT}",
+                "services": [{"port": 80}], "updated_at": db._utcnow()})
+        _AgentStub.calls.clear()
+        _AgentStub.unsigned.clear()
+        srv, port = self._start_api()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/s/px9/80/hello?q=1",
+                headers={"X-Sbx-Agent-Signature": "v1=" + "0" * 64,
+                         "X-Sbx-Agent-Nonce": "forged-nonce-forged-nonce"})
+            try:
+                urllib.request.urlopen(req, timeout=10).read()
+            except urllib.error.HTTPError:
+                pass  # stub 对 /proxy/ 回 404,只关心它收到的签名
+        finally:
+            srv.shutdown()
+        proxied = [c[1] for c in _AgentStub.calls if c[1].startswith("/proxy/px9/80/")]
+        self.assertEqual(proxied, ["/proxy/px9/80/hello?q=1"])
+        self.assertEqual(_AgentStub.unsigned, [])
 
     @mock_aws
     def test_admin_requires_admin_key(self):

@@ -97,6 +97,11 @@ NODE_HEARTBEAT_ERRORS = Counter(
     "Failed node heartbeat writes.",
     ("node",),
 )
+NODE_AGENT_SECURITY_EVENTS = Counter(
+    "node_agent_security_events_total",
+    "Rejected node-agent requests (auth failures, guest-range callers, invalid paths).",
+    ("kind", "reason"),
+)
 
 
 def _initialize_snapshot_metric_series() -> None:
@@ -117,6 +122,27 @@ def _initialize_snapshot_metric_series() -> None:
 
 
 _initialize_snapshot_metric_series()
+
+# 告警关注的拒绝原因:guest 网段来源、签名失败、路径/前缀越界。预建零基线供 increase()。
+SECURITY_ALERT_SERIES = (
+    ("auth_denied", "guest_source"),
+    ("auth_denied", "caller_not_allowed"),
+    ("auth_denied", "missing"),
+    ("auth_denied", "malformed"),
+    ("auth_denied", "expired"),
+    ("auth_denied", "bad_signature"),
+    ("auth_denied", "replay"),
+    ("auth_denied", "body_mismatch"),
+    ("invalid_request", "bad_path"),
+    ("invalid_request", "path_outside_sbx_base"),
+    ("invalid_request", "path_owner_mismatch"),
+    ("invalid_request", "symlink"),
+    ("invalid_request", "bad_s3_prefix"),
+    ("invalid_request", "bad_id"),
+    ("invalid_request", "bad_kernel"),
+)
+for _kind, _reason in SECURITY_ALERT_SERIES:
+    NODE_AGENT_SECURITY_EVENTS.labels(_kind, _reason).inc(0)
 
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default=""
@@ -170,23 +196,34 @@ def log_event(level: str, event: str, **fields) -> None:
     )
 
 
+_VM_OPS = frozenset({"create", "destroy", "snapshot_base", "suspend", "resume", "exec"})
+_STATIC_ROUTES = frozenset({
+    "/", "/health", "/livez", "/readyz", "/metrics",
+    "/reclaim/status", "/reclaim/simulate", "/reclaim/reset",
+})
+_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
+
+
 def normalize_route(path: str) -> str:
+    """把请求路径收敛到有限集合(含未鉴权请求):未知路径一律 "/other",防止指标标签基数被刷爆。"""
     parts = urlparse(path).path.strip("/").split("/")
     if not parts or parts == [""]:
         return "/"
-    if parts[0] == "vm":
-        if len(parts) == 2 and parts[1] not in {
-            "create", "destroy", "snapshot_base", "suspend", "resume", "exec"
-        }:
-            return "/vm/{id}"
-        return "/" + "/".join(parts[:2])
+    if parts[0] == "vm" and len(parts) == 2:
+        return f"/vm/{parts[1]}" if parts[1] in _VM_OPS else "/vm/{id}"
     if parts[0] == "proxy":
         return "/proxy/{id}/{port}/{path}"
-    return "/" + "/".join(parts)
+    route = "/" + "/".join(parts)
+    return route if route in _STATIC_ROUTES else "/other"
+
+
+def normalize_method(method: str) -> str:
+    return method if method in _METHODS else "OTHER"
 
 
 def record_http(method: str, path: str, status: int, duration: float) -> str:
     route = normalize_route(path)
+    method = normalize_method(method)
     HTTP_REQUESTS.labels(route, method, f"{status // 100}xx").inc()
     HTTP_REQUEST_DURATION.labels(route, method).observe(duration)
     return route
@@ -245,6 +282,10 @@ def record_snapshot_verify(result: str, duration: float) -> None:
 
 def record_snapshot_error(phase: str) -> None:
     FC_SNAPSHOT_ERRORS.labels(phase).inc()
+
+
+def record_security_event(kind: str, reason: str) -> None:
+    NODE_AGENT_SECURITY_EVENTS.labels(kind, reason).inc()
 
 
 def record_snapshot_legacy_migration(result: str) -> None:

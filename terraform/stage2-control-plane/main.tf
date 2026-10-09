@@ -31,6 +31,7 @@ terraform {
     kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.0" }
     helm       = { source = "hashicorp/helm", version = "~> 2.0" }
     null       = { source = "hashicorp/null", version = "~> 3.0" }
+    random     = { source = "hashicorp/random", version = "~> 3.0" }
   }
 }
 
@@ -66,6 +67,15 @@ variable "fc_nodes" {
   type        = string
   description = "Comma-separated private IPs of Firecracker sandbox nodes running node-agent"
   default     = ""
+}
+
+# node-agent 受保护路由的来源白名单(逗号分隔 CIDR)。留空 = 集群 VPC CIDR
+# (控制面 Pod 走 VPC CNI 拿 VPC 内地址)。node-agent 对空白名单 fail closed,
+# 因此这里始终下发非空值;guest tap 网段 172.18.0.0/16 另由 DENIED_CALLER_CIDR 永久拒绝。
+variable "node_agent_allowed_caller_cidrs" {
+  type        = string
+  default     = ""
+  description = "Comma-separated CIDRs allowed to call node-agent protected routes (default: cluster VPC CIDR). Authentication (HMAC) is always required in addition."
 }
 
 variable "nlb_hostname" {
@@ -208,6 +218,11 @@ resource "aws_s3_bucket" "snapshots" {
 }
 
 locals {
+  snapshot_bucket_or_placeholder  = local.snapshot_bucket != "" ? local.snapshot_bucket : "placeholder"
+  node_agent_allowed_caller_cidrs = var.node_agent_allowed_caller_cidrs != "" ? var.node_agent_allowed_caller_cidrs : data.aws_vpc.cluster.cidr_block
+}
+
+locals {
   snapshot_bucket = var.snapshot_s3_bucket != "" ? var.snapshot_s3_bucket : (
     length(aws_s3_bucket.snapshots) > 0 ? aws_s3_bucket.snapshots[0].id : ""
   )
@@ -312,33 +327,48 @@ resource "aws_iam_role" "node_agent" {
 resource "aws_iam_role_policy" "node_agent" {
   name = "node-agent-policy"
   role = aws_iam_role.node_agent.id
+  # 最小权限:只能读写快照桶的 sbx/ 前缀(与 node-agent 校验的 s3_prefix 约定一致),
+  # 读 / 写分开声明,不授予 DeleteObject(aws s3 sync 不带 --delete)。
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # S3 快照上传/下载
       {
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-        Resource = local.snapshot_bucket != "" ? [
-          "arn:aws:s3:::${local.snapshot_bucket}",
-          "arn:aws:s3:::${local.snapshot_bucket}/*",
-        ] : ["arn:aws:s3:::placeholder"]
+        Sid       = "SnapshotList"
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}"]
+        Condition = { StringLike = { "s3:prefix" = ["sbx/*"] } }
       },
-      # ECR 拉镜像(rootfs 构建产物)
       {
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken", "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer"]
-        Resource = ["*"]
+        Sid      = "SnapshotRead"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}/sbx/*"]
+      },
+      {
+        Sid      = "SnapshotWrite"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}/sbx/*"]
       },
       # P0-3: 心跳注册表写入(node-agent 定期 upsert 本节点状态)
       {
+        Sid      = "NodeHeartbeat"
         Effect   = "Allow"
         Action   = ["dynamodb:PutItem"]
         Resource = ["arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_nodes}"]
       },
     ]
   })
+}
+
+# ---------- 控制面 ↔ node-agent 鉴权密钥 ----------
+# node-agent 只接受带 HMAC 签名的请求(见 node-agent/agent_auth.py)。密钥由 Terraform 生成,
+# 存为 sandbox-system 下的 Secret,只注入控制面 Deployment 与 node-agent DaemonSet。
+# 轮换:terraform apply -replace=random_password.node_agent_auth 后滚动重启两者。
+resource "random_password" "node_agent_auth" {
+  length  = 64
+  special = false
 }
 
 # ---------- Kubernetes: Namespace ----------
@@ -497,6 +527,17 @@ resource "kubernetes_secret" "control_plane_api_keys" {
   type = "Opaque"
 }
 
+resource "kubernetes_secret" "node_agent_auth" {
+  metadata {
+    name      = "node-agent-auth"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+  data = {
+    NODE_AGENT_AUTH_KEY = random_password.node_agent_auth.result
+  }
+  type = "Opaque"
+}
+
 resource "kubernetes_config_map" "control_plane" {
   metadata {
     name      = "sandbox-control-plane"
@@ -515,9 +556,9 @@ resource "kubernetes_config_map" "control_plane" {
     K8S_NAMESPACE         = "default"
     SNAPSHOT_S3_BUCKET    = local.snapshot_bucket
     # 默认把 suspend 快照上传 S3 作权威副本;false=只保留在节点持久状态 EBS(方案C)。
-    SNAPSHOT_TO_S3        = var.snapshot_to_s3 ? "1" : "0"
-    WARM_POOL_SIZE        = tostring(var.warm_pool_size)
-    WARM_POOL_REFILL_S    = "60"
+    SNAPSHOT_TO_S3     = var.snapshot_to_s3 ? "1" : "0"
+    WARM_POOL_SIZE     = tostring(var.warm_pool_size)
+    WARM_POOL_REFILL_S = "60"
     # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。
     AUTO_SLEEP_ENABLED   = var.auto_sleep_enabled
     AUTO_SLEEP_IDLE_S    = tostring(var.auto_sleep_idle_s)
@@ -558,6 +599,8 @@ resource "kubernetes_deployment" "control_plane" {
         labels = { app = "sandbox-control-plane", fargate = "true" }
         annotations = {
           "sandbox.platform/config-sha256" = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          # 密钥轮换时触发滚动重启
+          "sandbox.platform/node-agent-auth-sha256" = sha256(random_password.node_agent_auth.result)
         }
       }
       spec {
@@ -589,6 +632,10 @@ resource "kubernetes_deployment" "control_plane" {
           # API_KEYS 从 Secret 注入（不进 ConfigMap 避免明文暴露）
           env_from {
             secret_ref { name = kubernetes_secret.control_plane_api_keys.metadata[0].name }
+          }
+          # 调用 node-agent 的 HMAC 签名密钥
+          env_from {
+            secret_ref { name = kubernetes_secret.node_agent_auth.metadata[0].name }
           }
           resources {
             requests = { cpu = "250m", memory = "512Mi" }
@@ -663,7 +710,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
   spec {
     selector { match_labels = { app = "node-agent" } }
     template {
-      metadata { labels = { app = "node-agent" } }
+      metadata {
+        labels = { app = "node-agent" }
+        annotations = {
+          # 密钥轮换时触发滚动重启
+          "sandbox.platform/node-agent-auth-sha256" = sha256(random_password.node_agent_auth.result)
+        }
+      }
       spec {
         service_account_name = kubernetes_service_account.node_agent.metadata[0].name
         # 只调度到 Firecracker 沙盒节点
@@ -674,9 +727,10 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           value    = "sandbox"
           effect   = "NoSchedule"
         }
-        # 需要 hostNetwork + hostPID 才能操作 tap/Firecracker
+        # 需要 hostNetwork 才能操作 tap/iptables。不再开 hostPID:node-agent 只管理自己拉起的
+        # Firecracker 子进程,无需看到宿主进程表;关闭后 /proc/1/root 不再指向宿主根文件系统。
         host_network = true
-        host_pid     = true
+        host_pid     = false
         # 需要特权容器操作 KVM/tap/iptables
         container {
           name              = "agent"
@@ -691,6 +745,49 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "NODE_AGENT_PORT"
             value = "8002"
+          }
+          # ---- 宿主执行面安全(V2401449830)----
+          # 只绑节点主网卡 IP(管理面),不再 0.0.0.0;心跳上报同一地址。
+          env {
+            name = "NODE_AGENT_LISTEN_HOST"
+            value_from {
+              field_ref { field_path = "status.hostIP" }
+            }
+          }
+          env {
+            name = "NODE_ADVERTISE_IP"
+            value_from {
+              field_ref { field_path = "status.hostIP" }
+            }
+          }
+          # 受保护路由来源白名单(空值 node-agent 会拒绝启动);guest tap 网段永久拒绝。
+          env {
+            name  = "ALLOWED_CALLER_CIDR"
+            value = local.node_agent_allowed_caller_cidrs
+          }
+          env {
+            name  = "DENIED_CALLER_CIDR"
+            value = "172.18.0.0/16"
+          }
+          # 控制面 ↔ node-agent HMAC 密钥(缺失则 node-agent 拒绝启动)
+          env {
+            name = "NODE_AGENT_AUTH_KEY"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.node_agent_auth.metadata[0].name
+                key  = "NODE_AGENT_AUTH_KEY"
+              }
+            }
+          }
+          # 测试钩子(/reclaim/simulate、/reclaim/reset)生产关闭
+          env {
+            name  = "NODE_AGENT_ENABLE_TEST_HOOKS"
+            value = "0"
+          }
+          # 启动时安装 guest 隔离 iptables 规则(SBX-GUEST-IN / SBX-GUEST-FWD)
+          env {
+            name  = "NODE_AGENT_GUEST_FIREWALL"
+            value = "1"
           }
           env {
             name  = "SBX_BASE"
@@ -748,9 +845,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             read_only  = true
           }
           # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
+          # 只读:node-agent 只从模板 CoW 复制,从不写 /opt/sbx(防模板/kernel 被篡改投毒)
           volume_mount {
             name       = "fc-assets"
             mount_path = "/opt/sbx"
+            read_only  = true
           }
           # ⚠️ 关键:所有 Firecracker microVM 作为 node-agent 的子进程,跑在【本 Pod 的 cgroup】内。
           # 若设 memory limit,所有 guest 内存之和会被此 limit 卡住 → OOM 杀 microVM。
