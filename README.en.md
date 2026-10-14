@@ -11,12 +11,12 @@
 >
 > - **Deployments built from any commit before [`2ea68f2`](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/commit/2ea68f2) ([PR #31](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/pull/31), V2401449830) are exposed to cross-tenant root RCE.**
 >   In those versions node-agent runs as root on `0.0.0.0:8002` with no authentication and an allow-all caller gate. Code inside any sandbox can reach it through the tap gateway and run commands as root in other tenants' microVMs, destroy / suspend / resume them, and write arbitrary files on the host as root. Guests can also reach IMDS and read the node role's credentials.
->   Do not run untrusted or multi-tenant workloads on these versions. Upgrade the control plane and node-agent together; this is a breaking change, see §3 of the [remediation doc](docs/安全整改-V2401449830-node-agent宿主执行面.md).
+>   Do not run untrusted or multi-tenant workloads on these versions. Upgrade the control plane and node-agent together. This is a breaking change: the new node-agent rejects unsigned requests, so an old control plane gets 401 from it. Restarting the node-agent DaemonSet also stops the microVMs on that node, so suspend or drain sandboxes first.
 > - **From `2ea68f2` on, node-agent must not run multi-tenant unless both of these are in place:**
 >   1. **HMAC-SHA256 request signing**: `NODE_AGENT_AUTH_KEY` (or `NODE_AGENT_AUTH_KEY_FILE`, at least 32 bytes) set to the same value on the control plane and on every node-agent. node-agent refuses to start without it. stage2 Terraform generates the key into a Kubernetes Secret.
 >   2. **`ALLOWED_CALLER_CIDR` set to the control-plane Pod CIDR**: only the range control-plane Pods actually get addresses from (with VPC CNI, the subnets of the system node group). An empty value denies every caller and node-agent refuses to start. The guest tap range `172.18.0.0/16` is always denied.
 > - **The stage2 default is wider than the control-plane Pod CIDR.** If `node_agent_allowed_caller_cidrs` is left empty, stage2 uses the whole cluster VPC CIDR, because in the sample VPC the system and sandbox nodes share subnets. For multi-tenant use, run control-plane Pods in subnets that sandbox nodes do not use, and set `node_agent_allowed_caller_cidrs` to those subnets.
-> - Keep `NODE_AGENT_GUEST_FIREWALL=1` and `NODE_AGENT_ENABLE_TEST_HOOKS=0` (both are the defaults). Known residual risks, such as one shared key across all nodes, plaintext HTTP inside the VPC and jailer being off by default, are listed in §5 of the remediation doc.
+> - Keep `NODE_AGENT_GUEST_FIREWALL=1` and `NODE_AGENT_ENABLE_TEST_HOOKS=0` (both are the defaults). Known residual risks remain even with both controls: one HMAC key is shared by all nodes, control-plane → node-agent traffic is plaintext HTTP inside the VPC, and jailer is off by default.
 >
 > To check a checkout: `git merge-base --is-ancestor 2ea68f2 HEAD && echo fixed || echo VULNERABLE`
 
