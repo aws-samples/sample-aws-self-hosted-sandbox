@@ -3,7 +3,7 @@
 > 日期：2026-06-14
 > 目的：严格按 README「快速开始（Agent 部署指南）」从零部署，记录与文档不符之处，用于优化 README/Terraform 准确性。
 > 执行者：Claude (DevOps agent)
-> AWS 账号：427169985960，region us-east-1
+> AWS 账号：<ACCOUNT_ID>，region us-east-1
 
 ## 环境基线
 

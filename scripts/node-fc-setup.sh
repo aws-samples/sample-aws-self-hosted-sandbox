@@ -2,10 +2,10 @@
 # 在 EKS metal 节点上安装 Firecracker 素材(B2 修法2:pre_bootstrap 未生效时手动补)
 # 经 SSM 下发。装:firecracker 二进制 + guest kernel + 从 S3 拉 rootfs 造 ext4。
 set -uxo pipefail
+ROOTFS_S3="${ROOTFS_S3:?set ROOTFS_S3=s3://my-sandbox-snapshots-<ACCOUNT_ID>/rootfs/min-rootfs.tar.gz}"
 exec >> /var/log/fc-setup.log 2>&1
 echo "[fc-setup] START $(date)"
 
-ROOTFS_S3="${ROOTFS_S3:-s3://my-sandbox-snapshots-551344820358/rootfs/min-rootfs.tar.gz}"
 REGION="${REGION:-us-east-1}"
 ARCH=aarch64
 
