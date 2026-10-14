@@ -6,6 +6,20 @@
 
 ---
 
+> [!CAUTION]
+> **多租户部署：运行不可信代码前必读**
+>
+> - **基于 [`2ea68f2`](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/commit/2ea68f2)（[PR #31](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/pull/31)，V2401449830）之前任何提交构建的部署，都存在跨租户 root 远程代码执行风险。**
+>   这些版本的 node-agent 以 root 身份监听 `0.0.0.0:8002`，没有任何鉴权，来源白名单默认放行所有地址。任一沙盒内的代码都能经 tap 网关访问它：以 root 身份在其他租户的 microVM 内执行命令，销毁 / 挂起 / 恢复它们，并以宿主 root 身份写入任意宿主文件。guest 还能访问 IMDS，拿到节点角色凭据。
+>   这些版本上不要运行不可信或多租户的工作负载。请把控制面和 node-agent 一起升级；这是破坏性变更，见[整改文档](docs/安全整改-V2401449830-node-agent宿主执行面.md)第 3 节。
+> - **从 `2ea68f2` 起，以下两项都满足之前，不得以多租户方式运行 node-agent：**
+>   1. **HMAC-SHA256 请求签名**：控制面和每个 node-agent 上配置相同的 `NODE_AGENT_AUTH_KEY`（或 `NODE_AGENT_AUTH_KEY_FILE`，至少 32 字节）。缺少密钥时 node-agent 拒绝启动。stage2 Terraform 会生成该密钥并存入 Kubernetes Secret。
+>   2. **`ALLOWED_CALLER_CIDR` 设为控制面 Pod CIDR**：只包含控制面 Pod 实际获得地址的网段（使用 VPC CNI 时，即 system 节点组所在子网）。值为空时拒绝所有调用方，node-agent 也会拒绝启动。guest tap 网段 `172.18.0.0/16` 始终被拒绝。
+> - **stage2 的默认值比控制面 Pod CIDR 宽。** `node_agent_allowed_caller_cidrs` 留空时，stage2 使用整个集群 VPC CIDR，因为示例 VPC 中 system 节点和沙盒节点共用子网。多租户使用时，请把控制面 Pod 放在沙盒节点不使用的子网中，并把 `node_agent_allowed_caller_cidrs` 设为这些子网。
+> - 保持 `NODE_AGENT_GUEST_FIREWALL=1` 和 `NODE_AGENT_ENABLE_TEST_HOOKS=0`（均为默认值）。已知的残余风险，例如所有节点共用一把密钥、VPC 内明文 HTTP、默认未启用 jailer，列在整改文档第 5 节。
+>
+> 检查某个代码副本：`git merge-base --is-ancestor 2ea68f2 HEAD && echo fixed || echo VULNERABLE`
+
 ### 项目简介
 
 在 AWS 上复刻 Fly.io Firecracker microVM 架构，以更低成本、更高可控性运行 Claude Code 及各类 AI Agent。
