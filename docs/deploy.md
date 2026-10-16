@@ -5,11 +5,12 @@
 
 ---
 
-## 后端：裸 Firecracker microVM
+## 后端：宿主管理的 Firecracker microVM
 
-本平台后端为**裸 Firecracker microVM + node-agent DaemonSet**：支持 suspend/resume 亚秒恢复 +
-持久 EBS 跨机快照（状态卷落持久 EBS + Diff 增量内存快照），成本优先。控制面通过 HTTP 直管每台沙盒节点上的
-node-agent，不依赖 K8s 编排沙盒本身。
+本平台后端为 **Firecracker microVM + node-agent DaemonSet + 宿主 systemd/jailer**：
+支持 suspend/resume、持久 EBS 跨机快照（状态卷 + Diff 增量内存快照）。控制面通过
+签名 HTTP 请求调用每台沙盒节点上的 node-agent；VMM 则由宿主 PID 1 管理为独立 service，
+不随 node-agent Pod 重建而被杀死。
 
 部署者必须选择节点架构：
 
@@ -54,6 +55,21 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
 10. **费用提醒**：沙盒节点和 EKS 控制面持续计费，用完务必执行【清理】步骤。清理时 stage2 destroy 若卡在删 `sandbox-system` namespace，可强制删除残留 node-agent pod 后继续。
 11. **Helm/Kubernetes 认证依赖 AWS CLI**：stage2 provider 使用 `aws eks get-token` 动态刷新凭据，避免 15 分钟 EKS token 在长时间 Helm upgrade 中过期。执行 Terraform 的环境必须能从 `PATH` 调用 `aws`，且当前身份可访问目标集群。
 12. **可观测性分三层**：`enable_observability_stack=true` 安装集群内监控；`enable_amp_remote_write=true` 创建 AMP；`enable_p2_observability=true` 增加 CloudWatch Logs、ADOT/X-Ray 和 AMG datasource/Dashboard 自动配置。AMG workspace 仍需预先存在。
+13. **node-agent 鉴权密钥由 Terraform 生成**：stage2 用 `random_password.node_agent_auth`
+    生成 64 字符密钥存入 Secret `node-agent-auth`，只注入控制面、operator 与 node-agent；
+    轮换用 `terraform apply -replace=random_password.node_agent_auth`。
+14. **首次从旧 Pod-cgroup 版本升级有固定顺序**：先 apply phase3 并替换/疏散旧
+    sandbox 与 recovery 节点，确认宿主存在 `/usr/local/sbin/sbx-vmm-runtime`、
+    `/usr/local/sbin/sbx-state-volume` 和固定版本的 `firecracker-jailer`，再升级
+    stage2/node-agent。当前默认固定 `v1.16.1`；宿主 helper 会拒绝低于
+    `v1.14.1` 的 Firecracker/jailer。
+    直接先删旧 node-agent Pod 会连带杀死仍在旧 Pod cgroup 内的 VMM。
+15. **VMM 统一归入 `sbx.slice` 并设内存上限**：`sbx-vmm-runtime` 现用
+    `systemd-run --slice sbx.slice` 启动所有 Firecracker VMM，并把该 slice 的
+    `MemoryMax` 设为 `88%`（可用环境变量 `VMM_SLICE`、`VMM_SLICE_MEMORY_MAX` 覆盖）。
+    内存超分越过物理内存时，由 slice 内 cgroup OOM 只杀单个 VM，避免全局内存耗尽
+    拖垮 kubelet/containerd/SSM 导致整机 NotReady。该设置持久化在
+    `/etc/systemd/system.control/sbx.slice.d/50-MemoryMax.conf`。
 
 ---
 
@@ -92,6 +108,20 @@ fi
 
 选择 `amd64` 时，Terraform 会在 Launch Template 中显式设置
 `nested_virtualization=enabled`。若查询结果或目标区域不支持该能力，不要继续 apply。
+
+> Terraform 变量的 `node_arch` 默认值现为 `amd64`（phase3 与 stage2 需保持一致）；
+> 选 Graviton 时必须显式传 `-var="node_arch=arm64"`（上面的 `NODE_ARCH` 变量已覆盖此点）。
+
+本轮真机测试（r8i 超分 + Spot 快照）调整了以下默认值，部署时无需额外传参，如需改回可显式覆盖：
+
+| 变量 | 所属 | 新默认值 | 说明 |
+|---|---|---|---|
+| `state_ebs_iops` / `state_ebs_throughput` | phase3 | 40000 / 2000 | 原 4000 / 1000；低 IOPS 下 Spot checkpoint 先撞卷 IOPS 上限 |
+| `sandbox_zram_size_gib` | phase3 | 64 | 沙盒节点 zram(zstd) swap，0 关闭；kubelet 同时设 `failSwapOn=false`、`swapBehavior=NoSwap`；内存超分越过 `sbx.slice` 上限时换出冷页而非 OOM 杀 VM |
+| `balloon_free_page_reporting` | stage2 | true | 新建 microVM 默认挂 virtio-balloon 并开启 free page reporting（node-agent env `BALLOON_FREE_PAGE_REPORTING`）；create 请求显式传 `balloon` 时以请求为准 |
+| `reclaim_auto_evacuate` | stage2 | true | 原 false；关闭则 Spot 中断只做 DRY-RUN |
+| `reclaim_snapshot_concurrency` | stage2 | 8 | 原 12 |
+| `spot_recovery_od_recycle_enabled` | stage2 | false | 原 true；OD 回收的卷交接阶段存在已知 bug，修复前保持关闭 |
 
 ---
 
@@ -255,9 +285,10 @@ terraform apply -auto-approve \
   -var="litellm_master_key=${LITELLM_KEY}"
 
 # Terraform 自动完成：
+# - 控制面 ↔ node-agent 的 HMAC 密钥(random_password → Secret node-agent-auth,无需手工传入)
 # - IRSA 角色（控制面 / node-agent / LiteLLM）
 # - K8s 资源（sandbox-system namespace + 控制面 Deployment + node-agent DaemonSet）
-# - api-keys Secret + ConfigMap（FC_NODES 经 env_from 注入控制面）
+# - api-keys / node-agent-auth Secret + ConfigMap（FC_NODES 经 env_from 注入控制面）
 ```
 
 > ⚠️ **FC_NODES 只填稳定的 sandbox 节点**：不能使用无 label 的 `kubectl get nodes`，

@@ -1,0 +1,5 @@
+[20:12:25] prepared 120 non-xfs sandbox dirs
+[20:14:01] created+base 120: create=29.2s base=38.7s
+[20:15:47] dirty fill done in 89.4s; h1 captured for 3
+[20:18:06] checkpoint: ok=116/120 wall=114.372s logical=171.0GiB alloc=94.8GiB logical_rate=1530.7MiB/s per_vm={'n': 116, 'p50': 6.885, 'p90': 11.054, 'p99': 13.649, 'max': 13.651, 'mean': 7.199} errors=['snapshot deadline exhausted']
+[20:18:36] verify: [{'id': 'zl-0001', 'resume_code': 200, 'resume_s': 1.23, 'restore_time_s': 0.0105, 'match': True, 'error': None}, {'id': 'zl-0002', 'resume_code': 200, 'resume_s': 1.21, 'restore_time_s': 0.0106, 'match': True, 'error': None}, {'id': 'zl-0003', 'resume_code': 200, 'resume_s': 1.3, 'restore_time_s': 0.0109, 'match': True, 'error': None}]

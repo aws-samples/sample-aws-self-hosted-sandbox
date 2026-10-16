@@ -72,11 +72,38 @@ def list_by_tenant(tenant_id: str, limit: int = 100) -> list[dict]:
 
 def list_by_states(states: list[str]) -> list[dict]:
     """
-    扫全表取 state ∈ states 的沙盒,供 reconcile 对账用。
-    POC 规模(数百沙盒)全表 scan 可接受;量大后应建 state-index GSI 改 query。
+    通过 state-updated_at-index 查询 lifecycle 状态。
+
+    老环境在 GSI 在线创建完成前会返回 ValidationException，此时暂时回退旧的
+    scan 路径，支持无停机滚动升级；新环境和索引就绪后不再做全表扫描。
     """
     if not states:
         return []
+    try:
+        items: list[dict] = []
+        for state in states:
+            kwargs: dict = {
+                "IndexName": "state-updated_at-index",
+                "KeyConditionExpression": "#s = :state",
+                "ExpressionAttributeNames": {"#s": "state"},
+                "ExpressionAttributeValues": {":state": state},
+            }
+            while True:
+                resp = _sb().query(**kwargs)
+                items.extend(resp.get("Items", []))
+                lek = resp.get("LastEvaluatedKey")
+                if not lek:
+                    break
+                kwargs["ExclusiveStartKey"] = lek
+        return [_from_dynamo(i) for i in items]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {
+            "ValidationException",
+            "ResourceNotFoundException",
+        }:
+            raise
+
+    # Rolling-upgrade fallback while the new GSI is not ACTIVE yet.
     # FilterExpression: #s IN (:s0, :s1, ...)
     placeholders = {f":s{i}": s for i, s in enumerate(states)}
     filter_expr  = "#s IN (" + ", ".join(placeholders) + ")"
@@ -94,6 +121,82 @@ def list_by_states(states: list[str]) -> list[dict]:
             break
         kwargs["ExclusiveStartKey"] = lek
     return [_from_dynamo(i) for i in items]
+
+
+def list_by_recovery_target_instance(
+    instance_id: str,
+    *,
+    consistent: bool = False,
+) -> list[dict]:
+    """Return every durable sandbox still owned by one recovery host.
+
+    The GSI path is used for cheap polling. Destructive EBS handoff calls pass
+    ``consistent=True`` and scan the base table so an eventually-consistent
+    index can never hide a suspended sandbox from the OD recycle fence.
+    """
+    if not instance_id:
+        return []
+    if consistent:
+        return _scan_by_recovery_target_instance(instance_id)
+
+    items: list[dict] = []
+    query_kwargs: dict = {
+        "IndexName": (
+            "recovery_target_instance_id-updated_at-index"
+        ),
+        "KeyConditionExpression": "#target = :target",
+        "ExpressionAttributeNames": {
+            "#target": "recovery_target_instance_id",
+        },
+        "ExpressionAttributeValues": {
+            ":target": instance_id,
+        },
+    }
+    try:
+        while True:
+            response = _sb().query(**query_kwargs)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
+        if items:
+            return [_from_dynamo(item) for item in items]
+        # A GSI is eventually consistent. Confirm an apparently empty host
+        # with the strongly consistent base table before reclaiming its EBS.
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in {
+            "ValidationException",
+            "ResourceNotFoundException",
+        }:
+            raise
+
+    # Rolling-upgrade fallback while the GSI is absent/building, and the
+    # strong empty-result confirmation described above.
+    return _scan_by_recovery_target_instance(instance_id)
+
+
+def _scan_by_recovery_target_instance(instance_id: str) -> list[dict]:
+    """Strongly consistent ownership fence used before destructive recycle."""
+    items: list[dict] = []
+    kwargs: dict = {
+        "ConsistentRead": True,
+        "FilterExpression": "#target = :target",
+        "ExpressionAttributeNames": {
+            "#target": "recovery_target_instance_id",
+        },
+        "ExpressionAttributeValues": {
+            ":target": instance_id,
+        },
+    }
+    while True:
+        response = _sb().scan(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return [_from_dynamo(item) for item in items]
 
 
 from decimal import Decimal
@@ -175,7 +278,12 @@ def acquire_lease(sandbox_id: str, duration_s: int = LEASE_DURATION_S) -> str:
     _sb().update_item(
         Key={"id": sandbox_id},
         UpdateExpression="SET lease_id = :lid, lease_expires = :exp",
-        ConditionExpression="attribute_not_exists(lease_id) OR lease_expires < :now",
+        # Never let a late duplicate reconciler recreate a key-only item
+        # after the delete finalizer removed the sandbox projection.
+        ConditionExpression=(
+            "attribute_exists(id) AND "
+            "(attribute_not_exists(lease_id) OR lease_expires < :now)"
+        ),
         ExpressionAttributeValues={":lid": lease_id, ":exp": expires, ":now": now},
     )
     return lease_id
@@ -191,6 +299,31 @@ def release_lease(sandbox_id: str, lease_id: str) -> None:
         )
     except Exception:
         pass
+
+
+def renew_lease(
+    sandbox_id: str,
+    lease_id: str,
+    duration_s: int = LEASE_DURATION_S,
+) -> bool:
+    """Extend a per-sandbox operation lease only while this owner still holds it."""
+    try:
+        _sb().update_item(
+            Key={"id": sandbox_id},
+            UpdateExpression="SET lease_expires = :exp",
+            ConditionExpression="lease_id = :lid",
+            ExpressionAttributeValues={
+                ":lid": lease_id,
+                ":exp": _utcnow_plus(duration_s),
+            },
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) == "ConditionalCheckFailedException":
+            return False
+        raise
 
 
 # ---------- 节点心跳注册表(P0-3) ----------
@@ -220,6 +353,245 @@ def list_active_nodes(ttl_s: int = 90) -> list[dict]:
         if item.get("last_seen", "") >= cutoff:
             out.append(_from_dynamo(item))
     return out
+
+
+def claim_recovery_standby(
+    availability_zone: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> dict | None:
+    """Atomically claim one live, empty standby in the requested AZ."""
+    now = _utcnow()
+    expires = _utcnow_plus(claim_ttl_s)
+    candidates = sorted(
+        list_active_nodes(),
+        key=lambda item: (
+            -int(item.get("free_mem_mib", 0)),
+            item.get("node_id", ""),
+        ),
+    )
+    for item in candidates:
+        if item.get("availability_zone") != availability_zone:
+            continue
+        if item.get("recovery_role") != "standby":
+            continue
+        if item.get("state_volume_id"):
+            continue
+        if int(item.get("vm_count", 0)) != 0:
+            continue
+        if bool(item.get("draining")):
+            continue
+        node_id = item.get("node_id")
+        if not node_id:
+            continue
+        try:
+            response = _nodes().update_item(
+                Key={"node_id": node_id},
+                UpdateExpression=(
+                    "SET recovery_claim_id=:session, "
+                    "recovery_claim_expires=:expires"
+                ),
+                ConditionExpression=(
+                    "#role=:standby AND #vms=:zero AND "
+                    "(attribute_not_exists(#draining) OR "
+                    "#draining=:false) AND "
+                    "(attribute_not_exists(#volume) OR #volume=:empty) AND "
+                    "(attribute_not_exists(recovery_claim_id) OR "
+                    "recovery_claim_expires < :now OR "
+                    "recovery_claim_id = :session)"
+                ),
+                ExpressionAttributeNames={
+                    "#role": "recovery_role",
+                    "#vms": "vm_count",
+                    "#draining": "draining",
+                    "#volume": "state_volume_id",
+                },
+                ExpressionAttributeValues={
+                    ":standby": "standby",
+                    ":zero": 0,
+                    ":false": False,
+                    ":empty": "",
+                    ":session": recovery_session_id,
+                    ":expires": expires,
+                    ":now": now,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return _from_dynamo(response.get("Attributes") or item)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def get_recovery_claim(recovery_session_id: str) -> dict | None:
+    for item in list_active_nodes():
+        if item.get("recovery_claim_id") == recovery_session_id:
+            return item
+    return None
+
+
+def release_recovery_claim(
+    node_id: str,
+    recovery_session_id: str,
+) -> None:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression=(
+                "REMOVE recovery_claim_id, recovery_claim_expires"
+            ),
+            ConditionExpression="recovery_claim_id = :session",
+            ExpressionAttributeValues={":session": recovery_session_id},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) != "ConditionalCheckFailedException":
+            raise
+
+
+def claim_repatriation_target(
+    availability_zone: str,
+    recovery_group: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> dict | None:
+    """Atomically reserve one empty active Spot node for an EBS handoff."""
+    now = _utcnow()
+    expires = _utcnow_plus(claim_ttl_s)
+    candidates = sorted(
+        list_active_nodes(),
+        key=lambda item: (
+            -int(item.get("free_mem_mib", 0)),
+            item.get("node_id", ""),
+        ),
+    )
+    for item in candidates:
+        if item.get("availability_zone") != availability_zone:
+            continue
+        if item.get("recovery_group") != recovery_group:
+            continue
+        if item.get("recovery_role") != "active":
+            continue
+        if item.get("pool") != "spot":
+            continue
+        if not item.get("state_volume_id"):
+            continue
+        if int(item.get("vm_count", 0)) != 0:
+            continue
+        if bool(item.get("draining")):
+            continue
+        if item.get("recovery_claim_id"):
+            continue
+        node_id = item.get("node_id")
+        if not node_id:
+            continue
+        try:
+            response = _nodes().update_item(
+                Key={"node_id": node_id},
+                UpdateExpression=(
+                    "SET repatriation_claim_id=:session, "
+                    "repatriation_claim_expires=:expires, "
+                    "repatriation_replaced_volume_id=#volume"
+                ),
+                ConditionExpression=(
+                    "#role=:active AND #pool=:spot AND #vms=:zero AND "
+                    "#az=:az AND #group=:group AND "
+                    "attribute_exists(#volume) AND #volume <> :empty AND "
+                    "(attribute_not_exists(#draining) OR "
+                    "#draining=:false) AND "
+                    "attribute_not_exists(recovery_claim_id) AND "
+                    "(attribute_not_exists(repatriation_claim_id) OR "
+                    "repatriation_claim_expires < :now OR "
+                    "repatriation_claim_id = :session)"
+                ),
+                ExpressionAttributeNames={
+                    "#role": "recovery_role",
+                    "#pool": "pool",
+                    "#vms": "vm_count",
+                    "#az": "availability_zone",
+                    "#group": "recovery_group",
+                    "#volume": "state_volume_id",
+                    "#draining": "draining",
+                },
+                ExpressionAttributeValues={
+                    ":active": "active",
+                    ":spot": "spot",
+                    ":zero": 0,
+                    ":az": availability_zone,
+                    ":group": recovery_group,
+                    ":empty": "",
+                    ":false": False,
+                    ":session": recovery_session_id,
+                    ":expires": expires,
+                    ":now": now,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return _from_dynamo(response.get("Attributes") or item)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def get_repatriation_claim(recovery_session_id: str) -> dict | None:
+    for item in list_active_nodes():
+        if item.get("repatriation_claim_id") == recovery_session_id:
+            return item
+    return None
+
+
+def renew_repatriation_claim(
+    node_id: str,
+    recovery_session_id: str,
+    claim_ttl_s: int = 1800,
+) -> bool:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression="SET repatriation_claim_expires=:expires",
+            ConditionExpression="repatriation_claim_id = :session",
+            ExpressionAttributeValues={
+                ":session": recovery_session_id,
+                ":expires": _utcnow_plus(claim_ttl_s),
+            },
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def release_repatriation_claim(
+    node_id: str,
+    recovery_session_id: str,
+) -> None:
+    try:
+        _nodes().update_item(
+            Key={"node_id": node_id},
+            UpdateExpression=(
+                "REMOVE repatriation_claim_id, repatriation_claim_expires, "
+                "repatriation_replaced_volume_id"
+            ),
+            ConditionExpression="repatriation_claim_id = :session",
+            ExpressionAttributeValues={":session": recovery_session_id},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get(
+            "Code"
+        ) != "ConditionalCheckFailedException":
+            raise
 
 
 # ---------- 分布式 leader 锁(P1-4:reconcile/暖池 loop 单实例) ----------
@@ -279,37 +651,60 @@ def mark_warm(sandbox_id: str) -> None:
     force_update(sandbox_id, {"pool_state": "warm", "state": "warm", "driver": os.environ.get("SANDBOX_DRIVER", "firecracker")})
 
 
-def claim_warm_item(driver: str) -> str | None:
-    resp = _sb().query(
-        IndexName="pool_state-driver-index",
-        KeyConditionExpression="pool_state = :w AND driver = :d",
-        ExpressionAttributeValues={":w": "warm", ":d": driver},
-        Limit=1,
-    )
-    items = resp.get("Items", [])
-    if not items:
-        return None
-    candidate = items[0]["id"]
-    try:
-        _sb().update_item(
-            Key={"id": candidate},
-            UpdateExpression="SET pool_state = :claimed",
-            ConditionExpression="pool_state = :warm",
-            ExpressionAttributeValues={":claimed": "claimed", ":warm": "warm"},
+def _warm_items(driver: str, pool: str | None = None) -> list[dict]:
+    """List warm entries for one placement pool using the existing warm GSI."""
+    items: list[dict] = []
+    kwargs: dict = {
+        "IndexName": "pool_state-driver-index",
+        "KeyConditionExpression": "pool_state = :w AND driver = :d",
+        "ExpressionAttributeValues": {":w": "warm", ":d": driver},
+    }
+    while True:
+        resp = _sb().query(**kwargs)
+        items.extend(
+            item for item in resp.get("Items", [])
+            if (item.get("pool") or None) == pool
         )
-        return candidate
-    except Exception:
-        return None
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            return items
+        kwargs["ExclusiveStartKey"] = lek
 
 
-def count_warm(driver: str) -> int:
-    resp = _sb().query(
-        IndexName="pool_state-driver-index",
-        KeyConditionExpression="pool_state = :w AND driver = :d",
-        ExpressionAttributeValues={":w": "warm", ":d": driver},
-        Select="COUNT",
-    )
-    return resp.get("Count", 0)
+def claim_warm_item(driver: str, pool: str | None = None) -> str | None:
+    # Conditional update fences two API/operator replicas racing for the same
+    # warm entry. Continue through candidates if another replica wins first.
+    for item in _warm_items(driver, pool):
+        candidate = item["id"]
+        try:
+            _sb().update_item(
+                Key={"id": candidate},
+                UpdateExpression="SET pool_state = :claimed",
+                ConditionExpression=(
+                    "pool_state = :warm AND "
+                    "(#pool = :pool OR "
+                    "(attribute_not_exists(#pool) AND :pool = :empty))"
+                ),
+                ExpressionAttributeNames={"#pool": "pool"},
+                ExpressionAttributeValues={
+                    ":claimed": "claimed",
+                    ":warm": "warm",
+                    ":pool": pool or "",
+                    ":empty": "",
+                },
+            )
+            return candidate
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get(
+                "Code"
+            ) == "ConditionalCheckFailedException":
+                continue
+            raise
+    return None
+
+
+def count_warm(driver: str, pool: str | None = None) -> int:
+    return len(_warm_items(driver, pool))
 
 
 # ---------- tap_idx 分布式分配 ----------

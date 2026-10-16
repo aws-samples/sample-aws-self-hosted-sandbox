@@ -11,6 +11,11 @@
 > 的 auto-sleep/auto-wake、可观测性、快照 SHA-256 校验、P2 的端口暴露均已实现；
 > 集群内 Prometheus/Alertmanager/Grafana、AMP/AMG、CloudWatch Logs 与 ADOT/X-Ray
 > 查询链路均已通过真实 AWS E2E。
+> **状态更新（2026-09-02）**：新建/恢复的 VMM 已改为宿主 systemd transient service
+> 持有独立 cgroup，并默认经 jailer 进入 chroot/PID namespace；node-agent Pod 重建不再
+> 直接杀死这些 VMM。控制面到 node-agent 已增加 HMAC 请求签名、防重放和完整性校验。
+> 首次从旧 Pod-cgroup 版本升级仍必须逐节点 checkpoint/drain；这些后续改造已通过本地
+> 回归，尚待升级后的真实节点/FIS 复验。
 > 当前采用持久 EBS 作为快照权威来源，
 > 不再走本文假设的 S3 上传主路径。正文保留用于说明问题来源，现状请以
 > [`README.md`](../README.md) 和
@@ -32,7 +37,7 @@
 | **P1** | 控制面单进程、loop 无 leader 选举 | 多副本暖池互相打架；单副本是单点 | `app.py:51-52`, `warm_pool.py:117-126` |
 | **P2** | 网络编排全自研 + sbxinit 硬编码 IP | 对外暴露沙盒服务基本空白；tap_idx≠1 时 SSH 通道连不上 | `node-agent/main.py:72-96` |
 | **P2** | create 乐观写 running | 无真正就绪信号(两 driver 共有) | `app.py:159-160` |
-| **P2** | jailer 隔离默认关闭 | `USE_BARE_FC=1` → 无 chroot/seccomp/cgroup 限制 | `node-agent/main.py:133-135` |
+| **P2** | jailer 隔离默认关闭（历史；已改） | 当时 `USE_BARE_FC=1`；当前生产配置为宿主 systemd+jailer | `scripts/sbx-vmm-runtime`, `node-agent/main.py` |
 | **P2** | 可观测性缺失（历史；P1/P2 已完成） | 当时日志被静音、无 metrics/tracing | `app.py:318-319`, `main.py:626` |
 
 ---
@@ -115,7 +120,9 @@
 1. **网络编排**：Kata = Service + Ingress + CoreDNS，多端口/域名路由现成；FC = 手搓 tap `/30` + iptables MASQUERADE(`node-agent/main.py:72-96`)。对外暴露沙盒服务这块基本空白。
    - 附带 bug：`sbxinit` 硬编码 guest IP `172.18.1.2`(实测报告 §8.4)，只有 tap_idx=1 时对，SSH 通道对其他沙盒本就连不上(已改用 vsock 通道规避，但 bug 未修)。
 2. **健康探针 / 就绪**：Kata = liveness/readiness probe；FC = create 乐观写 running(`app.py:159-160`，两 driver 共有)，靠 exec 层重试兜底，无真正就绪信号。
-3. **资源限制强制**：Kata = K8s cgroup limits；FC = jailer 的 chroot+seccomp+cgroup **默认关闭**(`node-agent/main.py:133-135`，`USE_BARE_FC=1`)。生产必须切 jailer，否则隔离性和资源限制都降级。
+3. **资源限制强制（已改）**：Kata = K8s cgroup limits；FC 当前由宿主 systemd
+   为每个 VMM 设置独立 `MemoryMax`/`TasksMax`，并默认经 jailer 进入 chroot 与 PID
+   namespace。首次升级的旧 VMM 仍在 Pod cgroup 中，必须先 checkpoint/drain。
 4. **滚动更新 / 优雅排水**：Kata = K8s Deployment / node drain；FC = 无节点排水机制，节点下线沙盒直接消失。
 5. **RBAC / 审计 / 事件**：Kata = K8s RBAC + audit log + events；FC = app 层自建(tenant 校验有 `_check_tenant_access`，审计只有 `write_event`，无细粒度 RBAC)。
 

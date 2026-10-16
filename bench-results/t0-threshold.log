@@ -1,0 +1,49 @@
+created 1 - 16 ok 16
+[target=16] 04:35:46 alive=16 dirs=16 failentry=0 load=0.22
+[target=16] 04:36:46 alive=16 dirs=16 failentry=0 load=0.08
+[target=16] 04:37:49 alive=16 dirs=16 failentry=0 load=0.03
+created 17 - 32 ok 16
+[target=32] 04:38:57 alive=32 dirs=32 failentry=0 load=0.74
+[target=32] 04:39:59 alive=32 dirs=32 failentry=0 load=0.27
+[target=32] 04:41:00 alive=32 dirs=32 failentry=0 load=0.10
+created 33 - 64 ok 32
+[target=64] 04:42:12 alive=64 dirs=64 failentry=0 load=0.10
+[target=64] 04:43:13 alive=64 dirs=64 failentry=0 load=0.40
+[target=64] 04:44:14 alive=64 dirs=64 failentry=0 load=0.53
+created 65 - 128 ok 64
+[target=128] 04:45:29 alive=128 dirs=128 failentry=0 load=1.08
+[target=128] 04:46:34 alive=128 dirs=128 failentry=0 load=0.47
+[target=128] 04:47:34 alive=128 dirs=128 failentry=0 load=0.31
+created 129 - 160 ok 32
+[target=160] 04:52:30 alive=160 dirs=160 failentry=0 load=7.17
+[target=160] 04:53:27 alive=158 dirs=160 failentry=2 load=3.19
+created 161 - 192 ok 32
+[target=192] 04:54:35 alive=176 dirs=192 failentry=16 load=2.86
+[target=192] 04:55:30 alive=172 dirs=192 failentry=20 load=1.23
+created 193 - 224 ok 32
+[target=224] 04:56:36 alive=189 dirs=224 failentry=35 load=1.32
+[target=224] 04:57:32 alive=186 dirs=224 failentry=38 load=0.68
+created 225 - 256 ok 32
+[target=256] 04:58:38 alive=215 dirs=256 failentry=41 load=0.67
+[target=256] 04:59:35 alive=213 dirs=256 failentry=43 load=0.63
+created 1 - 160 ok 160
+[1vcpu target=160] 05:02:16 alive=160 dirs=160 failentry=0 load=3.43 leftover_units=0
+[1vcpu target=160] 05:03:12 alive=160 dirs=160 failentry=0 load=1.48 leftover_units=0
+created 161 - 224 ok 64
+[1vcpu target=224] 05:04:20 alive=224 dirs=224 failentry=0 load=0.71 leftover_units=0
+[1vcpu target=224] 05:05:16 alive=224 dirs=224 failentry=0 load=0.44 leftover_units=0
+created 225 - 288 ok 64
+[1vcpu target=288] 05:06:27 alive=286 dirs=288 failentry=2 load=0.63 leftover_units=0
+[1vcpu target=288] 05:07:24 alive=286 dirs=288 failentry=2 load=0.50 leftover_units=0
+created 289 - 352 ok 64
+[1vcpu target=352] 05:08:37 alive=316 dirs=352 failentry=36 load=1.50 leftover_units=0
+[1vcpu target=352] 05:09:34 alive=316 dirs=352 failentry=36 load=0.87 leftover_units=0
+created 1 - 288 ok 288 []
+[noapicv 1vcpu target=288] 05:12:56 alive=280 dirs=288 failentry=8 load=7.00 leftover_units=0
+[noapicv 1vcpu target=288] 05:13:52 alive=277 dirs=288 failentry=11 load=3.64 leftover_units=0
+created 289 - 352 ok 64 []
+[noapicv 1vcpu target=352] 05:15:04 alive=326 dirs=352 failentry=26 load=2.72 leftover_units=0
+[noapicv 1vcpu target=352] 05:16:01 alive=317 dirs=352 failentry=35 load=1.36 leftover_units=0
+created 353 - 416 ok 64 []
+[noapicv 1vcpu target=416] 05:17:12 alive=331 dirs=416 failentry=85 load=0.96 leftover_units=0
+[noapicv 1vcpu target=416] 05:18:08 alive=326 dirs=416 failentry=90 load=0.86 leftover_units=0

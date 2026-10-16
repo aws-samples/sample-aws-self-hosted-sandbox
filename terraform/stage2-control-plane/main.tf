@@ -22,7 +22,7 @@
 #     -var="control_plane_image=<acct>.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
 #     -var="node_agent_image=<acct>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
 #     -var="litellm_url=http://litellm.litellm.svc.cluster.local:4000" \
-#     -var="snapshot_s3_bucket=<your-bucket>"
+#     -var="snapshot_s3_bucket=<your-bucket>" \
 
 terraform {
   required_version = ">= 1.5"
@@ -110,6 +110,82 @@ variable "warm_pool_size" {
   default = 3
 }
 
+variable "reclaim_auto_evacuate" {
+  type        = bool
+  default     = true
+  description = "收到 Spot interruption/rebalance 信号后是否真实并发快照。2026-10-16 FIS 真实中断实测 20/20 checkpoint + 20/20 恢复且内存校验一致,默认开启;关闭则只做 DRY-RUN。"
+}
+
+variable "reclaim_snapshot_concurrency" {
+  type        = number
+  default     = 8
+  description = "单节点 Spot 疏散时并发 Firecracker snapshot 数。真机实测 r8i.8xlarge 上 8 与 12/16 总吞吐相同而单任务尾延迟更低,再高只会排队;不会突破实例级 EBS 上限。"
+  validation {
+    condition     = var.reclaim_snapshot_concurrency >= 1 && var.reclaim_snapshot_concurrency <= 64
+    error_message = "reclaim_snapshot_concurrency 必须在 1..64。"
+  }
+}
+
+variable "reclaim_budget_s" {
+  type        = number
+  default     = 120
+  description = "无明确 termination time 时从检测开始计算的 Spot 疏散总预算。"
+}
+
+variable "reclaim_commit_reserve_s" {
+  type        = number
+  default     = 8
+  description = "120 秒窗口尾部预留给 journal/fsync/状态传播的秒数。"
+}
+
+variable "balloon_free_page_reporting" {
+  type        = bool
+  default     = true
+  description = "新建 microVM 默认挂 virtio-balloon 并开启 free page reporting,让 guest 释放的内存还给宿主(内存超分的前提)。真机实测:关闭时 guest 释放 3GiB 后宿主 RSS 不回落,开启后 10s 内降回 240MiB。"
+}
+
+variable "spot_recovery_enabled" {
+  type        = bool
+  default     = false
+  description = "启用 operator 的同 AZ standby claim + EBS attach/mount + 批量 resume 状态机。"
+}
+
+variable "spot_recovery_poll_s" {
+  type        = number
+  default     = 2
+  description = "Spot 恢复状态机轮询周期。"
+}
+
+variable "spot_recovery_attach_timeout_s" {
+  type        = number
+  default     = 120
+  description = "等待 EBS attach 和 standby mount 的超时。"
+}
+
+variable "spot_recovery_resume_concurrency" {
+  type        = number
+  default     = 12
+  description = "恢复节点批量 resume 并发度。"
+}
+
+variable "spot_recovery_replenish_enabled" {
+  type        = bool
+  default     = true
+  description = "恢复完成后是否扩容对应 EKS standby 节点组，以继续保留空闲接管节点。"
+}
+
+variable "spot_recovery_min_standby_per_az" {
+  type        = number
+  default     = 1
+  description = "每个已启用恢复节点组需要维持的未认领 standby 数。"
+}
+
+variable "spot_recovery_od_recycle_enabled" {
+  type        = bool
+  default     = false
+  description = "恢复完成后把状态 EBS 迁回同 AZ 空闲 Spot 节点，并精确缩容被认领的 OD 实例。2026-10-16 FIS 实测卷交接阶段循环 spot_recovery_od_recycle_failed,已恢复沙盒再次离线;修复前默认关闭。"
+}
+
 variable "control_plane_replicas" {
   type    = number
   default = 2
@@ -150,8 +226,8 @@ variable "activity_touch_min_s" {
 
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。需与 phase3 的 node_arch 一致。"
+  default     = "amd64"
+  description = "节点 CPU 架构:amd64(Intel x86,默认) 或 arm64(Graviton)。需与 phase3 的 node_arch 一致。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
@@ -251,7 +327,10 @@ resource "aws_iam_role" "control_plane" {
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
-          "${local.oidc_issuer}:sub" = "system:serviceaccount:sandbox-system:sandbox-control-plane"
+          "${local.oidc_issuer}:sub" = [
+            "system:serviceaccount:sandbox-system:sandbox-control-plane",
+            "system:serviceaccount:sandbox-system:firecracker-operator",
+          ]
           "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
         }
       }
@@ -279,11 +358,66 @@ resource "aws_iam_role_policy" "control_plane" {
           "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_locks}",
         ]
       },
-      # EC2 DescribeInstances(节点 IP → 实例 ID)
+      # EC2 恢复编排：只读发现可全局执行；AttachVolume 仅允许本 EKS
+      # 集群的实例与卷，避免被伪造心跳诱导去操作账号内其它工作负载。
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeVolumeStatus",
+        ]
+        Resource = ["*"]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:AttachVolume",
+          "ec2:DetachVolume",
+          "ec2:DeleteVolume",
+        ]
+        Resource = [
+          "arn:aws:ec2:${var.region}:${local.account_id}:instance/*",
+          "arn:aws:ec2:${var.region}:${local.account_id}:volume/*",
+        ]
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/eks:cluster-name" = var.cluster_name
+          }
+        }
+      },
       {
         Effect   = "Allow"
-        Action   = ["ec2:DescribeInstances"]
-        Resource = ["*"]
+        Action   = ["ec2:CreateTags"]
+        Resource = ["arn:aws:ec2:${var.region}:${local.account_id}:volume/*"]
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/eks:cluster-name" = var.cluster_name
+          }
+          "ForAllValues:StringEquals" = {
+            "aws:TagKeys" = ["RecoverySession", "RecoveryTarget"]
+          }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "eks:DescribeNodegroup",
+          "eks:UpdateNodegroupConfig",
+        ]
+        Resource = [
+          "arn:aws:eks:${var.region}:${local.account_id}:nodegroup/${var.cluster_name}/*/*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "autoscaling:TerminateInstanceInAutoScalingGroup",
+        ]
+        Resource = [
+          "arn:aws:autoscaling:${var.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/eks-${var.cluster_name}-recovery-*",
+          "arn:aws:autoscaling:${var.region}:${local.account_id}:autoScalingGroup:*:autoScalingGroupName/eks-sbx-standby-test-*",
+        ]
       },
       # SSM SendCommand(备用:通过 SSM 调 node-agent)
       {
@@ -351,12 +485,37 @@ resource "aws_iam_role_policy" "node_agent" {
         Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
         Resource = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}/sbx/*"]
       },
-      # P0-3: 心跳注册表写入(node-agent 定期 upsert 本节点状态)
+      # 节点心跳 + Spot 疏散实时 journal。主状态表更新带
+      # attribute_exists(id) 条件，node-agent 无法凭空创建沙盒记录。
+      {
+        Effect = "Allow"
+        Action = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = [
+          "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_nodes}",
+          "arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_table}",
+        ]
+      },
+      # Spot 回收开始时先把当前状态盘的 DeleteOnTermination 从 true
+      # 改成 false。Describe 用于解析并验证精确 attachment；修改权限只
+      # 允许本 EKS 集群打过标签的实例。
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeVolumes",
+        ]
+        Resource = ["*"]
+      },
       {
         Sid      = "NodeHeartbeat"
         Effect   = "Allow"
-        Action   = ["dynamodb:PutItem"]
-        Resource = ["arn:aws:dynamodb:${var.region}:${local.account_id}:table/${local.dynamodb_nodes}"]
+        Action   = ["ec2:ModifyInstanceAttribute"]
+        Resource = ["arn:aws:ec2:${var.region}:${local.account_id}:instance/*"]
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/eks:cluster-name" = var.cluster_name
+          }
+        }
       },
     ]
   })
@@ -402,6 +561,18 @@ resource "kubernetes_service_account" "node_agent" {
   }
 }
 
+resource "kubernetes_service_account" "firecracker_operator" {
+  metadata {
+    name      = "firecracker-operator"
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+    annotations = {
+      # Separate Kubernetes identity/RBAC, shared AWS role because both
+      # processes need the same DynamoDB/node-discovery projection.
+      "eks.amazonaws.com/role-arn" = aws_iam_role.control_plane.arn
+    }
+  }
+}
+
 # ---------- Kubernetes: RBAC ----------
 # 控制面需要操作 default namespace 的 Pod/Service/Ingress
 
@@ -424,9 +595,9 @@ resource "kubernetes_cluster_role" "control_plane" {
     verbs      = ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   }
   rule {
-    api_groups = ["agents.x-k8s.io"]
-    resources  = ["sandboxes", "sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
-    verbs      = ["get", "list", "watch", "create", "update", "patch", "delete"]
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes"]
+    verbs      = ["get", "list", "watch", "create", "patch", "delete"]
   }
 }
 
@@ -440,6 +611,57 @@ resource "kubernetes_cluster_role_binding" "control_plane" {
   subject {
     kind      = "ServiceAccount"
     name      = kubernetes_service_account.control_plane.metadata[0].name
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+}
+
+resource "kubernetes_cluster_role" "firecracker_operator" {
+  metadata { name = "firecracker-operator" }
+  rule {
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes"]
+    verbs      = ["get", "list", "watch", "create", "update", "patch"]
+  }
+  rule {
+    api_groups = ["sandbox.memorion.ai"]
+    resources  = ["firecrackersandboxes/status", "firecrackersandboxes/finalizers"]
+    verbs      = ["get", "update", "patch"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "firecracker_operator" {
+  metadata { name = "firecracker-operator" }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = kubernetes_cluster_role.firecracker_operator.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.firecracker_operator.metadata[0].name
+    namespace = kubernetes_namespace.sandbox_system.metadata[0].name
+  }
+}
+
+resource "kubernetes_cluster_role" "node_agent" {
+  metadata { name = "sandbox-node-agent" }
+  rule {
+    api_groups = [""]
+    resources  = ["nodes"]
+    verbs      = ["get"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "node_agent" {
+  metadata { name = "sandbox-node-agent" }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = kubernetes_cluster_role.node_agent.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.node_agent.metadata[0].name
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
 }
@@ -516,6 +738,12 @@ variable "api_keys" {
   description = "逗号分隔的 Bearer token 列表，注入控制面 API_KEYS env（生产必填）"
 }
 
+variable "node_agent_enable_test_hooks" {
+  type        = bool
+  default     = false
+  description = "开启 node-agent 测试钩子(/reclaim/simulate、/reclaim/reset),仅用于压测/演练;生产保持关闭。"
+}
+
 resource "kubernetes_secret" "control_plane_api_keys" {
   metadata {
     name      = "control-plane-api-keys"
@@ -550,6 +778,17 @@ resource "kubernetes_config_map" "control_plane" {
     DYNAMODB_NODES_TABLE  = local.dynamodb_nodes # P0-3: 节点发现/reconcile
     DYNAMODB_LOCKS_TABLE  = local.dynamodb_locks # P1-4: leader 锁
     AWS_REGION            = var.region
+    CRD_CONTROL_ENABLED   = var.crd_control_enabled ? "1" : "0"
+    CRD_GROUP             = "sandbox.memorion.ai"
+    CRD_VERSION           = "v1alpha1"
+    CRD_PLURAL            = "firecrackersandboxes"
+    CRD_KIND              = "FirecrackerSandbox"
+    CRD_NAMESPACE         = kubernetes_namespace.sandbox_system.metadata[0].name
+    CRD_OPERATOR_WORKERS  = tostring(var.crd_operator_workers)
+    CRD_OPERATION_LEASE_S = "900"
+    CRD_RESYNC_S          = "20"
+    CRD_API_WAIT_S        = "700"
+    CRD_DELETE_WAIT_S     = "120"
     SANDBOX_IMAGE         = var.sandbox_image
     LITELLM_URL           = var.litellm_url
     SANDBOX_DOMAIN        = var.sandbox_domain
@@ -559,15 +798,27 @@ resource "kubernetes_config_map" "control_plane" {
     SNAPSHOT_TO_S3     = var.snapshot_to_s3 ? "1" : "0"
     WARM_POOL_SIZE     = tostring(var.warm_pool_size)
     WARM_POOL_REFILL_S = "60"
+    # Warm entries are created on the protected pool and are only claimed by
+    # matching requests, preserving both low latency and pool isolation.
+    WARM_POOL_POOL      = "protected"
+    DEFAULT_CREATE_POOL = "protected"
     # 自动休眠/唤醒(auto-sleep/auto-wake):opt-in,仅对声明 autostop/autostart 的沙盒生效。
-    AUTO_SLEEP_ENABLED   = var.auto_sleep_enabled
-    AUTO_SLEEP_IDLE_S    = tostring(var.auto_sleep_idle_s)
-    AUTO_SLEEP_SCAN_S    = tostring(var.auto_sleep_scan_s)
-    AUTO_WAKE_TIMEOUT_S  = tostring(var.auto_wake_timeout_s)
-    ACTIVITY_TOUCH_MIN_S = tostring(var.activity_touch_min_s)
-    LISTEN_PORT          = "8000"
-    LISTEN_HOST          = "0.0.0.0"
-    NODE_AGENT_PORT      = "8002"
+    AUTO_SLEEP_ENABLED               = var.auto_sleep_enabled
+    AUTO_SLEEP_IDLE_S                = tostring(var.auto_sleep_idle_s)
+    AUTO_SLEEP_SCAN_S                = tostring(var.auto_sleep_scan_s)
+    AUTO_WAKE_TIMEOUT_S              = tostring(var.auto_wake_timeout_s)
+    ACTIVITY_TOUCH_MIN_S             = tostring(var.activity_touch_min_s)
+    SPOT_RECOVERY_ENABLED            = var.spot_recovery_enabled ? "1" : "0"
+    SPOT_RECOVERY_POLL_S             = tostring(var.spot_recovery_poll_s)
+    SPOT_RECOVERY_ATTACH_TIMEOUT_S   = tostring(var.spot_recovery_attach_timeout_s)
+    SPOT_RECOVERY_RESUME_CONCURRENCY = tostring(var.spot_recovery_resume_concurrency)
+    SPOT_RECOVERY_REPLENISH_ENABLED  = var.spot_recovery_replenish_enabled ? "1" : "0"
+    SPOT_RECOVERY_MIN_STANDBY_PER_AZ = tostring(var.spot_recovery_min_standby_per_az)
+    SPOT_RECOVERY_OD_RECYCLE_ENABLED = var.spot_recovery_od_recycle_enabled ? "1" : "0"
+    EKS_CLUSTER_NAME                 = var.cluster_name
+    LISTEN_PORT                      = "8000"
+    LISTEN_HOST                      = "0.0.0.0"
+    NODE_AGENT_PORT                  = "8002"
     # 端口暴露:对外访问前缀(NLB 自带域名)。供控制面 /admin/cluster 返回给 Portal 拼
     # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
     NLB_HOSTNAME = var.nlb_hostname
@@ -665,6 +916,11 @@ resource "kubernetes_deployment" "control_plane" {
       }
     }
   }
+
+  depends_on = [
+    kubernetes_manifest.firecracker_sandbox_crd,
+    kubernetes_cluster_role_binding.control_plane,
+  ]
 }
 
 # ---------- Kubernetes: 控制面 Service ----------
@@ -709,6 +965,12 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
   }
   spec {
     selector { match_labels = { app = "node-agent" } }
+    # Host-systemd VMMs survive Pod replacement. Keep OnDelete so the first
+    # migration from legacy Pod-cgroup VMMs and secret/runtime changes remain
+    # an explicit, per-node checkpoint/drain operation.
+    strategy {
+      type = "OnDelete"
+    }
     template {
       metadata {
         labels = { app = "node-agent" }
@@ -727,10 +989,14 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           value    = "sandbox"
           effect   = "NoSchedule"
         }
-        # 需要 hostNetwork 才能操作 tap/iptables。不再开 hostPID:node-agent 只管理自己拉起的
-        # Firecracker 子进程,无需看到宿主进程表;关闭后 /proc/1/root 不再指向宿主根文件系统。
+        # 需要 hostNetwork 才能操作 tap/iptables。
+        # hostPID:VMM 由宿主 systemd 托管(sbx.slice 下的 transient service),node-agent 经
+        # nsenter -t 1 调用宿主 helper,才能做到 node-agent Pod 重建时 microVM 不中断
+        # (2026-10-16 真机实测 Pod 替换 22s 期间 guest 持续运行)。容器本身已是 privileged,
+        # hostPID 带来的额外暴露有限;其余宿主执行面隔离(HMAC、来源 CIDR、绑定管理 IP、
+        # guest iptables 隔离、路径校验)全部保留。
         host_network = true
-        host_pid     = false
+        host_pid     = true
         # 需要特权容器操作 KVM/tap/iptables
         container {
           name              = "agent"
@@ -767,7 +1033,8 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           }
           env {
             name  = "DENIED_CALLER_CIDR"
-            value = "172.18.0.0/16"
+            # tap_idx<=255 用 172.18.x,>255 映射到 172.19.x(见 node-agent _tap_addresses)
+            value = "172.18.0.0/16,172.19.0.0/16"
           }
           # 控制面 ↔ node-agent HMAC 密钥(缺失则 node-agent 拒绝启动)
           env {
@@ -782,7 +1049,7 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           # 测试钩子(/reclaim/simulate、/reclaim/reset)生产关闭
           env {
             name  = "NODE_AGENT_ENABLE_TEST_HOOKS"
-            value = "0"
+            value = var.node_agent_enable_test_hooks ? "1" : "0"
           }
           # 启动时安装 guest 隔离 iptables 规则(SBX-GUEST-IN / SBX-GUEST-FWD)
           env {
@@ -800,6 +1067,22 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "JAILER_BIN"
             value = "/usr/local/bin/firecracker-jailer"
+          }
+          env {
+            name  = "VMM_LAUNCH_MODE"
+            value = "host-systemd"
+          }
+          env {
+            name  = "VMM_USE_JAILER"
+            value = "1"
+          }
+          env {
+            name  = "HOST_VMM_CTL"
+            value = "/usr/local/sbin/sbx-vmm-runtime"
+          }
+          env {
+            name  = "HOST_STATE_CTL"
+            value = "/usr/local/sbin/sbx-state-volume"
           }
           env {
             name  = "AWS_REGION"
@@ -821,6 +1104,49 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             value = local.dynamodb_nodes
           }
           env {
+            name  = "DYNAMODB_TABLE"
+            value = local.dynamodb_table
+          }
+          env {
+            name  = "DYNAMODB_EVENTS_TABLE"
+            value = local.dynamodb_events
+          }
+          env {
+            name  = "RECLAIM_AUTO_EVACUATE"
+            value = var.reclaim_auto_evacuate ? "1" : "0"
+          }
+          env {
+            name  = "RECLAIM_SNAPSHOT_CONCURRENCY"
+            value = tostring(var.reclaim_snapshot_concurrency)
+          }
+          env {
+            name  = "RECLAIM_BUDGET_S"
+            value = tostring(var.reclaim_budget_s)
+          }
+          env {
+            name  = "RECLAIM_COMMIT_RESERVE_S"
+            value = tostring(var.reclaim_commit_reserve_s)
+          }
+          env {
+            name  = "BALLOON_FREE_PAGE_REPORTING"
+            value = var.balloon_free_page_reporting ? "1" : "0"
+          }
+          env {
+            name  = "CLOUD_INIT_STATUS_PATH"
+            value = "/host/var/lib/cloud/data/status.json"
+          }
+          env {
+            name  = "NODE_BOOTSTRAP_WAIT_S"
+            value = "900"
+          }
+          env {
+            name  = "NODE_STABILITY_MIN_AGE_S"
+            value = "180"
+          }
+          # Pod labels are not Node labels. The agent uses NODE_ID plus a
+          # minimal get-nodes RBAC grant to read the recovery role/group from
+          # its own Kubernetes Node object.
+          env {
             name  = "OTEL_SERVICE_NAME"
             value = "sandbox-node-agent"
           }
@@ -836,13 +1162,20 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/dev"
           }
           volume_mount {
-            name       = "sbx-data"
-            mount_path = "/var/lib/sbx"
+            name              = "sbx-data"
+            mount_path        = "/var/lib/sbx"
+            mount_propagation = "Bidirectional"
           }
           volume_mount {
             name       = "firecracker-bin"
             mount_path = "/usr/local/bin/firecracker"
             read_only  = true
+          }
+          # jailer 把 API socket 放在宿主 /srv/jailer/<exec>/<id>/root/run。
+          # node-agent 需要访问该 UDS，并在 Pod 重建后据此恢复 _VMS。
+          volume_mount {
+            name       = "jailer-root"
+            mount_path = "/srv/jailer"
           }
           # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
           # 只读:node-agent 只从模板 CoW 复制,从不写 /opt/sbx(防模板/kernel 被篡改投毒)
@@ -851,11 +1184,14 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/opt/sbx"
             read_only  = true
           }
-          # ⚠️ 关键:所有 Firecracker microVM 作为 node-agent 的子进程,跑在【本 Pod 的 cgroup】内。
-          # 若设 memory limit,所有 guest 内存之和会被此 limit 卡住 → OOM 杀 microVM。
-          # 方案C:一台 metal 要跑 ~50 个 2GB sandbox(~100GB),故【不设 memory limit】,
-          # 让 node-agent(及其 microVM 子进程)可用到节点物理内存上限。
-          # 只保留 CPU request 用于调度;不设 cpu/memory limit。
+          volume_mount {
+            name       = "cloud-init-data"
+            mount_path = "/host/var/lib/cloud/data"
+            read_only  = true
+          }
+          # VMM 由宿主 PID 1 创建独立 systemd service/cgroup，不再是此 Pod 的
+          # 子进程。Pod 重建不会杀 live sandbox；这里仍只给 agent 自身 request，
+          # 每个 guest 的 MemoryMax 由宿主 runtime 按 mem_mib 单独设置。
           resources {
             requests = { cpu = "100m", memory = "256Mi" }
           }
@@ -879,6 +1215,15 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             timeout_seconds       = 3
             failure_threshold     = 3
           }
+          startup_probe {
+            http_get {
+              path = "/livez"
+              port = 8002
+            }
+            period_seconds    = 10
+            timeout_seconds   = 3
+            failure_threshold = 120
+          }
         }
         volume {
           name = "dev"
@@ -899,9 +1244,23 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           }
         }
         volume {
+          name = "jailer-root"
+          host_path {
+            path = "/srv/jailer"
+            type = "DirectoryOrCreate"
+          }
+        }
+        volume {
           name = "fc-assets"
           host_path {
             path = "/opt/sbx"
+            type = "DirectoryOrCreate"
+          }
+        }
+        volume {
+          name = "cloud-init-data"
+          host_path {
+            path = "/var/lib/cloud/data"
             type = "DirectoryOrCreate"
           }
         }

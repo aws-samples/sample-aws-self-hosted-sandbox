@@ -38,21 +38,27 @@ from __future__ import annotations
 
 import http.client
 import hashlib
+import hmac
 import json
 import os
 import re
 import signal
 import shutil
-import signal
 import socket
+import ssl
 import subprocess
+import sys
 import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from observability import (
     FC_RESUME_INFLIGHT,
@@ -86,8 +92,9 @@ LISTEN_HOST  = os.environ.get("NODE_AGENT_LISTEN_HOST", "")
 # 允许调用受保护路由的来源 CIDR(逗号分隔)。空 = 全部拒绝(fail closed);
 # 生产设为控制面 Pod 所在网段(terraform stage2 默认集群 VPC CIDR)。
 ALLOWED_CALLER_CIDR = os.environ.get("ALLOWED_CALLER_CIDR", "")
-# 永远拒绝的来源 CIDR:guest tap 网段(172.18.{tap_idx}.0/30),对所有路由(含健康检查)生效。
-DENIED_CALLER_CIDR  = os.environ.get("DENIED_CALLER_CIDR", "172.18.0.0/16")
+# 永远拒绝的来源 CIDR:guest tap 网段(172.18.x / tap_idx>255 时 172.19.x,见 _tap_addresses),
+# 对所有路由(含健康检查)生效。
+DENIED_CALLER_CIDR  = os.environ.get("DENIED_CALLER_CIDR", "172.18.0.0/16,172.19.0.0/16")
 # 控制面 ↔ node-agent 共享的 HMAC 密钥(见 agent_auth.py)。缺失则拒绝启动。
 _AUTH = agent_auth.Verifier(
     agent_auth.load_key(os.environ.get("NODE_AGENT_AUTH_KEY", ""),
@@ -137,14 +144,89 @@ def _rootfs_template_path(name: str) -> str:
     if not name or name in ("min", "default") or not _ROOTFS_NAME_RE.match(name):
         return ROOTFS
     return _available_rootfs_templates().get(name, ROOTFS)
+
+
+# rootfs 模板在根盘 /opt/sbx,沙盒目录在状态盘 SBX_BASE:跨文件系统时
+# cp --reflink=auto 退化成整份实拷(每沙盒 2 GiB)。在状态盘上缓存一份
+# 稀疏化模板,沙盒 rootfs 从缓存 reflink(XFS reflink=1 / ZFS block clone),
+# 只有 guest 改写的块才占新空间。ROOTFS_TEMPLATE_CACHE=0 关闭。
+ROOTFS_TEMPLATE_CACHE = os.environ.get(
+    "ROOTFS_TEMPLATE_CACHE", "1"
+).lower() in ("1", "true")
+_TEMPLATE_CACHE_DIR = os.path.join(SBX_BASE, ".templates")
+_TEMPLATE_CACHE_LOCK = threading.Lock()
+
+
+def _cached_rootfs_template(src: str) -> str:
+    """返回与 SBX_BASE 同文件系统的模板副本路径;失败时回退 src。"""
+    if not ROOTFS_TEMPLATE_CACHE:
+        return src
+    try:
+        st = os.stat(src)
+        if os.stat(SBX_BASE).st_dev == st.st_dev:
+            return src
+        name = os.path.basename(src)
+        # 源模板变化(重建/更新)时 size/mtime 变化 → 新缓存文件
+        cached = os.path.join(
+            _TEMPLATE_CACHE_DIR, f"{name}.{st.st_size}.{st.st_mtime_ns}"
+        )
+        if os.path.exists(cached):
+            return cached
+        with _TEMPLATE_CACHE_LOCK:
+            if os.path.exists(cached):
+                return cached
+            os.makedirs(_TEMPLATE_CACHE_DIR, exist_ok=True)
+            tmp = f"{cached}.tmp"
+            subprocess.run(["cp", "--sparse=always", src, tmp], check=True)
+            os.chmod(tmp, 0o444)
+            os.replace(tmp, cached)
+        return cached
+    except Exception as exc:  # 缓存只是优化,任何失败都回退原路径
+        print(f"[rootfs] template cache disabled for {src}: {exc}",
+              file=sys.stderr, flush=True)
+        return src
+
+
+# 默认给每个新建 VM 挂 virtio-balloon 并开启 free page reporting:guest 释放的
+# 内存会还给宿主(真机实测 3.2GiB→240MiB);不开时宿主 RSS 只涨不降,内存超分
+# 随时间失效。create 请求显式传 balloon 时以请求为准。
+BALLOON_FREE_PAGE_REPORTING = os.environ.get(
+    "BALLOON_FREE_PAGE_REPORTING", "1"
+).lower() in ("1", "true")
+_DEFAULT_BALLOON = {
+    "amount_mib": 0,
+    "deflate_on_oom": True,
+    "stats_polling_interval_s": 0,
+    "free_page_reporting": True,
+}
+
+
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
+VMM_LAUNCH_MODE = os.environ.get(
+    "VMM_LAUNCH_MODE", "subprocess"
+).strip().lower()
+# Keep the historical USE_BARE_FC switch as a compatibility fallback, while
+# making the positive production setting explicit.
+VMM_USE_JAILER = os.environ.get(
+    "VMM_USE_JAILER",
+    "0" if os.environ.get("USE_BARE_FC", "1") == "1" else "1",
+).strip().lower() in {"1", "true", "yes"}
+HOST_NSENTER = os.environ.get("HOST_NSENTER", "/usr/bin/nsenter")
+HOST_VMM_CTL = os.environ.get(
+    "HOST_VMM_CTL", "/usr/local/sbin/sbx-vmm-runtime"
+)
+HOST_STATE_CTL = os.environ.get(
+    "HOST_STATE_CTL", "/usr/local/sbin/sbx-state-volume"
+)
 HOST_IFACE   = os.environ.get("HOST_IFACE", "")                 # 空则自动探测
 AWS_REGION   = os.environ.get("AWS_REGION", "us-east-1")
 NODE_ID      = os.environ.get("NODE_ID", socket.gethostname())
 
 # ---------- 心跳注册(P0-3:控制面按 last_seen 判活,替换 FC_NODES 硬编码)----------
 NODES_TABLE       = os.environ.get("DYNAMODB_NODES_TABLE", "sandbox_nodes")
+SANDBOXES_TABLE   = os.environ.get("DYNAMODB_TABLE", "sandboxes")
+EVENTS_TABLE      = os.environ.get("DYNAMODB_EVENTS_TABLE", "sandbox_events")
 HEARTBEAT_EVERY_S = int(os.environ.get("HEARTBEAT_EVERY_S", "30"))
 # 上报给控制面的节点标识:必须是控制面能 HTTP 连到 node-agent 的地址。
 # 默认自动探测主网卡内网 IP;可用 NODE_ADVERTISE_IP 覆盖。
@@ -158,9 +240,51 @@ RECLAIM_WATCH         = os.environ.get("RECLAIM_WATCH_ENABLED", "1").lower() in 
 RECLAIM_POLL_S        = int(os.environ.get("RECLAIM_POLL_S", "5"))
 # =0(默认)DRY-RUN 只记录计划;=1 才真正触发疏散(打 Diff 快照到持久 EBS)。
 RECLAIM_AUTO_EVACUATE = os.environ.get("RECLAIM_AUTO_EVACUATE", "0").lower() in ("1", "true")
+RECLAIM_SNAPSHOT_CONCURRENCY = max(
+    1, int(os.environ.get("RECLAIM_SNAPSHOT_CONCURRENCY", "12"))
+)
+RECLAIM_BUDGET_S = max(10, int(os.environ.get("RECLAIM_BUDGET_S", "120")))
+# 在实例终止前留出写 journal、fsync、控制面观测的尾部预算。
+RECLAIM_COMMIT_RESERVE_S = max(
+    2, int(os.environ.get("RECLAIM_COMMIT_RESERVE_S", "8"))
+)
+NODE_RECOVERY_ROLE = os.environ.get("NODE_RECOVERY_ROLE", "").strip().lower()
+NODE_RECOVERY_GROUP = os.environ.get("NODE_RECOVERY_GROUP", "").strip()
+STATE_VOLUME_ID_OVERRIDE = os.environ.get("STATE_VOLUME_ID", "").strip()
+NODE_LABEL_REFRESH_S = max(
+    5, int(os.environ.get("NODE_LABEL_REFRESH_S", "30"))
+)
+K8S_SERVICE_ACCOUNT_DIR = os.environ.get(
+    "K8S_SERVICE_ACCOUNT_DIR",
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+)
+CLOUD_INIT_STATUS_PATH = os.environ.get(
+    "CLOUD_INIT_STATUS_PATH",
+    "/host/var/lib/cloud/data/status.json",
+)
+NODE_BOOTSTRAP_MARKER = os.environ.get(
+    "NODE_BOOTSTRAP_MARKER",
+    "/opt/sbx/.bootstrap-complete",
+)
+NODE_BOOTSTRAP_WAIT_S = max(
+    0, int(os.environ.get("NODE_BOOTSTRAP_WAIT_S", "900"))
+)
+NODE_STABILITY_MIN_AGE_S = max(
+    0, int(os.environ.get("NODE_STABILITY_MIN_AGE_S", "180"))
+)
 # 最近一次回收检测/疏散计划(供 GET /reclaim/status 观测;injected 供测试注入)
 _RECLAIM_STATE: dict = {"detected": False, "signal": None, "at": None,
                         "plan": None, "evacuated": False, "injected": None}
+_INSTANCE_ID_CACHE = ""
+_AZ_CACHE = ""
+_STATE_VOLUME_CACHE = ""
+_NODE_RECOVERY_IDENTITY_CACHE: dict[str, object] = {
+    "role": "",
+    "group": "",
+    "resolved": False,
+    "fetched_at": 0.0,
+}
+_NODE_RECOVERY_IDENTITY_LOCK = threading.Lock()
 
 # ---------- JuiceFS 配置（方案 B：workspace 在 S3，快照不含磁盘）----------
 JUICEFS_ENABLED    = os.environ.get("JUICEFS_ENABLED", "false").lower() == "true"
@@ -174,10 +298,50 @@ JUICEFS_FS_NAME    = "sbxfs"                      # JuiceFS 文件系统名（�
 _VMS: dict[str, dict] = {}
 _LOCK = threading.Lock()
 _VM_OP_LOCKS: dict[str, threading.RLock] = {}
+_VM_OP_LOCK_USERS: dict[str, int] = {}
 _HEARTBEAT_LAST_SUCCESS = 0.0
 _HEARTBEAT_LAST_ITERATION = time.monotonic()
 
 os.makedirs(SBX_BASE, exist_ok=True)
+
+
+def _node_bootstrap_ready() -> bool:
+    """Only advertise after bootstrap and a fresh-node stability window.
+
+    The explicit marker is written at the very end of our custom bootstrap and
+    is authoritative. Older launch templates do not write it, so they must
+    satisfy both cloud-init completion and a minimum Kubernetes Node age. This
+    keeps the agent from accepting work before a late kubelet/containerd
+    restart rebuilds its pod sandbox.
+    """
+    if NODE_BOOTSTRAP_MARKER and os.path.exists(NODE_BOOTSTRAP_MARKER):
+        return True
+    try:
+        with open(CLOUD_INIT_STATUS_PATH, encoding="utf-8") as status_file:
+            status = json.load(status_file)
+        stages = status.get("v1", {})
+        final = stages.get("modules-final", {})
+        if not final.get("finished") or final.get("errors"):
+            return False
+        if any(
+            stage.get("errors")
+            for stage in stages.values()
+            if isinstance(stage, dict)
+        ):
+            return False
+        if NODE_STABILITY_MIN_AGE_S == 0:
+            return True
+        metadata = _fetch_node_object().get("metadata", {})
+        created_at = str(metadata.get("creationTimestamp", "")).strip()
+        if not created_at:
+            return False
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - created).total_seconds()
+        return age_s >= NODE_STABILITY_MIN_AGE_S
+    except (OSError, ValueError, TypeError, RuntimeError, urllib.error.URLError):
+        return False
 
 
 # ---------- 请求参数校验 ----------
@@ -192,7 +356,7 @@ os.makedirs(SBX_BASE, exist_ok=True)
 _SANDBOX_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")      # 用 fullmatch
 _KERNEL_NAME_RE = re.compile(r"vmlinux[A-Za-z0-9._-]*")              # 用 fullmatch
 # tap_idx 只做整数/范围合法性校验(tap 名 fctap{idx} ≤ 15 字符)。控制面 alloc_tap_idx 目前只增不减,
-# 不在这里按 172.18.{idx} 的 255 上限拒绝 —— 否则累计创建 ~255 个沙盒后全部 create/resume 失败。
+# 不按 255 上限拒绝;>255 的地址映射见 _tap_addresses。
 MAX_TAP_IDX = 9_999_999_999
 MAX_VCPU    = int(os.environ.get("NODE_AGENT_MAX_VCPU", "64"))
 MAX_MEM_MIB = int(os.environ.get("NODE_AGENT_MAX_MEM_MIB", str(512 * 1024)))
@@ -282,25 +446,78 @@ def _kernel_path(value) -> str:
     return value
 
 
-def _vm_op_lock(sandbox_id: str) -> threading.RLock:
-    """Serialize Firecracker API operations for one VM while allowing other VMs in parallel."""
-    with _LOCK:
-        return _VM_OP_LOCKS.setdefault(sandbox_id, threading.RLock())
+
+def _wait_for_node_bootstrap() -> None:
+    if NODE_BOOTSTRAP_WAIT_S == 0:
+        return
+    deadline = time.monotonic() + NODE_BOOTSTRAP_WAIT_S
+    last_log = 0.0
+    while not _node_bootstrap_ready():
+        now = time.monotonic()
+        if now >= deadline:
+            raise TimeoutError(
+                "node bootstrap did not complete within "
+                f"{NODE_BOOTSTRAP_WAIT_S}s"
+            )
+        if now - last_log >= 30:
+            print(
+                "[bootstrap] waiting for cloud-init/custom bootstrap "
+                "completion",
+                flush=True,
+            )
+            last_log = now
+        time.sleep(2)  # nosemgrep: arbitrary-sleep -- node startup gate
+    print("[bootstrap] node is stable and ready for Firecracker", flush=True)
 
 
-def _drop_vm_op_lock(sandbox_id: str, lock: threading.RLock) -> None:
+@contextmanager
+def _vm_operation_lock(sandbox_id: str):
+    """Serialize one VM's operations without dropping locks under waiters."""
     with _LOCK:
-        if _VM_OP_LOCKS.get(sandbox_id) is lock:
-            _VM_OP_LOCKS.pop(sandbox_id, None)
+        lock = _VM_OP_LOCKS.setdefault(sandbox_id, threading.RLock())
+        _VM_OP_LOCK_USERS[sandbox_id] = (
+            _VM_OP_LOCK_USERS.get(sandbox_id, 0) + 1
+        )
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _LOCK:
+            remaining = _VM_OP_LOCK_USERS.get(sandbox_id, 1) - 1
+            if remaining > 0:
+                _VM_OP_LOCK_USERS[sandbox_id] = remaining
+            else:
+                _VM_OP_LOCK_USERS.pop(sandbox_id, None)
+                if _VM_OP_LOCKS.get(sandbox_id) is lock:
+                    _VM_OP_LOCKS.pop(sandbox_id, None)
 
 
 # ---------- tap 网络 ----------
 
+# tap_idx 是控制面全局只增计数器(db.alloc_tap_idx),累计创建超过 255 次后旧的
+# 172.18.{tap_idx}.x 映射会生成非法地址(ip addr add 静默失败 → guest 无 IPv4)。
+# 1..255 保持旧映射(已有快照里 guest 的 IP 固化在内存态,恢复时必须一致);
+# 更大的 idx 映射进 172.19.0.0/16 的 /30 块(16384 个,取模复用)。
+_TAP_LEGACY_MAX_IDX = 255
+_TAP_EXT_BLOCKS = 16384
+
+
+def _tap_addresses(tap_idx: int) -> tuple[str, str]:
+    """tap_idx → (host_ip, guest_ip),同一 /30 内 .1/.2。"""
+    if tap_idx < 0:
+        raise ValueError(f"invalid tap_idx {tap_idx}")
+    if tap_idx <= _TAP_LEGACY_MAX_IDX:
+        return f"172.18.{tap_idx}.1", f"172.18.{tap_idx}.2"
+    offset = ((tap_idx - _TAP_LEGACY_MAX_IDX - 1) % _TAP_EXT_BLOCKS) * 4
+    third, fourth = divmod(offset, 256)
+    return f"172.19.{third}.{fourth + 1}", f"172.19.{third}.{fourth + 2}"
+
+
 def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
     """建 tap + /30 子网。返回 (tap_name, host_ip, guest_ip)。"""
     tap      = f"fctap{tap_idx}"
-    host_ip  = f"172.18.{tap_idx}.1"
-    guest_ip = f"172.18.{tap_idx}.2"
+    host_ip, guest_ip = _tap_addresses(tap_idx)
     host_if  = _host_iface()
     # 幂等清理同名残留 tap:suspend/destroy 后 tap 设备不会自动消失,
     # 若 tap_idx 被复用(暖池 resume、tap_idx 回收重分配),残留的旧 tap 会让
@@ -311,8 +528,14 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
                    stderr=subprocess.DEVNULL)
     # guest 不用 IPv6:关掉 tap 上的 IPv6,避免 guest 经 link-local 访问宿主监听在 :: 的服务。
     _disable_ipv6(tap)
-    subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
-                   stderr=subprocess.DEVNULL)
+    # 地址配置失败不能静默吞掉:否则 guest 起来但没有网络,只有 vsock 能用。
+    addr = subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
+                          capture_output=True, text=True)
+    if addr.returncode != 0:
+        subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
+        raise RuntimeError(
+            f"ip addr add {host_ip}/30 dev {tap} failed: {addr.stderr.strip()}"
+        )
     subprocess.run(["ip", "link", "set", tap, "up"])
     # NAT(幂等)
     # nosec B602 / nosemgrep: subprocess-shell-true -- shell=True 仅为 "-C 检查 || -A 添加" 幂等惯用法;
@@ -428,6 +651,13 @@ def _disable_ipv6(tap: str) -> None:
 
 def _teardown_tap(tap: str) -> None:
     subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
+    # 同时删掉 _setup_tap 追加的 FORWARD 规则,否则每次创建都残留一条,
+    # 高密度/长时间运行后 FORWARD 链线性膨胀。
+    subprocess.run(
+        ["iptables", "-D", "FORWARD", "-i", tap, "-o", _host_iface(),
+         "-j", "ACCEPT"],
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _host_iface() -> str:
@@ -438,91 +668,346 @@ def _host_iface() -> str:
     return r.stdout.strip() or "eth0"
 
 
-# ---------- Firecracker 启动(jailer 包裹) ----------
+# ---------- Firecracker 宿主运行层(systemd + jailer) ----------
 
-def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
-               mem_mib: int, kernel: str, env: dict,
-               guest_ip: str = "", host_ip: str = "") -> tuple[int, str]:
+_VMM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+
+def _validated_vmm_id(sandbox_id: str) -> str:
+    if not _VMM_ID_RE.fullmatch(sandbox_id):
+        raise ValueError("sandbox id is not safe for the host runtime")
+    return sandbox_id
+
+
+def _host_control(
+    executable: str,
+    args: list[str],
+    *,
+    timeout: float = 30,
+) -> dict:
+    """Run a narrowly-scoped host helper through PID 1's namespaces."""
+    command = [
+        HOST_NSENTER,
+        "--target", "1",
+        "--mount",
+        "--uts",
+        "--ipc",
+        "--net",
+        "--pid",
+        "--",
+        executable,
+        *args,
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    output = completed.stdout.strip().splitlines()
+    if not output:
+        return {}
+    try:
+        return json.loads(output[-1])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"host helper returned invalid JSON: {output[-1][:512]}"
+        ) from exc
+
+
+def _runtime_unit_name(sandbox_id: str) -> str:
+    return f"sbx-vmm-{_validated_vmm_id(sandbox_id)}.service"
+
+
+def _runtime_uid(sandbox_id: str) -> int:
+    # Numeric IDs do not need host passwd entries. Use a 31-bit range so
+    # thousand-sandbox fleets have negligible collision probability.
+    digest = hashlib.sha256(sandbox_id.encode()).digest()
+    return 100000 + int.from_bytes(digest[:4], "big") % 2_000_000_000
+
+
+def _vmm_writable_dir(sandbox_id: str, path: str) -> None:
+    """建 VMM 需要写入的目录(如快照目录)。
+
+    jailer 只在启动时 chown -R 沙盒目录;启动之后由 node-agent(root)新建的
+    子目录仍归 root,降权运行的 firecracker 写快照会 EACCES(真机实测
+    snapshot/create → Permission denied)。这里把目录交给该 VM 的运行 uid。
     """
-    用 jailer 启动 Firecracker,返回 (pid, api_sock)。
-    jailer 把 FC 进程放进独立 cgroup + chroot + seccomp,防止逃逸。
-    """
-    d    = f"{SBX_BASE}/{sandbox_id}"
-    sock = f"{d}/api.sock"
-    log  = f"{d}/vm.log"
+    os.makedirs(path, exist_ok=True)
+    if VMM_LAUNCH_MODE == "host-systemd" and VMM_USE_JAILER:
+        uid = _runtime_uid(sandbox_id)
+        os.chown(path, uid, uid)
+
+
+def _runtime_bind_dirs(sandbox_id: str, extra_dirs=None) -> list[str]:
+    candidates = [f"{SBX_BASE}/{sandbox_id}", *(extra_dirs or [])]
+    result: list[str] = []
+    for path in candidates:
+        managed = _managed_sandbox_dir(str(path))
+        if not managed:
+            raise ValueError(f"unsafe jail bind path: {path}")
+        if managed not in result:
+            result.append(managed)
+    return result
+
+
+def _link_runtime_socket(sandbox_id: str, socket_name: str, target: str) -> None:
+    """Keep the historical socket path stable for restart recovery."""
+    compatibility_path = f"{SBX_BASE}/{sandbox_id}/{socket_name}"
+    if os.path.abspath(compatibility_path) == os.path.abspath(target):
+        return
+    try:
+        if os.path.lexists(compatibility_path):
+            os.remove(compatibility_path)
+        os.symlink(target, compatibility_path)
+    except OSError:
+        # The actual target remains authoritative; the compatibility link only
+        # improves restart discovery and legacy diagnostics.
+        pass
+
+
+def _launch_vmm(
+    sandbox_id: str,
+    socket_name: str,
+    mem_mib: int,
+    *,
+    bind_dirs=None,
+    log_name: str = "vmm.log",
+) -> tuple[int, str, str]:
+    """Launch one VMM and return (pid, host_api_socket, runtime_unit)."""
+    sid = _validated_vmm_id(sandbox_id)
+    d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
+    if socket_name not in {"api.sock", "api-resume.sock"}:
+        raise ValueError("unsupported Firecracker API socket name")
 
+    if VMM_LAUNCH_MODE == "host-systemd":
+        uid = _runtime_uid(sid)
+        args = [
+            "start",
+            "--id", sid,
+            "--socket-name", socket_name,
+            # Guest memory plus VMM/device overhead. The service cgroup is
+            # independent from the node-agent Pod cgroup.
+            "--memory-mib", str(
+                int(mem_mib) + max(1024, int(mem_mib) // 4)
+            ),
+            "--uid", str(uid),
+            "--gid", str(uid),
+            "--jailer", "1" if VMM_USE_JAILER else "0",
+        ]
+        for path in _runtime_bind_dirs(sid, bind_dirs):
+            args.extend(["--bind-dir", path])
+        result = _host_control(HOST_VMM_CTL, args, timeout=45)
+        pid = int(result.get("pid", 0) or 0)
+        sock = str(result.get("socket", ""))
+        unit = str(result.get("unit", "")) or _runtime_unit_name(sid)
+        if pid <= 0 or not sock:
+            raise RuntimeError("host runtime did not return pid/socket")
+        _link_runtime_socket(sid, socket_name, sock)
+        return pid, sock, unit
+
+    if VMM_LAUNCH_MODE != "subprocess":
+        raise RuntimeError(
+            f"unsupported VMM_LAUNCH_MODE={VMM_LAUNCH_MODE!r}"
+        )
+    if VMM_USE_JAILER:
+        raise RuntimeError(
+            "VMM_USE_JAILER requires VMM_LAUNCH_MODE=host-systemd"
+        )
+
+    sock = f"{d}/{socket_name}"
     try:
         os.remove(sock)
     except FileNotFoundError:
         pass
+    with open(f"{d}/{log_name}", "w") as log_file:
+        process = subprocess.Popen(
+            [FC_BIN, "--api-sock", sock],
+            stdout=log_file,
+            stderr=log_file,
+        )
+    return process.pid, sock, ""
 
-    # jailer 参数:每个沙盒独立 uid(从 tap_idx 派生,避免 uid 碰撞)
-    # jailer 会把 FC 进程 chroot 到 /srv/jailer/firecracker/<id>/root/
-    # 注意:rootfs 和 kernel 需在 jailer chroot 内可见 → 用 --bind-path 或预先 cp
-    # POC 阶段用裸 FC(无 jailer chroot 复杂度);生产切换时去掉 USE_BARE_FC
-    USE_BARE_FC = os.environ.get("USE_BARE_FC", "1") == "1"
-    if not USE_BARE_FC and os.path.exists(JAILER_BIN):
-        cmd = [
-            JAILER_BIN,
-            "--id",          sandbox_id,
-            "--exec-file",   FC_BIN,
-            "--uid",         str(3000 + _tap_idx_from_d(d)),
-            "--gid",         str(3000 + _tap_idx_from_d(d)),
-            "--chroot-base-dir", SBX_BASE,
-            "--",
-            "--api-sock",    sock,
-        ]
-    else:
-        cmd = [FC_BIN, "--api-sock", sock]
 
-    with open(log, "w") as lf:
-        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- cmd 为固定 list(jailer/FC 二进制路径来自环境配置,非请求体);env 仅作为 boot_args 注入 guest,不参与 host 命令拼接
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
+def _runtime_status(sandbox_id: str, *, strict: bool = False) -> dict:
+    if VMM_LAUNCH_MODE != "host-systemd":
+        return {}
+    try:
+        return _host_control(
+            HOST_VMM_CTL,
+            ["status", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=5,
+        )
+    except Exception:
+        if strict:
+            raise
+        return {}
+
+
+def _legacy_vmm_pid(api_socket: str) -> int | None:
+    """Find a pre-systemd Firecracker child during an in-place rollout."""
+    expected = {
+        api_socket,
+        os.path.realpath(api_socket),
+    }
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError:
+        return None
+    with proc_entries:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = _read_proc_cmdline(
+                    f"/proc/{entry.name}/cmdline"
+                )
+                argv = [
+                    value.decode(errors="replace")
+                    for value in raw.split(b"\0")
+                    if value
+                ]
+                for index, value in enumerate(argv[:-1]):
+                    if value == "--api-sock" and argv[index + 1] in expected:
+                        return int(entry.name)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def _read_proc_cmdline(path: str) -> bytes:
+    """Small indirection kept patchable in unit tests."""
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
+def _stop_vmm(sandbox_id: str, vm: dict) -> None:
+    """Stop a host-owned service or the legacy child process."""
+    if vm.get("runtime_unit"):
+        _host_control(
+            HOST_VMM_CTL,
+            ["stop", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=30,
+        )
+        return
+    if vm.get("pid"):
+        try:
+            os.kill(int(vm["pid"]), signal.SIGTERM)
+        except (ProcessLookupError, ValueError, TypeError):
+            pass
+        return
+    runtime = _runtime_status(sandbox_id)
+    if runtime.get("active"):
+        _host_control(
+            HOST_VMM_CTL,
+            ["stop", "--id", _validated_vmm_id(sandbox_id)],
+            timeout=30,
+        )
+
+
+# ---------- Firecracker 启动 ----------
+
+def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
+               mem_mib: int, kernel: str, env: dict,
+               guest_ip: str = "", host_ip: str = "",
+               balloon: dict | None = None) -> tuple[int, str, str]:
+    """
+    启动 Firecracker，返回 (pid, api_sock, runtime_unit)。
+    生产模式由宿主 systemd + jailer 提供独立 cgroup/chroot。
+    """
+    d    = f"{SBX_BASE}/{sandbox_id}"
+    os.makedirs(d, exist_ok=True)
+    pid, sock, runtime_unit = _launch_vmm(
+        sandbox_id,
+        "api.sock",
+        mem_mib,
+        bind_dirs=[d],
+        log_name="vm.log",
+    )
 
     if not _wait_sock(sock, timeout=30.0):
-        proc.kill()
+        _stop_vmm(
+            sandbox_id,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
         raise RuntimeError("firecracker API socket 未就绪")
 
-    # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
-    # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
-    # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
-    net_args = f"SBX_IP={guest_ip} SBX_GW={host_ip} " if guest_ip and host_ip else ""
-    if JUICEFS_ENABLED and JUICEFS_REDIS_ADDR and JUICEFS_BUCKET:
-        jfs_env = (
-            f"JFS_REDIS={JUICEFS_REDIS_ADDR} "
-            f"JFS_BUCKET={JUICEFS_BUCKET} "
-            f"JFS_NAME={JUICEFS_FS_NAME} "
-            f"AWS_REGION={AWS_REGION} "
-        )
-        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}{jfs_env}"
-    else:
-        boot_args = f"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/sbxinit {net_args}"
-
-    _fc(sock, "PUT", "/boot-source", {
-        "kernel_image_path": kernel,
-        "boot_args": boot_args,
-    })
-    _fc(sock, "PUT", "/drives/rootfs", {
-        "drive_id": "rootfs", "path_on_host": rootfs,
-        "is_root_device": True, "is_read_only": False,
-    })
-    # track_dirty_pages=True: 开启脏页跟踪,是 Diff 增量快照的前提。
-    # 不开则 PUT /snapshot/create {Diff} 会失败 → 方案C 疏散退化成全量 Full(慢一个量级)。
-    _fc(sock, "PUT", "/machine-config",
-        {"vcpu_count": cpu, "mem_size_mib": mem_mib, "track_dirty_pages": True})
-    _fc(sock, "PUT", "/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap})
-    # vsock: host UDS = {d}/v.sock, guest CID=3, port=2222 供 exec 使用。
-    # exec 主通道走 vsock(不依赖 guest 网络/sshd)，SSH 仅兜底。
-    # 快照含 vsock 设备配置,resume 时由 op_resume 先 os.remove(v.sock) 避免 "Address in use"。
-    vsock_path = f"{d}/v.sock"
     try:
-        _fc(sock, "PUT", "/vsock", {"vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_path})
-    except Exception:
-        pass  # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)
-    _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
+        # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
+        # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
+        # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
+        net_args = (
+            f"SBX_IP={guest_ip} SBX_GW={host_ip} "
+            if guest_ip and host_ip else ""
+        )
+        if JUICEFS_ENABLED and JUICEFS_REDIS_ADDR and JUICEFS_BUCKET:
+            jfs_env = (
+                f"JFS_REDIS={JUICEFS_REDIS_ADDR} "
+                f"JFS_BUCKET={JUICEFS_BUCKET} "
+                f"JFS_NAME={JUICEFS_FS_NAME} "
+                f"AWS_REGION={AWS_REGION} "
+            )
+            boot_args = (
+                "console=ttyS0 reboot=k panic=1 pci=off "
+                f"init=/sbin/sbxinit {net_args}{jfs_env}"
+            )
+        else:
+            boot_args = (
+                "console=ttyS0 reboot=k panic=1 pci=off "
+                f"init=/sbin/sbxinit {net_args}"
+            )
 
-    return proc.pid, sock
+        _fc(sock, "PUT", "/boot-source", {
+            "kernel_image_path": kernel,
+            "boot_args": boot_args,
+        })
+        _fc(sock, "PUT", "/drives/rootfs", {
+            "drive_id": "rootfs", "path_on_host": rootfs,
+            "is_root_device": True, "is_read_only": False,
+        })
+        # track_dirty_pages=True:开启脏页跟踪,是 Diff 增量快照的前提。
+        _fc(sock, "PUT", "/machine-config", {
+            "vcpu_count": cpu,
+            "mem_size_mib": mem_mib,
+            "track_dirty_pages": True,
+        })
+        _fc(sock, "PUT", "/network-interfaces/eth0", {
+            "iface_id": "eth0",
+            "host_dev_name": tap,
+        })
+        # 可选 virtio-balloon(只能 boot 前配置):free_page_reporting 让 guest
+        # 把释放的页还给宿主(宿主 RSS 随之下降),是内存超分的前提之一。
+        if balloon:
+            _fc(sock, "PUT", "/balloon", {
+                "amount_mib": int(balloon.get("amount_mib", 0)),
+                "deflate_on_oom": bool(balloon.get("deflate_on_oom", True)),
+                "stats_polling_interval_s": int(
+                    balloon.get("stats_polling_interval_s", 0)
+                ),
+                **({"free_page_reporting": True}
+                   if balloon.get("free_page_reporting") else {}),
+            })
+        # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)。
+        vsock_path = f"{d}/v.sock"
+        try:
+            _fc(sock, "PUT", "/vsock", {
+                "vsock_id": "vsock0",
+                "guest_cid": 3,
+                "uds_path": vsock_path,
+            })
+        except Exception:
+            pass
+        _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
+    except Exception:
+        _stop_vmm(
+            sandbox_id,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
+        raise
+
+    return pid, sock, runtime_unit
 
 
 def _tap_idx_from_d(d: str) -> int:
@@ -538,7 +1023,13 @@ def _tap_idx_from_d(d: str) -> int:
 
 # ---------- Firecracker UDS HTTP ----------
 
-def _fc(sock: str, method: str, path: str, body=None, timeout: int = 15) -> dict:
+def _fc(
+    sock: str,
+    method: str,
+    path: str,
+    body=None,
+    timeout: float = 15,
+) -> dict:
     conn = http.client.HTTPConnection("localhost", timeout=timeout)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -642,6 +1133,37 @@ _BASE_SNAPSHOT_FILES = frozenset(("vm.snapshot.base", "vm.mem.base"))
 _BASE_HASH_CACHE: dict[str, tuple[tuple[int, int, int, int, int], str]] = {}
 _BASE_HASH_CACHE_LOCK = threading.Lock()
 
+# Diff 快照的落盘方式:
+#   sparse  旧方式。Diff 写成新的稀疏文件,resume 时按 SEEK_DATA/SEEK_HOLE 叠加到
+#           base 上。要求文件系统的空洞粒度精确到 4 KiB 页(XFS/ext4 满足);
+#           ZFS(空洞粒度=recordsize)和 Lustre 不满足 → 未写的页被当成"有数据"
+#           以零覆盖 base,resume 后 guest 静默损坏(真机实测 triple fault)。
+#   inplace 先把 base block-clone 成同尺寸 vm.mem,再让 Firecracker 把 Diff 原地
+#           写进去(Firecracker 对已存在且尺寸匹配的 mem 文件做原地合并),结果即
+#           完整内存镜像,resume 直接 load,不依赖 SEEK_DATA。
+#   auto    ZFS 上用 inplace,其余用 sparse(默认)。
+SNAPSHOT_DIFF_MODE = os.environ.get("SNAPSHOT_DIFF_MODE", "auto").strip().lower()
+_INPLACE_MARKER = "vm.mem.inplace"
+# 这些文件系统自带端到端块校验,inplace 的整份 vm.mem 不在关键路径上再做
+# sha256(否则每个沙盒要冷读一遍完整内存镜像,吃掉 Spot 窗口的 EBS 带宽)。
+_CHECKSUMMING_FS = frozenset(("zfs",))
+
+
+def _fs_type(path: str) -> str:
+    try:
+        return subprocess.run(
+            ["stat", "-f", "-c", "%T", path],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _diff_mode(snap_dir: str) -> str:
+    if SNAPSHOT_DIFF_MODE in ("sparse", "inplace"):
+        return SNAPSHOT_DIFF_MODE
+    return "inplace" if _fs_type(snap_dir) == "zfs" else "sparse"
+
 
 class SnapshotIntegrityError(RuntimeError):
     pass
@@ -691,11 +1213,29 @@ def _clear_base_hash_cache(sandbox_dir: str) -> None:
             del _BASE_HASH_CACHE[path]
 
 
+_FS_INTEGRITY_FILES = frozenset(("vm.mem", "vm.mem.base"))
+
+
+def _fs_checksummed_mem(snap_dir: str) -> bool:
+    """inplace 模式且文件系统自带块校验:整份内存镜像交给文件系统担保。"""
+    return (
+        _diff_mode(snap_dir) == "inplace"
+        and _fs_type(snap_dir) in _CHECKSUMMING_FS
+    )
+
+
 def _write_snapshot_manifest(snap_dir: str) -> dict:
     files = {}
+    fs_checksummed = _fs_checksummed_mem(snap_dir)
     for name in _SNAPSHOT_FILES:
         path = os.path.join(snap_dir, name)
         if os.path.isfile(path):
+            if fs_checksummed and name in _FS_INTEGRITY_FILES:
+                files[name] = {
+                    "size": os.path.getsize(path),
+                    "integrity": f"filesystem:{_fs_type(snap_dir)}",
+                }
+                continue
             files[name] = {
                 "size": os.path.getsize(path),
                 "sha256": _snapshot_file_hash(path, name),
@@ -733,6 +1273,18 @@ def _verify_snapshot_manifest(snap_dir: str) -> dict:
             raise SnapshotIntegrityError(f"snapshot file is missing: {name}")
         if os.path.getsize(path) != expected.get("size"):
             raise SnapshotIntegrityError(f"snapshot size mismatch: {name}")
+        integrity = expected.get("integrity")
+        if integrity:
+            # 只接受由自带块校验的文件系统担保的 inplace 内存镜像
+            if (
+                name not in _FS_INTEGRITY_FILES
+                or integrity != f"filesystem:{_fs_type(snap_dir)}"
+                or _fs_type(snap_dir) not in _CHECKSUMMING_FS
+            ):
+                raise SnapshotIntegrityError(
+                    f"snapshot integrity mode unsupported here: {name} {integrity}"
+                )
+            continue
         if _snapshot_file_hash(path, name) != expected.get("sha256"):
             raise SnapshotIntegrityError(f"snapshot checksum mismatch: {name}")
     if "vm.snapshot" not in files or "vm.mem" not in files:
@@ -780,6 +1332,24 @@ def op_create(body: dict) -> dict:
         if owner != sid:
             raise RequestValidationError("path_owner_mismatch", "rootfs_path")
 
+    # Operator reconciliation is level-triggered: after a watch reconnect or
+    # process crash it may repeat a create whose side effect already
+    # succeeded. Make the node boundary idempotent so the retry cannot start a
+    # second Firecracker process or overwrite the running VM's rootfs.
+    with _LOCK:
+        existing = _VMS.get(sid)
+        if existing and existing.get("state") == "running":
+            return {
+                "state": "running",
+                "ip": existing.get("ip", ""),
+                "already_exists": True,
+            }
+        if existing:
+            raise RuntimeError(
+                f"sandbox {sid} already exists in state "
+                f"{existing.get('state', 'unknown')}"
+            )
+
     d = f"{SBX_BASE}/{sid}"
     _no_symlink(d, "id")
     os.makedirs(d, exist_ok=True)
@@ -787,42 +1357,257 @@ def op_create(body: dict) -> dict:
     # CoW 复制基础 rootfs 到沙盒目录(src 是全局基础镜像,dst 是沙盒私有副本)。
     # 按控制面传的 rootfs_template 选模板 /opt/sbx/rootfs-{name}.ext4;不存在则回退默认 ROOTFS。
     dest_rootfs = f"{d}/rootfs.ext4"
-    src_rootfs  = _rootfs_template_path(body.get("rootfs_template", ""))
+    src_rootfs  = _cached_rootfs_template(
+        _rootfs_template_path(body.get("rootfs_template", ""))
+    )
     subprocess.run(["cp", "--reflink=auto", src_rootfs, dest_rootfs], check=True)
+    os.chmod(dest_rootfs, 0o644)
 
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
 
-    pid, sock = _start_fc(sid, dest_rootfs, tap, cpu, mem_mib, kernel, env,
-                          guest_ip=guest_ip, host_ip=host_ip)
+    try:
+        pid, sock, runtime_unit = _start_fc(
+            sid,
+            dest_rootfs,
+            tap,
+            cpu,
+            mem_mib,
+            kernel,
+            env,
+            guest_ip=guest_ip,
+            host_ip=host_ip,
+            balloon=body.get("balloon") or (
+                _DEFAULT_BALLOON if BALLOON_FREE_PAGE_REPORTING else None
+            ),
+        )
+    except Exception:
+        _teardown_tap(tap)
+        raise
 
+    vm = {
+        "state":   "running",
+        "pid":     pid,
+        "sock":    sock,
+        "tap":     tap,
+        "tap_idx": tap_idx,
+        "ip":      guest_ip,
+        "dir":     d,
+        "runtime_unit": runtime_unit,
+    }
     with _LOCK:
-        _VMS[sid] = {
-            "state":   "running",
-            "pid":     pid,
-            "sock":    sock,
-            "tap":     tap,
-            "tap_idx": tap_idx,
-            "ip":      guest_ip,
-            "dir":     d,
-        }
+        _VMS[sid] = vm
+    try:
+        _persist_runtime_metadata(sid, vm)
+    except Exception:
+        with _LOCK:
+            if _VMS.get(sid) is vm:
+                _VMS.pop(sid, None)
+        _stop_vmm(sid, vm)
+        _teardown_tap(tap)
+        raise
     return {"state": "running", "ip": guest_ip}
+
+
+def _managed_sandbox_dir(path: str) -> str | None:
+    """Return a normalized direct child of SBX_BASE, or None if unsafe."""
+    base = os.path.abspath(SBX_BASE)
+    candidate = os.path.abspath(path)
+    if os.path.dirname(candidate) != base:
+        return None
+    return candidate
+
+
+def _runtime_metadata_path(sid: str) -> str:
+    return f"{SBX_BASE}/{_validated_vmm_id(sid)}/runtime.json"
+
+
+def _persist_runtime_metadata(sid: str, vm: dict) -> None:
+    """Persist host-network identity needed after node-agent Pod restart."""
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not sandbox_dir:
+        raise ValueError("unsafe sandbox runtime metadata path")
+    os.makedirs(sandbox_dir, exist_ok=True)
+    owned_dirs = [
+        managed
+        for path in vm.get("owned_dirs") or []
+        if (managed := _managed_sandbox_dir(str(path)))
+    ]
+    payload = {
+        "version": 1,
+        "state": str(vm.get("state", "")),
+        "tap": str(vm.get("tap", "")),
+        "tap_idx": int(vm.get("tap_idx", 0) or 0),
+        "ip": str(vm.get("ip", "")),
+        "runtime_unit": str(vm.get("runtime_unit", "")),
+        "owned_dirs": sorted(set(owned_dirs)),
+    }
+    target = _runtime_metadata_path(sid)
+    temporary = (
+        f"{target}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _load_runtime_metadata(sid: str) -> dict:
+    try:
+        with open(
+            _runtime_metadata_path(sid),
+            encoding="utf-8",
+        ) as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if payload.get("version") != 1:
+        return {}
+    return payload
+
+
+def _try_persist_runtime_metadata(sid: str, vm: dict) -> bool:
+    try:
+        _persist_runtime_metadata(sid, vm)
+        return True
+    except Exception as exc:
+        log_event(
+            "error",
+            "runtime_metadata_persist_failed",
+            sandbox_id=sid,
+            error_type=type(exc).__name__,
+        )
+        return False
+
+
+def _snapshot_source(sid: str, snap_dir: str) -> tuple[str | None, str | None]:
+    """Identify a distinct managed sandbox directory backing a snapshot."""
+    source_dir = _managed_sandbox_dir(os.path.dirname(snap_dir))
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not source_dir or source_dir == sandbox_dir:
+        return None, None
+    return os.path.basename(source_dir), source_dir
+
+
+def _ensure_resume_source_available(sid: str, snap_dir: str) -> None:
+    """A warm snapshot may only be claimed from an inactive source VM."""
+    source_sid, _ = _snapshot_source(sid, snap_dir)
+    if not source_sid:
+        return
+    with _LOCK:
+        source = _VMS.get(source_sid)
+        if source and source.get("state") != "suspended":
+            raise RuntimeError(
+                f"snapshot source {source_sid} is still "
+                f"{source.get('state', 'unknown')}"
+            )
+
+
+def _register_resumed_vm(sid: str, vm: dict, snap_dir: str) -> None:
+    """Atomically transfer a warm snapshot's local ownership to real sid."""
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    source_sid, source_dir = _snapshot_source(sid, snap_dir)
+    owned_dirs = {
+        path for path in (sandbox_dir, source_dir)
+        if path is not None
+    }
+    with _LOCK:
+        # A warm-claimed sandbox can later suspend into real_id/snap and
+        # resume again. That second resume no longer exposes warm_id through
+        # snap_dir, so retain the ownership transferred by the first claim.
+        previous = _VMS.get(sid) or {}
+        for path in previous.get("owned_dirs") or []:
+            managed = _managed_sandbox_dir(str(path))
+            if managed:
+                owned_dirs.add(managed)
+        vm["owned_dirs"] = sorted(owned_dirs)
+        _VMS[sid] = vm
+        if source_sid:
+            source = _VMS.get(source_sid)
+            if source and source.get("state") == "suspended":
+                _VMS.pop(source_sid, None)
+    _persist_runtime_metadata(sid, vm)
+
+
+def _owned_runtime_dirs(sid: str, vm: dict) -> list[str]:
+    """Return only safe per-sandbox directories owned by a runtime."""
+    candidates = list(vm.get("owned_dirs") or [])
+    candidates.extend((vm.get("dir", ""), f"{SBX_BASE}/{sid}"))
+    result: list[str] = []
+    for candidate in candidates:
+        managed = _managed_sandbox_dir(str(candidate)) if candidate else None
+        if managed and managed not in result:
+            result.append(managed)
+    return result
+
+
+def _live_runtime_socket(sandbox_dir: str) -> str | None:
+    for name in ("api.sock", "api-resume.sock"):
+        sock = os.path.join(sandbox_dir, name)
+        if os.path.exists(sock) and _wait_sock(sock, timeout=0.2):
+            return sock
+    return None
 
 
 def op_destroy(body: dict) -> dict:
     sid = _sandbox_id(body.get("id"))
+    with _vm_operation_lock(sid):
+        return _op_destroy_locked(sid)
+
+
+def _op_destroy_locked(sid: str) -> dict:
     with _LOCK:
-        vm = _VMS.pop(sid, None)
+        vm = _VMS.get(sid)
+    sandbox_dir = _managed_sandbox_dir(f"{SBX_BASE}/{sid}")
+    if not vm and VMM_LAUNCH_MODE == "host-systemd":
+        runtime = _runtime_status(sid, strict=True)
+        if runtime.get("active"):
+            metadata = _load_runtime_metadata(sid)
+            vm = {
+                "state": "running",
+                "pid": int(runtime.get("pid", 0) or 0),
+                "sock": str(runtime.get("socket", "")),
+                "tap": str(metadata.get("tap", "")),
+                "tap_idx": int(metadata.get("tap_idx", 0) or 0),
+                "ip": str(metadata.get("ip", "")),
+                "dir": sandbox_dir or "",
+                "runtime_unit": (
+                    str(runtime.get("unit", ""))
+                    or _runtime_unit_name(sid)
+                ),
+                "owned_dirs": metadata.get("owned_dirs", []),
+            }
+    if not vm and sandbox_dir and _live_runtime_socket(sandbox_dir):
+        raise RuntimeError(
+            f"sandbox {sid} has a live Firecracker socket but is not tracked"
+        )
     if vm:
-        if vm.get("pid"):
-            # os.kill 而非 subprocess(slim 镜像无 /bin/kill)
-            try:
-                os.kill(int(vm["pid"]), signal.SIGTERM)
-            except (ProcessLookupError, ValueError, TypeError):
-                pass
+        _stop_vmm(sid, vm)
         _teardown_tap(vm.get("tap", ""))
-        sandbox_dir = f"{SBX_BASE}/{sid}"
-        shutil.rmtree(sandbox_dir, ignore_errors=True)
-        _clear_base_hash_cache(sandbox_dir)
+        with _LOCK:
+            if _VMS.get(sid) is vm:
+                _VMS.pop(sid, None)
+        # A warm claim restores from the warm source directory because the
+        # Firecracker snapshot embeds paths to its rootfs/vsock/memory files.
+        # The real sandbox therefore owns both its runtime directory and that
+        # source directory until destroy. Remove both after the VMM is dead.
+    cleanup_vm = vm or {
+        "dir": sandbox_dir or "",
+        "owned_dirs": (
+            _recovered_owned_dirs(sandbox_dir)
+            if sandbox_dir else []
+        ),
+    }
+    for owned_dir in _owned_runtime_dirs(sid, cleanup_vm):
+        shutil.rmtree(owned_dir, ignore_errors=True)
+        _clear_base_hash_cache(owned_dir)
     return {"deleted": True}
 
 
@@ -838,7 +1623,7 @@ def op_snapshot_base(body: dict) -> dict:
         vm = _VMS.get(sid)
     if not vm:
         raise KeyError(sid)
-    os.makedirs(snap_dir, exist_ok=True)
+    _vmm_writable_dir(sid, snap_dir)
     sock = vm["sock"]
     base_snap = f"{snap_dir}/vm.snapshot.base"
     base_mem  = f"{snap_dir}/vm.mem.base"
@@ -861,6 +1646,17 @@ def op_snapshot_base(body: dict) -> dict:
         # 打完 base 立即恢复运行(base 是运行期快照,不释放 RAM)
         _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
     dt = time.monotonic() - t0
+    # 趁 base 刚写完(大概率仍在页缓存)把哈希算进缓存。否则 Spot 回收时第一次
+    # suspend 要把 dense base 从 EBS 冷读一遍,与快照写入争抢实例 EBS 带宽
+    # (真机实测读流量 200~630 MiB/s,checkpoint 有效写入只剩 ~450 MiB/s)。
+    # 只预热缓存,校验逻辑不变。
+    try:
+        for name in ("vm.snapshot.base", "vm.mem.base"):
+            if name in _FS_INTEGRITY_FILES and _fs_checksummed_mem(snap_dir):
+                continue  # 由文件系统块校验担保,不做 sha256
+            _snapshot_file_hash(f"{snap_dir}/{name}", name)
+    except OSError:
+        pass
     return {"base_created": True, "base_snapshot_time_s": round(dt, 3),
             "base_mem_bytes": os.path.getsize(base_mem)}
 
@@ -875,7 +1671,7 @@ def op_suspend(body: dict) -> dict:
     if not vm:
         raise KeyError(sid)
 
-    os.makedirs(snap_dir, exist_ok=True)
+    _vmm_writable_dir(sid, snap_dir)
     sock = vm["sock"]
 
     # 方案 B：JuiceFS 模式下，暂停前先 flush 脏页到 S3
@@ -908,43 +1704,88 @@ def op_suspend(body: dict) -> dict:
     diff_mem   = f"{snap_dir}/vm.mem"
     has_base   = os.path.exists(base_mem)
 
-    # snapshot/create 超时:内存越大越久;多个并发共享 EBS 带宽会显著拉长。留足 600s。
-    SNAP_TIMEOUT = 600
+    # 正常 suspend 留足 600s；Spot 疏散会传入剩余 deadline，确保阻塞中的
+    # Firecracker API 调用不会越过 120s 终止窗口。
+    snapshot_budget_s = max(
+        0.1, min(600.0, float(body.get("snapshot_timeout_s", 600)))
+    )
+    snapshot_started = time.monotonic()
+
+    def remaining_snapshot_timeout() -> float:
+        remaining = snapshot_budget_s - (
+            time.monotonic() - snapshot_started
+        )
+        if remaining <= 0:
+            raise TimeoutError("snapshot deadline exhausted")
+        return max(0.1, remaining)
 
     t0 = time.monotonic()
     snap_type = "diff"
-    if not has_base:
-        # 无 base:Full 快照,同时保留一份作 base(供本 sandbox 后续 Diff)
-        snap_type = "full"
-        _fc(sock, "PUT", "/snapshot/create", {
-            "snapshot_type": "Full",
-            "snapshot_path": diff_snap,
-            "mem_file_path": diff_mem,
-        }, timeout=SNAP_TIMEOUT)
-        import shutil as _sh
-        _sh.copy2(diff_snap, base_snap)
-        _sh.copy2(diff_mem,  base_mem)
-    else:
-        # 有 base:Diff 快照(只写自 base 以来的脏页)
-        try:
-            _fc(sock, "PUT", "/snapshot/create", {
-                "snapshot_type": "Diff",
-                "snapshot_path": diff_snap,
-                "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
-        except Exception:
-            # Diff 失败(如未开 track_dirty_pages)→ 降级 Full
-            snap_type = "full-fallback"
+    try:
+        if not has_base:
+            # 无 base:Full 快照,同时保留一份作 base(供本 sandbox 后续 Diff)。
+            # 状态盘使用 reflink-enabled XFS，避免物理复制整份内存文件再次消耗
+            # EBS 吞吐和 120s 预算。
+            snap_type = "full"
             _fc(sock, "PUT", "/snapshot/create", {
                 "snapshot_type": "Full",
                 "snapshot_path": diff_snap,
                 "mem_file_path": diff_mem,
-            }, timeout=SNAP_TIMEOUT)
-    dt = time.monotonic() - t0
+            }, timeout=remaining_snapshot_timeout())
+            subprocess.run(
+                ["cp", "--reflink=auto", diff_snap, base_snap],
+                check=True,
+            )
+            subprocess.run(
+                ["cp", "--reflink=auto", diff_mem, base_mem],
+                check=True,
+            )
+        else:
+            # 有 base:Diff 快照(只写自 base 以来的脏页)
+            marker = f"{snap_dir}/{_INPLACE_MARKER}"
+            inplace = False
+            if _diff_mode(snap_dir) == "inplace":
+                staged = f"{diff_mem}.clone"
+                clone = subprocess.run(
+                    ["cp", "--reflink=always", base_mem, staged],
+                    capture_output=True, text=True,
+                )
+                if clone.returncode == 0:
+                    if VMM_LAUNCH_MODE == "host-systemd" and VMM_USE_JAILER:
+                        uid = _runtime_uid(sid)
+                        os.chown(staged, uid, uid)
+                    os.replace(staged, diff_mem)
+                    with open(marker, "w") as stream:
+                        stream.write("full\n")
+                    inplace = True
+                    snap_type = "diff-inplace"
+                else:
+                    try:
+                        os.remove(staged)
+                    except FileNotFoundError:
+                        pass
+            if not inplace:
+                try:
+                    os.remove(marker)
+                except FileNotFoundError:
+                    pass
+            try:
+                _fc(sock, "PUT", "/snapshot/create", {
+                    "snapshot_type": "Diff",
+                    "snapshot_path": diff_snap,
+                    "mem_file_path": diff_mem,
+                }, timeout=remaining_snapshot_timeout())
+            except Exception:
+                # Diff 失败(如未开 track_dirty_pages)→ 降级 Full，但必须
+                # 继续复用原始硬截止时间，不能重新获得一整份 timeout。
+                snap_type = "full-fallback"
+                _fc(sock, "PUT", "/snapshot/create", {
+                    "snapshot_type": "Full",
+                    "snapshot_path": diff_snap,
+                    "mem_file_path": diff_mem,
+                }, timeout=remaining_snapshot_timeout())
 
-    # suspend 只有在完整性清单落盘并立即回读通过后才算成功。失败时 VMM
-    # 仍只是 Paused，先恢复运行再把错误交给控制面回滚状态。
-    try:
+        # suspend 只有在完整性清单落盘并立即回读通过后才算成功。
         _write_snapshot_manifest(snap_dir)
         _record_snapshot_verification(snap_dir)
     except Exception:
@@ -952,16 +1793,19 @@ def op_suspend(body: dict) -> dict:
             _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
         except Exception:
             pass
+        with _LOCK:
+            vm["state"] = "running"
+        _try_persist_runtime_metadata(sid, vm)
         raise
+    dt = time.monotonic() - t0
 
     # 方案C:快照写在持久状态 EBS 上(snap_dir),spot 终止后卷幸存,
     # 故【不传 S3】——删掉最慢的 S3 传输,是 120s 窗口内跑满 50 个的关键。
     # snapshot/create 同步完成即已落 EBS,数据已持久 → 可安全 kill VMM。
-    # kill VMM,释放 RAM。用 os.kill 而非 subprocess(slim 镜像无 /bin/kill)
-    try:
-        os.kill(int(vm["pid"]), signal.SIGTERM)
-    except (ProcessLookupError, ValueError, TypeError):
-        pass
+    # Stop the host-owned service (or legacy child process) after the durable
+    # snapshot is complete, releasing guest RAM without tying lifecycle to the
+    # node-agent Pod.
+    _stop_vmm(sid, vm)
     time.sleep(0.2)  # nosemgrep: arbitrary-sleep -- 等 VMM 退出释放 vm.mem 文件句柄后再读大小
 
     # diff.mem 是稀疏文件:apparent 是全量大小,真实占盘用 st_blocks*512
@@ -978,6 +1822,7 @@ def op_suspend(body: dict) -> dict:
     with _LOCK:
         vm["state"] = "suspended"
         vm["pid"]   = None
+    _try_persist_runtime_metadata(sid, vm)
 
     # 快照默认上传 S3 作权威副本(控制面 SNAPSHOT_TO_S3 开关决定是否传 upload_s3)。
     # 上传整份 snap_dir(base + diff + manifest),跨机 resume 时 node-agent 从此前缀
@@ -1063,6 +1908,50 @@ def _vsock_uds_in_snapshot(snapshot_path: str) -> list[str]:
     return sorted(f"{SBX_BASE}/{o}/v.sock" for o in owners if _SANDBOX_ID_RE.fullmatch(o))
 
 
+def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
+    # Reconciliation may retry after a successful response was lost. Do not
+    # start a second Firecracker process or rebuild tap/rootfs. A normal
+    # suspend intentionally retains a lightweight _VMS entry with pid=None;
+    # that exact suspended state is the valid input to snapshot restore.
+    persist_vm: dict | None = None
+    result: dict | None = None
+    with _LOCK:
+        existing = _VMS.get(sid)
+        if existing and existing.get("state") == "running":
+            source_sid, source_dir = _snapshot_source(sid, snap_dir)
+            if source_dir:
+                owned_dirs = set(existing.get("owned_dirs") or [])
+                owned_dirs.update((
+                    _managed_sandbox_dir(f"{SBX_BASE}/{sid}"),
+                    source_dir,
+                ))
+                existing["owned_dirs"] = sorted(
+                    path for path in owned_dirs if path
+                )
+                source = _VMS.get(source_sid or "")
+                if source and source.get("state") == "suspended":
+                    _VMS.pop(source_sid or "", None)
+            persist_vm = existing
+            result = {
+                "state": "running",
+                "ip": existing.get("ip", ""),
+                "already_exists": True,
+                "restore_time_s": 0,
+                "merge_time_s": 0,
+                "restore_mode": "existing",
+                "net_fix_ok": True,
+                "juicefs_mode": JUICEFS_ENABLED,
+            }
+        elif existing and existing.get("state") != "suspended":
+            raise RuntimeError(
+                f"sandbox {sid} already exists in state "
+                f"{existing.get('state', 'unknown')}"
+            )
+    if persist_vm is not None:
+        _persist_runtime_metadata(sid, persist_vm)
+    return result
+
+
 def op_resume(body: dict) -> dict:
     sid        = _sandbox_id(body.get("id"))
     # 快照来源 id(snap_owner)可与 sid 不同(暖池 claim:warm_id → real_id),
@@ -1077,6 +1966,10 @@ def op_resume(body: dict) -> dict:
     tap_idx    = _int_in_range(body.get("tap_idx"), 0, MAX_TAP_IDX, "tap_idx")
     s3_prefix  = _s3_prefix_for(snap_owner, body.get("s3_prefix", ""))
     _no_symlink(f"{SBX_BASE}/{sid}", "id")
+
+    if existing_result := _existing_resume_result(sid, snap_dir):
+        return existing_result
+    _ensure_resume_source_available(sid, snap_dir)
 
     # 兜底:若本地无快照文件且传了 s3_prefix,从 S3 拉回。
     # 注:方案C 从不往 S3 上传快照(见 op_suspend 的 upload_s3 分支),控制面传下来的
@@ -1125,7 +2018,11 @@ def op_resume(body: dict) -> dict:
     diff_mem = f"{snap_dir}/vm.mem"
     mem_backend_path = diff_mem
     merge_time = 0.0
-    if os.path.exists(base_mem) and os.path.exists(diff_mem):
+    inplace_image = os.path.exists(f"{snap_dir}/{_INPLACE_MARKER}")
+    if inplace_image:
+        # inplace:vm.mem 已是完整内存镜像(base 克隆 + 原地 Diff),直接 load。
+        pass
+    elif os.path.exists(base_mem) and os.path.exists(diff_mem):
         # ⚠️ 正确性:只要存在 base,就【必须】把 vm.mem 合并到 base 上再 load,不能直接 load vm.mem。
         #   原因:Diff 的 mem 是稀疏文件,自 base 以来【未改动的干净页是空洞(读为0)】。
         #   直接 load diff → 干净页变成 0 → 内存损坏。即使 diff 看起来"很满"(满载),
@@ -1138,12 +2035,6 @@ def op_resume(body: dict) -> dict:
         merge_time = time.monotonic() - tm
         mem_backend_path = merged
 
-    sock = f"{d}/api-resume.sock"
-    try:
-        os.remove(sock)
-    except FileNotFoundError:
-        pass
-
     # resume 前清理旧 vsock socket(快照含 vsock 设备,残留的 v.sock 会导致
     # "Address in use" → snapshot load 失败)。这是 Firecracker 快照恢复已知坑。
     # 清理集合含:sid 目录、目录约定路径、以及从快照抠出的固化真实路径(暖池来源)。
@@ -1153,12 +2044,29 @@ def op_resume(body: dict) -> dict:
         except FileNotFoundError:
             pass
 
-    with open(f"{d}/vm-resume.log", "w") as lf:
-        # nosemgrep: dangerous-subprocess-use-tainted-env-args -- 固定 list:FC_BIN 来自环境配置,sock 为本地派生路径,无用户输入
-        proc = subprocess.Popen([FC_BIN, "--api-sock", sock], stdout=lf, stderr=lf)
+    runtime_bind_dirs = [d, src_dir]
+    for path in stale_vsocks:
+        managed = _managed_sandbox_dir(os.path.dirname(path))
+        if managed:
+            runtime_bind_dirs.append(managed)
+    snapshot_mem_mib = max(
+        1,
+        (os.path.getsize(mem_backend_path) + 1024 * 1024 - 1)
+        // (1024 * 1024),
+    )
+    pid, sock, runtime_unit = _launch_vmm(
+        sid,
+        "api-resume.sock",
+        snapshot_mem_mib,
+        bind_dirs=runtime_bind_dirs,
+        log_name="vm-resume.log",
+    )
 
     if not _wait_sock(sock):
-        proc.kill()
+        _stop_vmm(
+            sid,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
         raise RuntimeError("firecracker resume socket 未就绪")
 
     # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
@@ -1174,27 +2082,45 @@ def op_resume(body: dict) -> dict:
     # 顺序关键:snapshot/load(resume_vm=True) 会立即恢复快照里保存的网络设备并
     # 打开宿主 tap(fctap{idx});若此时 tap 尚未就绪(或残留旧设备占用),FC 报
     # "Open tap device failed: Resource busy" → load 失败。因此必须先 setup_tap。
-    tap, _, guest_ip = _setup_tap(tap_idx)
+    tap = ""
+    try:
+        tap, _, guest_ip = _setup_tap(tap_idx)
 
-    # load 用 mem_backend_path:有 base(Diff 快照)时 = 上面合并出的 merged;
-    # 无 base(Full 快照,如暖池首份)时 = vm.mem 本身。合并只发生在存在 base 时,
-    # 是正确性所需(见上方 always-merge 说明),而非亚秒级恢复的阻碍。
-    t0 = time.monotonic()
-    _fc(sock, "PUT", "/snapshot/load", {
-        "snapshot_path": f"{snap_dir}/vm.snapshot",
-        "mem_backend":   {"backend_path": mem_backend_path, "backend_type": "File"},
-        # track_dirty_pages 不随快照保存 → load 时必须显式再设 True,
-        # 否则本次 resume 后的实例无法再打 Diff(多代接力断链)。FC 官方文档明确要求。
-        "track_dirty_pages": True,
-        "resume_vm":     True,
-    })
-    dt = time.monotonic() - t0
+        # load 用 mem_backend_path:有 base(Diff 快照)时 = 上面合并出的 merged;
+        # 无 base(Full 快照,如暖池首份)时 = vm.mem 本身。
+        t0 = time.monotonic()
+        _fc(sock, "PUT", "/snapshot/load", {
+            "snapshot_path": f"{snap_dir}/vm.snapshot",
+            "mem_backend": {
+                "backend_path": mem_backend_path,
+                "backend_type": "File",
+            },
+            "track_dirty_pages": True,
+            "resume_vm": True,
+        })
+        dt = time.monotonic() - t0
+    except Exception:
+        _stop_vmm(
+            sid,
+            {"pid": pid, "runtime_unit": runtime_unit},
+        )
+        if tap:
+            _teardown_tap(tap)
+        raise
 
     # ---- P0: merged 转正为新 base(多代接力 + 存储减半)----
     # FC 语义(官方文档):load 时重置脏页位图 → resume 后的 Diff 基准 = 本次 load 的完整内存镜像。
     # 因此 merged 必须成为下一轮 Diff 的 base。同时旧 base/diff 作废,删除以省空间。
     # ⚠️ merged 正被 FC mmap 当运行内存,不能删/不能动它的 inode → 用 os.replace 原子改名(inode 不变)。
-    if mem_backend_path.endswith("vm.mem.merged"):
+    if inplace_image:
+        try:
+            # 与 merged 同理:完整镜像转正为下一代 base(inode 不变,mmap 不受影响)
+            os.replace(diff_mem, base_mem)
+            mem_backend_path = base_mem
+            os.remove(f"{snap_dir}/{_INPLACE_MARKER}")
+        except OSError:
+            pass
+    elif mem_backend_path.endswith("vm.mem.merged"):
         try:
             # 删旧 diff(已并入 merged)
             if os.path.exists(diff_mem):
@@ -1218,16 +2144,25 @@ def op_resume(body: dict) -> dict:
         except OSError:
             pass
 
-    with _LOCK:
-        _VMS[sid] = {
-            "state":   "running",
-            "pid":     proc.pid,
-            "sock":    sock,
-            "tap":     tap,
-            "tap_idx": tap_idx,
-            "ip":      guest_ip,
-            "dir":     d,
-        }
+    resumed_vm = {
+        "state":   "running",
+        "pid":     pid,
+        "sock":    sock,
+        "tap":     tap,
+        "tap_idx": tap_idx,
+        "ip":      guest_ip,
+        "dir":     d,
+        "runtime_unit": runtime_unit,
+    }
+    try:
+        _register_resumed_vm(sid, resumed_vm, snap_dir)
+    except Exception:
+        with _LOCK:
+            if _VMS.get(sid) is resumed_vm:
+                _VMS.pop(sid, None)
+        _stop_vmm(sid, resumed_vm)
+        _teardown_tap(tap)
+        raise
 
     # ---- P1: resume 后经 vsock 加速 guest 网络收敛 ----
     # 跨机 resume 后,guest 内存快照固化了旧宿主 tap 的网关 MAC(stale ARP)。
@@ -1363,7 +2298,21 @@ def op_health() -> dict:
     mem = _free_mem_mib()
     with _LOCK:
         count = len(_VMS)
-    return {"node_id": NODE_ID, "free_mem_mib": mem, "vm_count": count}
+        draining = bool(_RECLAIM_STATE.get("detected"))
+    recovery_role, recovery_group, _ = _node_recovery_identity()
+    state_volume_id = _state_volume_id()
+    return {
+        "node_id": NODE_ID,
+        "free_mem_mib": mem,
+        "vm_count": count,
+        "pool": _detect_pool(),
+        "draining": draining,
+        "recovery_role": _effective_recovery_role(recovery_role),
+        "recovery_group": recovery_group,
+        "instance_id": _instance_id(),
+        "availability_zone": _availability_zone(),
+        "state_volume_id": state_volume_id,
+    }
 
 
 def _scratch_bytes() -> tuple[int, int]:
@@ -1399,6 +2348,22 @@ def health_report(require_dependencies: bool) -> tuple[int, dict]:
     if require_dependencies:
         checks["kvm"] = os.path.exists("/dev/kvm")
         checks["firecracker"] = os.path.isfile(FC_BIN) and os.access(FC_BIN, os.X_OK)
+        if VMM_LAUNCH_MODE == "host-systemd":
+            checks["host_nsenter"] = (
+                os.path.isfile(HOST_NSENTER)
+                and os.access(HOST_NSENTER, os.X_OK)
+            )
+            try:
+                host_runtime = _host_control(
+                    HOST_VMM_CTL, ["check"], timeout=3
+                )
+                checks["host_runtime"] = bool(host_runtime.get("ok"))
+            except Exception:
+                checks["host_runtime"] = False
+        else:
+            checks["host_nsenter"] = True
+            checks["host_runtime"] = not VMM_USE_JAILER
+        checks["node_agent_auth"] = _AUTH.configured
         checks["state_path"] = os.path.isdir(SBX_BASE) and os.access(SBX_BASE, os.W_OK)
         heartbeat_age = (
             time.monotonic() - _HEARTBEAT_LAST_SUCCESS
@@ -1415,6 +2380,9 @@ def health_report(require_dependencies: bool) -> tuple[int, dict]:
         healthy = healthy and all((
             checks["kvm"],
             checks["firecracker"],
+            checks["host_nsenter"],
+            checks["host_runtime"],
+            checks["node_agent_auth"],
             checks["state_path"],
             heartbeat_ok,
         ))
@@ -1462,23 +2430,70 @@ def _heartbeat_once() -> None:
     只保证装了 awscli,容器里 python3 版本可能与 boto3 安装目标不一致(实测踩坑)。
     """
     global _HEARTBEAT_LAST_SUCCESS
-    from datetime import datetime, timezone
     with _LOCK:
         vm_count = len(_VMS)
-    item = {
-        "node_id":      {"S": NODE_ID},
-        "ip":           {"S": _advertise_ip()},
-        "free_mem_mib": {"N": str(_free_mem_mib())},
-        "vm_count":     {"N": str(vm_count)},
-        "last_seen":    {"S": datetime.now(timezone.utc).isoformat()},
+        draining = bool(_RECLAIM_STATE.get("detected"))
+        reclaim_phase = str(
+            (_RECLAIM_STATE.get("plan") or {}).get("phase", "")
+        )
+        reclaim_session_id = str(
+            (_RECLAIM_STATE.get("plan") or {}).get("session_id", "")
+        )
+    configured_role, recovery_group, identity_resolved = (
+        _node_recovery_identity()
+    )
+    if not identity_resolved:
+        raise RuntimeError(
+            f"cannot resolve recovery identity for Kubernetes node {NODE_ID}"
+        )
+    state_volume_id = _state_volume_id()
+    # 用 UpdateItem 而不是 PutItem：恢复控制器会在同一节点记录上原子写入
+    # recovery_claim_id。心跳必须保留该字段，不能每 30 秒整条覆盖掉。
+    names = {
+        "#ip": "ip",
+        "#free": "free_mem_mib",
+        "#vms": "vm_count",
+        "#seen": "last_seen",
+        "#pool": "pool",
+        "#iid": "instance_id",
+        "#az": "availability_zone",
+        "#vol": "state_volume_id",
+        "#role": "recovery_role",
+        "#recovery_group": "recovery_group",
+        "#draining": "draining",
+        "#phase": "reclaim_phase",
+        "#session": "reclaim_session_id",
+    }
+    values = {
+        ":ip": {"S": _advertise_ip()},
+        ":free": {"N": str(_free_mem_mib())},
+        ":vms": {"N": str(vm_count)},
+        ":seen": {"S": datetime.now(timezone.utc).isoformat()},
         # M2:节点池归属(spot / protected),控制面据此做放置决策。
-        "pool":         {"S": _detect_pool()},
+        ":pool": {"S": _detect_pool()},
+        ":iid": {"S": _instance_id()},
+        ":az": {"S": _availability_zone()},
+        ":vol": {"S": state_volume_id},
+        ":role": {"S": _effective_recovery_role(configured_role)},
+        ":recovery_group": {"S": recovery_group},
+        ":draining": {"BOOL": draining},
+        ":phase": {"S": reclaim_phase},
+        ":session": {"S": reclaim_session_id},
     }
     subprocess.run(
-        ["aws", "dynamodb", "put-item",
+        ["aws", "dynamodb", "update-item",
          "--table-name", NODES_TABLE,
          "--region", AWS_REGION,
-         "--item", json.dumps(item)],
+         "--key", json.dumps({"node_id": {"S": NODE_ID}}),
+         "--update-expression",
+         (
+             "SET #ip=:ip, #free=:free, #vms=:vms, #seen=:seen, "
+             "#pool=:pool, #iid=:iid, #az=:az, #vol=:vol, #role=:role, "
+             "#recovery_group=:recovery_group, #draining=:draining, "
+             "#phase=:phase, #session=:session"
+         ),
+         "--expression-attribute-names", json.dumps(names),
+         "--expression-attribute-values", json.dumps(values)],
         check=True, capture_output=True, text=True,
     )
     _HEARTBEAT_LAST_SUCCESS = time.monotonic()
@@ -1510,6 +2525,19 @@ def start_heartbeat_loop() -> None:
 
 # ---------- 启动自恢复(P0-1:重建 _VMS,防重启后状态漂移) ----------
 
+def _recovered_owned_dirs(sandbox_dir: str) -> list[str]:
+    """Infer warm-source ownership from the recovered vsock symlink."""
+    owned = {_managed_sandbox_dir(sandbox_dir)}
+    vsock = os.path.join(sandbox_dir, "v.sock")
+    if os.path.islink(vsock):
+        source_dir = _managed_sandbox_dir(
+            os.path.dirname(os.path.realpath(vsock))
+        )
+        if source_dir:
+            owned.add(source_dir)
+    return sorted(path for path in owned if path)
+
+
 def _recover_vms() -> int:
     """
     启动时扫 SBX_BASE 下各沙盒目录,对仍有存活 FC api socket 的重建 _VMS。
@@ -1519,12 +2547,22 @@ def _recover_vms() -> int:
     if not os.path.isdir(SBX_BASE):
         return 0
     for sid in os.listdir(SBX_BASE):
+        if not _VMM_ID_RE.fullmatch(sid):
+            continue
         d = f"{SBX_BASE}/{sid}"
         if not os.path.isdir(d):
             continue
+        metadata = _load_runtime_metadata(sid)
+        runtime = _runtime_status(sid)
+        socket_candidates = [
+            f"{d}/api.sock",
+            f"{d}/api-resume.sock",
+        ]
+        runtime_socket = str(runtime.get("socket", ""))
+        if runtime_socket and runtime_socket not in socket_candidates:
+            socket_candidates.insert(0, runtime_socket)
         # create 用 api.sock,resume 用 api-resume.sock —— 依次探测
-        for sock_name in ("api.sock", "api-resume.sock"):
-            sock = f"{d}/{sock_name}"
+        for sock in socket_candidates:
             if not os.path.exists(sock):
                 continue
             if not _wait_sock(sock, timeout=1.0):
@@ -1535,24 +2573,51 @@ def _recover_vms() -> int:
                 state = "running" if info.get("state") == "Running" else "paused"
             except Exception:
                 state = "running"  # 探不到状态但 socket 通,保守当 running
+            recovered_pid = (
+                int(runtime.get("pid", 0) or 0)
+                or _legacy_vmm_pid(sock)
+            )
+            socket_name = os.path.basename(sock)
+            if socket_name in {"api.sock", "api-resume.sock"}:
+                _link_runtime_socket(sid, socket_name, sock)
             with _LOCK:
                 _VMS[sid] = {
                     "state": state,
-                    "pid":   None,   # 重启后无法拿回原 pid(destroy 会尽力 kill)
+                    "pid":   recovered_pid,
                     "sock":  sock,
-                    "tap":   f"fctap{_tap_idx_guess(sid)}",
-                    "ip":    "",
+                    # Never guess another VM's tap after restart. New
+                    # host-systemd runtimes always persist these fields; a
+                    # legacy/corrupt record leaves them empty so destroy may
+                    # leak one tap but cannot delete a neighbour's interface.
+                    "tap": str(metadata.get("tap", "")),
+                    "tap_idx": int(metadata.get("tap_idx", 0) or 0),
+                    "ip": str(metadata.get("ip", "")),
                     "dir":   d,
+                    "runtime_unit": (
+                        str(runtime.get("unit", ""))
+                        if runtime.get("active") else ""
+                    ),
+                    # Warm-claimed VMs keep a symlink to the snapshot source
+                    # vsock. Recover that source directory so a later destroy
+                    # still removes all locally-owned state after restart.
+                    "owned_dirs": sorted(set(
+                        _recovered_owned_dirs(d)
+                        + [
+                            managed
+                            for path in metadata.get(
+                                "owned_dirs", []
+                            )
+                            if (
+                                managed := _managed_sandbox_dir(
+                                    str(path)
+                                )
+                            )
+                        ]
+                    )),
                 }
             recovered += 1
             break
     return recovered
-
-
-def _tap_idx_guess(sid: str) -> int:
-    """无内存态时无法精确知道 tap_idx;返回 1 占位(仅用于 destroy 尽力 teardown)。"""
-    return 1
-
 
 # ---------- Spot 回收信号监听 → 疏散(Block 1) ----------
 
@@ -1583,6 +2648,377 @@ def _imds_get(path: str, token: str | None) -> tuple[int, str]:
         return e.code, ""      # 正常无信号时 spot/instance-action 返回 404
     except Exception:
         return 0, ""           # IMDS 不可达(本地/非 EC2)
+
+
+def _metadata_value(path: str) -> str:
+    token = _imds_token()
+    status, body = _imds_get(path, token)
+    return (body or "").strip() if status == 200 else ""
+
+
+def _instance_id() -> str:
+    global _INSTANCE_ID_CACHE
+    if not _INSTANCE_ID_CACHE:
+        _INSTANCE_ID_CACHE = _metadata_value(
+            "/latest/meta-data/instance-id"
+        )
+    return _INSTANCE_ID_CACHE
+
+
+def _availability_zone() -> str:
+    global _AZ_CACHE
+    if not _AZ_CACHE:
+        _AZ_CACHE = _metadata_value(
+            "/latest/meta-data/placement/availability-zone"
+        )
+    return _AZ_CACHE
+
+
+def _normalize_volume_id(raw: str) -> str:
+    value = (raw or "").strip().lower().replace(" ", "")
+    if not value:
+        return ""
+    if value.startswith("vol-"):
+        return value
+    if value.startswith("vol") and len(value) > 3:
+        return f"vol-{value[3:]}"
+    return ""
+
+
+def _fetch_node_object() -> dict:
+    """Read this pod's Kubernetes Node object through the in-cluster API."""
+    host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+    port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+    if not host or not NODE_ID:
+        raise RuntimeError("Kubernetes service address or NODE_ID is missing")
+    token_path = os.path.join(K8S_SERVICE_ACCOUNT_DIR, "token")
+    ca_path = os.path.join(K8S_SERVICE_ACCOUNT_DIR, "ca.crt")
+    with open(token_path, encoding="utf-8") as token_file:
+        token = token_file.read().strip()
+    request = urllib.request.Request(
+        f"https://{host}:{port}/api/v1/nodes/{quote(NODE_ID, safe='')}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    context = ssl.create_default_context(cafile=ca_path)
+    with urllib.request.urlopen(
+        request, timeout=2, context=context
+    ) as response:
+        payload = json.loads(response.read().decode())
+    if not isinstance(payload, dict):
+        raise RuntimeError("Kubernetes Node response is not an object")
+    return payload
+
+
+def _fetch_node_labels() -> dict[str, str]:
+    """Read this pod's Kubernetes Node labels through the in-cluster API."""
+    payload = _fetch_node_object()
+    labels = payload.get("metadata", {}).get("labels", {})
+    return {
+        str(key): str(value)
+        for key, value in labels.items()
+    }
+
+
+def _node_recovery_identity(
+    force: bool = False,
+) -> tuple[str, str, bool]:
+    """Resolve role/group from Node labels, retaining the last good result.
+
+    Downward API metadata.labels refers to Pod labels, not Node labels. A
+    failed first lookup is therefore reported as unresolved instead of
+    guessing that a root-only standby is active.
+    """
+    now = time.monotonic()
+    with _NODE_RECOVERY_IDENTITY_LOCK:
+        cached = dict(_NODE_RECOVERY_IDENTITY_CACHE)
+    if (
+        not force
+        and bool(cached.get("resolved"))
+        and now - float(cached.get("fetched_at", 0.0))
+        < NODE_LABEL_REFRESH_S
+    ):
+        return (
+            str(cached.get("role", "")),
+            str(cached.get("group", "")),
+            True,
+        )
+    try:
+        labels = _fetch_node_labels()
+        role = (
+            labels.get("sandbox.memorion.ai/recovery-role")
+            or NODE_RECOVERY_ROLE
+            or "active"
+        ).strip().lower()
+        if role not in {"active", "standby"}:
+            raise RuntimeError(f"invalid recovery role label: {role!r}")
+        group = (
+            labels.get("sandbox.memorion.ai/recovery-group")
+            or NODE_RECOVERY_GROUP
+        ).strip()
+        resolved = {
+            "role": role,
+            "group": group,
+            "resolved": True,
+            "fetched_at": now,
+        }
+        with _NODE_RECOVERY_IDENTITY_LOCK:
+            _NODE_RECOVERY_IDENTITY_CACHE.update(resolved)
+        return role, group, True
+    except Exception:
+        if bool(cached.get("resolved")):
+            return (
+                str(cached.get("role", "")),
+                str(cached.get("group", "")),
+                True,
+            )
+        if NODE_RECOVERY_ROLE in {"active", "standby"}:
+            return NODE_RECOVERY_ROLE, NODE_RECOVERY_GROUP, True
+        return "unknown", "", False
+
+
+def _configured_recovery_role() -> str:
+    role, _, _ = _node_recovery_identity()
+    return role
+
+
+def _findmnt_field(target: str, field: str) -> str:
+    try:
+        return subprocess.run(
+            ["findmnt", "-n", "-o", field, "--target", target],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _state_volume_device(volume_id: str = "") -> str:
+    """Return the local NVMe device backing the state volume.
+
+    Nitro exposes EBS volumes as NVMe devices and the requested /dev/sdf name
+    is not stable. Match by EBS serial first; otherwise inspect the mounted
+    filesystem. ``/opt/sbx`` is a hostPath on the host root filesystem, so its
+    device identity is a stable baseline: an empty standby has the same
+    MAJ:MIN for ``/var/lib/sbx`` and ``/opt/sbx``; a recovered standby has a
+    distinct state-EBS MAJ:MIN even after the node-agent Pod restarts.
+    """
+    target = _normalize_volume_id(volume_id)
+    if target:
+        compact = target.replace("-", "")
+        wanted = {
+            f"nvme-Amazon_Elastic_Block_Store_{compact}",
+            f"nvme-Amazon_Elastic_Block_Store_{target}",
+        }
+        # 只用目录里真实存在的条目名拼路径,不把请求里的 volume_id 拼进文件系统路径
+        by_id = "/dev/disk/by-id"
+        try:
+            entries = sorted(os.listdir(by_id))
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry in wanted:
+                return os.path.realpath(os.path.join(by_id, entry))
+        try:
+            out = subprocess.run(
+                ["lsblk", "-ndo", "PATH,SERIAL"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and _normalize_volume_id(parts[-1]) == target:
+                    return parts[0]
+        except Exception:
+            return ""
+
+    source = _findmnt_field(SBX_BASE, "SOURCE")
+    state_device_id = _findmnt_field(SBX_BASE, "MAJ:MIN")
+    root_device_id = _findmnt_field(ROOTFS_DIR, "MAJ:MIN")
+    if (
+        not source.startswith("/dev/")
+        or not state_device_id
+        or not root_device_id
+        or state_device_id == root_device_id
+    ):
+        return ""
+    # Bind-mounted root paths can be rendered as
+    # /dev/nvme0n1p1[/var/lib/sbx]. Strip the optional bind suffix before
+    # resolving the device path.
+    return os.path.realpath(source.split("[", 1)[0])
+
+
+def _state_volume_id() -> str:
+    global _STATE_VOLUME_CACHE
+    if STATE_VOLUME_ID_OVERRIDE:
+        return _normalize_volume_id(STATE_VOLUME_ID_OVERRIDE)
+    if _STATE_VOLUME_CACHE:
+        return _STATE_VOLUME_CACHE
+    device = _state_volume_device()
+    if not device:
+        return ""
+    try:
+        serial = subprocess.run(
+            ["lsblk", "-ndo", "SERIAL", device],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _STATE_VOLUME_CACHE = _normalize_volume_id(serial)
+    except Exception:
+        _STATE_VOLUME_CACHE = ""
+    return _STATE_VOLUME_CACHE
+
+
+def _effective_recovery_role(configured: str) -> str:
+    # A standby becomes an active recovery node as soon as a state EBS is
+    # mounted. The Kubernetes label can stay immutable; heartbeat reflects the
+    # real role used for placement and atomic standby claiming.
+    attached_state_volume = (
+        _normalize_volume_id(STATE_VOLUME_ID_OVERRIDE)
+        or _STATE_VOLUME_CACHE
+    )
+    if configured == "standby" and attached_state_volume:
+        return "active"
+    return configured
+
+
+def _recovery_role() -> str:
+    _state_volume_id()
+    return _effective_recovery_role(_configured_recovery_role())
+
+
+def op_recovery_mount(body: dict) -> dict:
+    """Mount an attached, pre-existing state EBS on a warm standby.
+
+    EC2 attachment is performed by the control-plane IRSA role. This privileged
+    hostNetwork/hostPID DaemonSet only discovers the Nitro NVMe device by EBS
+    serial and mounts it at the canonical path required by Firecracker
+    snapshots. mountPropagation=Bidirectional makes the host see the mount.
+    """
+    global _STATE_VOLUME_CACHE
+    volume_id = _normalize_volume_id(str(body.get("volume_id", "")))
+    if not volume_id:
+        raise ValueError("volume_id is required")
+    with _LOCK:
+        resident = sorted(_VMS)
+    if resident:
+        raise RuntimeError(
+            "standby has resident sandboxes and cannot take over volume: "
+            f"{resident}"
+        )
+
+    timeout_s = max(1, min(180, int(body.get("timeout_s", 90))))
+    deadline = time.monotonic() + timeout_s
+    device = ""
+    while time.monotonic() < deadline:
+        device = _state_volume_device(volume_id)
+        if device:
+            break
+        time.sleep(1)  # nosemgrep: arbitrary-sleep -- wait Nitro device attach
+    if not device:
+        raise TimeoutError(f"attached device for {volume_id} not found")
+
+    try:
+        mounted_source = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", SBX_BASE],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except Exception:
+        mounted_source = ""
+    if mounted_source and os.path.realpath(mounted_source) == os.path.realpath(device):
+        _STATE_VOLUME_CACHE = volume_id
+        return {
+            "mounted": True,
+            "already_mounted": True,
+            "volume_id": volume_id,
+            "device": device,
+            "sandbox_dirs": sorted(os.listdir(SBX_BASE)),
+        }
+
+    os.makedirs(SBX_BASE, exist_ok=True)
+    subprocess.run(["sync"], check=False)
+    # Production asks host systemd to own the mount, so it survives Pod and
+    # mount-namespace replacement and is correct after a host reboot.
+    if VMM_LAUNCH_MODE == "host-systemd":
+        _host_control(
+            HOST_STATE_CTL,
+            ["mount", "--device", device],
+            timeout=30,
+        )
+    else:
+        # Local/test compatibility path.
+        subprocess.run(
+            ["mount", "-t", "xfs", "-o", "noatime,nouuid", device, SBX_BASE],
+            check=True, capture_output=True, text=True,
+        )
+    subprocess.run(["sync"], check=False)
+    _STATE_VOLUME_CACHE = volume_id
+    return {
+        "mounted": True,
+        "already_mounted": False,
+        "volume_id": volume_id,
+        "device": device,
+        "sandbox_dirs": sorted(os.listdir(SBX_BASE)),
+    }
+
+
+def op_recovery_unmount(body: dict) -> dict:
+    """Quiesce and unmount the current state EBS for a controlled handoff."""
+    global _STATE_VOLUME_CACHE
+    requested_volume = _normalize_volume_id(
+        str(body.get("volume_id", ""))
+    )
+    current_volume = _state_volume_id()
+    if requested_volume and current_volume and requested_volume != current_volume:
+        raise RuntimeError(
+            f"mounted state volume is {current_volume}, not {requested_volume}"
+        )
+
+    with _LOCK:
+        running = sorted(
+            sid for sid, vm in _VMS.items()
+            if vm.get("state") not in {"suspended", "stopped"}
+        )
+    if running:
+        raise RuntimeError(
+            "state volume still has running sandboxes: "
+            f"{running}"
+        )
+    if not current_volume:
+        return {
+            "unmounted": True,
+            "already_unmounted": True,
+            "volume_id": requested_volume,
+        }
+
+    device = _state_volume_device(current_volume)
+    if not device:
+        raise RuntimeError(
+            f"device for mounted state volume {current_volume} not found"
+        )
+    subprocess.run(["sync"], check=False)
+    if VMM_LAUNCH_MODE == "host-systemd":
+        result = _host_control(
+            HOST_STATE_CTL,
+            ["unmount", "--device", device],
+            timeout=30,
+        )
+    else:
+        subprocess.run(
+            ["umount", SBX_BASE],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = {"unmounted": True, "already_unmounted": False}
+    with _LOCK:
+        # Suspended entries have no VMM process and their durable state is now
+        # moving with the EBS. They will be reconstructed on the target.
+        _VMS.clear()
+    _STATE_VOLUME_CACHE = ""
+    return {
+        **result,
+        "volume_id": current_volume,
+        "device": device,
+    }
 
 
 # ---------- 节点池归属(M2:受保护池 / 抢占池分离)----------
@@ -1648,6 +3084,286 @@ def _local_running_vms() -> list[str]:
         return [sid for sid, vm in _VMS.items() if vm.get("state") == "running"]
 
 
+def _has_local_sandbox_state() -> bool:
+    """Return whether the state EBS contains any managed sandbox directory."""
+    try:
+        return any(
+            entry.is_dir(follow_symlinks=False)
+            and _VMM_ID_RE.fullmatch(entry.name)
+            and _managed_sandbox_dir(entry.path)
+            for entry in os.scandir(SBX_BASE)
+        )
+    except OSError:
+        return False
+
+
+def _dynamodb_attr(value) -> dict:
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, (int, float)):
+        return {"N": str(value)}
+    return {"S": str(value)}
+
+
+def _update_sandbox_recovery(sid: str, fields: dict) -> tuple[bool, str]:
+    """Best-effort durable progress journal for the 120s reclaim path.
+
+    Snapshot persistence must continue even if DynamoDB is briefly
+    unavailable, so callers record the error but never fail the local
+    checkpoint solely because the journal write failed.
+    """
+    if not SANDBOXES_TABLE:
+        return False, "DYNAMODB_TABLE is empty"
+    names = {"#id": "id"}
+    values: dict[str, dict] = {}
+    sets: list[str] = []
+    for idx, (key, value) in enumerate(fields.items()):
+        name = f"#f{idx}"
+        token = f":v{idx}"
+        names[name] = key
+        values[token] = _dynamodb_attr(value)
+        sets.append(f"{name}={token}")
+    try:
+        subprocess.run(
+            [
+                "aws", "dynamodb", "update-item",
+                "--table-name", SANDBOXES_TABLE,
+                "--region", AWS_REGION,
+                "--key", json.dumps({"id": {"S": sid}}),
+                "--update-expression", "SET " + ", ".join(sets),
+                "--condition-expression", "attribute_exists(#id)",
+                "--expression-attribute-names", json.dumps(names),
+                "--expression-attribute-values", json.dumps(values),
+            ],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:512]
+
+
+def _signal_deadline(signal: dict) -> tuple[datetime, datetime]:
+    """Return (termination_deadline, checkpoint_deadline).
+
+    EC2 interruption notices normally include the future termination time.
+    Rebalance recommendations and local simulations may not, so those receive
+    the configured 120-second budget from detection.
+    """
+    now = datetime.now(timezone.utc)
+    termination = now + timedelta(seconds=RECLAIM_BUDGET_S)
+    raw = str(signal.get("time", "")).strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            # Ignore stale injection timestamps and implausibly distant times.
+            if now + timedelta(seconds=5) < parsed < now + timedelta(hours=1):
+                termination = parsed
+        except ValueError:
+            pass
+    checkpoint = termination - timedelta(seconds=RECLAIM_COMMIT_RESERVE_S)
+    return termination, max(checkpoint, now + timedelta(seconds=1))
+
+
+def _preserve_state_volume() -> dict:
+    """Make the state EBS survive this instance's imminent termination.
+
+    State disks are normally DeleteOnTermination=true so failed bootstrap and
+    ordinary unhealthy-node replacement cannot leak expensive orphan volumes.
+    The Spot critical path flips only the current state attachment to false
+    before checkpoint I/O starts, then verifies the EC2 attachment setting.
+    """
+    instance_id = _instance_id()
+    volume_id = _state_volume_id()
+    if not instance_id or not volume_id:
+        raise RuntimeError(
+            "cannot preserve state volume without instance_id and volume_id"
+        )
+
+    described = subprocess.run(
+        [
+            "aws", "ec2", "describe-volumes",
+            "--region", AWS_REGION,
+            "--volume-ids", volume_id,
+            "--output", "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(described.stdout or "{}")
+    attachments = (
+        (payload.get("Volumes") or [{}])[0].get("Attachments") or []
+    )
+    attachment = next(
+        (
+            item for item in attachments
+            if item.get("InstanceId") == instance_id
+        ),
+        None,
+    )
+    if not attachment or not attachment.get("Device"):
+        raise RuntimeError(
+            f"{volume_id} is not attached to {instance_id}"
+        )
+    device = str(attachment["Device"])
+    subprocess.run(
+        [
+            "aws", "ec2", "modify-instance-attribute",
+            "--region", AWS_REGION,
+            "--instance-id", instance_id,
+            "--block-device-mappings",
+            json.dumps([{
+                "DeviceName": device,
+                "Ebs": {"DeleteOnTermination": False},
+            }]),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    verified = subprocess.run(
+        [
+            "aws", "ec2", "describe-instances",
+            "--region", AWS_REGION,
+            "--instance-ids", instance_id,
+            "--output", "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    instances = [
+        item
+        for reservation in (
+            json.loads(verified.stdout or "{}").get("Reservations") or []
+        )
+        for item in reservation.get("Instances") or []
+    ]
+    mappings = instances[0].get("BlockDeviceMappings") if instances else []
+    mapping = next(
+        (
+            item for item in mappings or []
+            if item.get("Ebs", {}).get("VolumeId") == volume_id
+        ),
+        None,
+    )
+    if (
+        not mapping
+        or mapping.get("Ebs", {}).get("DeleteOnTermination") is not False
+    ):
+        raise RuntimeError(
+            f"failed to verify DeleteOnTermination=false for {volume_id}"
+        )
+    return {
+        "preserved": True,
+        "instance_id": instance_id,
+        "volume_id": volume_id,
+        "device": device,
+    }
+
+
+def _checkpoint_one(
+    sid: str,
+    *,
+    session_id: str,
+    signal: dict,
+    termination_deadline: datetime,
+    checkpoint_deadline: datetime,
+    expected_count: int,
+    monotonic_deadline: float,
+) -> dict:
+    started = time.monotonic()
+    common = {
+        "recovery_session_id": session_id,
+        "recovery_source_node": NODE_ID,
+        "recovery_source_instance_id": _instance_id(),
+        "recovery_source_volume_id": _state_volume_id(),
+        "recovery_az": _availability_zone(),
+        "recovery_expected_count": expected_count,
+        "interruption_type": signal.get("type", "spot-termination"),
+        "interruption_detected_at": _now_iso(),
+        "recovery_deadline_at": termination_deadline.isoformat(),
+        "recovery_checkpoint_only": bool(
+            signal.get("checkpoint_only", False)
+        ),
+    }
+    journal_errors: list[str] = []
+    ok, error = _update_sandbox_recovery(
+        sid,
+        {
+            **common,
+            "state": "checkpointing",
+            "recovery_phase": "checkpointing",
+            "recovery_error": "",
+            "updated_at": _now_iso(),
+        },
+    )
+    if not ok:
+        journal_errors.append(error)
+
+    try:
+        remaining = monotonic_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("checkpoint deadline exhausted before start")
+        with _vm_operation_lock(sid):
+            info = op_suspend({
+                "id": sid,
+                "snapshot_local_path": f"{SBX_BASE}/{sid}/snap",
+                "snapshot_timeout_s": max(1, int(remaining)),
+                # Spot critical path is EBS-only. Cross-AZ S3 replication is
+                # asynchronous and must not consume the 120-second window.
+                "upload_s3": False,
+                "s3_prefix": "",
+            })
+        elapsed = time.monotonic() - started
+        completed_at = _now_iso()
+        fields = {
+            **common,
+            **info,
+            "state": "checkpointed",
+            "recovery_phase": "checkpointed",
+            "checkpoint_completed_at": completed_at,
+            "checkpoint_elapsed_s": round(elapsed, 3),
+            "updated_at": completed_at,
+        }
+        ok, error = _update_sandbox_recovery(sid, fields)
+        if not ok:
+            journal_errors.append(error)
+        return {
+            "id": sid,
+            "ok": True,
+            "elapsed_s": round(elapsed, 3),
+            "actual_bytes": int(info.get("mem_actual_bytes", 0) or 0),
+            "snapshot_type": info.get("snapshot_type", ""),
+            "journal_errors": journal_errors,
+        }
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        message = str(exc)[:1024]
+        ok, error = _update_sandbox_recovery(
+            sid,
+            {
+                **common,
+                "state": "recovery_failed",
+                "recovery_phase": "checkpoint_failed",
+                "recovery_error": message,
+                "checkpoint_elapsed_s": round(elapsed, 3),
+                "updated_at": _now_iso(),
+            },
+        )
+        if not ok:
+            journal_errors.append(error)
+        return {
+            "id": sid,
+            "ok": False,
+            "elapsed_s": round(elapsed, 3),
+            "error": message,
+            "journal_errors": journal_errors,
+        }
+
+
 def _evacuate_local(signal: dict) -> dict:
     """
     收到回收信号 → 疏散本节点所有 running 沙盒。
@@ -1658,11 +3374,35 @@ def _evacuate_local(signal: dict) -> dict:
     """
     import sys
     sids = _local_running_vms()
-    # 疏散耗时粗估:满载 ~1.3GB/个 Diff、单卷 1000MB/s,实测 50 个并发 ~80s。
+    session_id = uuid.uuid4().hex
+    termination_deadline, checkpoint_deadline = _signal_deadline(signal)
+    budget_s = max(
+        1.0,
+        (checkpoint_deadline - datetime.now(timezone.utc)).total_seconds(),
+    )
+    monotonic_deadline = time.monotonic() + budget_s
+    # 疏散耗时粗估:历史满载约 1.3GB/个 Diff；实际验收以结果中的
+    # total_actual_bytes / wall_clock 为准，不再把该估算当成功判据。
     est_s = round(len(sids) * 1.3 + 20, 1)
     mode  = "REAL" if RECLAIM_AUTO_EVACUATE else "DRY-RUN"
-    plan  = {"node": NODE_ID, "signal": signal, "count": len(sids),
-             "sandboxes": sids, "est_evac_s": est_s, "mode": mode}
+    plan  = {
+        "session_id": session_id,
+        "node": NODE_ID,
+        "instance_id": _instance_id(),
+        "availability_zone": _availability_zone(),
+        "state_volume_id": _state_volume_id(),
+        "signal": signal,
+        "count": len(sids),
+        "sandboxes": sids,
+        "est_evac_s": est_s,
+        "mode": mode,
+        "phase": "detected",
+        "termination_deadline": termination_deadline.isoformat(),
+        "checkpoint_deadline": checkpoint_deadline.isoformat(),
+        "snapshot_concurrency": min(
+            RECLAIM_SNAPSHOT_CONCURRENCY, max(1, len(sids))
+        ),
+    }
     _RECLAIM_STATE.update({"detected": True, "signal": signal,
                            "at": _now_iso(), "plan": plan})
     print(f"[reclaim] SIGNAL={signal.get('type')} → evacuate {len(sids)} sandboxes "
@@ -1672,18 +3412,160 @@ def _evacuate_local(signal: dict) -> dict:
         print("[reclaim] DRY-RUN: 不实际疏散。设 RECLAIM_AUTO_EVACUATE=1 开启真疏散。",
               file=sys.stderr, flush=True)
         return plan
-    # REAL 疏散:逐个打 Diff 快照(方案C 落持久 EBS)。批量并发由控制面侧限流更合适,
-    # 这里节点自救走串行/尽力而为,保证内存先落盘幸存。
-    ok = 0
-    for sid in sids:
+
+    checkpoint_only = bool(signal.get("checkpoint_only", False))
+    if not sids and not checkpoint_only and not _has_local_sandbox_state():
+        # An empty replacement/test node has no state worth retaining. Keep
+        # DeleteOnTermination=true so a no-work interruption cannot leak EBS.
+        plan.update({
+            "phase": "checkpointed",
+            "volume_preservation": {
+                "preserved": False,
+                "skipped": True,
+                "reason": "no local sandbox state",
+                "elapsed_s": 0.0,
+            },
+            "completed": 0,
+            "evacuated_ok": 0,
+            "failed": 0,
+            "wall_clock_s": 0.0,
+            "total_actual_bytes": 0,
+            "effective_write_mib_s": 0,
+            "results": [],
+        })
+        _RECLAIM_STATE["evacuated"] = True
+        return plan
+
+    preserve_started = time.monotonic()
+    if checkpoint_only:
+        plan["volume_preservation"] = {
+            "preserved": False,
+            "skipped": True,
+            "reason": "checkpoint-only benchmark",
+            "elapsed_s": 0.0,
+        }
+    else:
         try:
-            op_suspend({"id": sid, "snapshot_local_path": f"{SBX_BASE}/{sid}/snap"})
-            ok += 1
-        except Exception as e:
-            print(f"[reclaim] evacuate {sid} failed: {e}", file=sys.stderr, flush=True)
-    plan["evacuated_ok"] = ok
-    _RECLAIM_STATE["evacuated"] = True
-    print(f"[reclaim] REAL evacuation done: {ok}/{len(sids)}", file=sys.stderr, flush=True)
+            plan["volume_preservation"] = {
+                **_preserve_state_volume(),
+                "elapsed_s": round(
+                    time.monotonic() - preserve_started,
+                    3,
+                ),
+            }
+        except Exception as exc:
+            message = str(exc)[:1024]
+            plan["volume_preservation"] = {
+                "preserved": False,
+                "error": message,
+                "elapsed_s": round(
+                    time.monotonic() - preserve_started,
+                    3,
+                ),
+            }
+            print(
+                "[reclaim] failed to preserve state EBS before termination: "
+                f"{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results = []
+            for sid in sids:
+                journal_errors: list[str] = []
+                ok, error = _update_sandbox_recovery(
+                    sid,
+                    {
+                        "recovery_session_id": session_id,
+                        "recovery_source_node": NODE_ID,
+                        "recovery_source_instance_id": _instance_id(),
+                        "recovery_source_volume_id": _state_volume_id(),
+                        "recovery_az": _availability_zone(),
+                        "recovery_expected_count": len(sids),
+                        "interruption_type": signal.get(
+                            "type", "spot-termination"
+                        ),
+                        "interruption_detected_at": _now_iso(),
+                        "recovery_deadline_at": (
+                            termination_deadline.isoformat()
+                        ),
+                        "recovery_checkpoint_only": False,
+                        "state": "recovery_failed",
+                        "recovery_phase": "volume_preservation_failed",
+                        "recovery_error": message,
+                        "updated_at": _now_iso(),
+                    },
+                )
+                if not ok:
+                    journal_errors.append(error)
+                results.append({
+                    "id": sid,
+                    "ok": False,
+                    "error": message,
+                    "journal_errors": journal_errors,
+                })
+            plan.update({
+                "phase": "volume_preservation_failed",
+                "completed": len(results),
+                "evacuated_ok": 0,
+                "failed": len(results),
+                "wall_clock_s": 0.0,
+                "total_actual_bytes": 0,
+                "effective_write_mib_s": 0,
+                "results": results,
+            })
+            _RECLAIM_STATE["evacuated"] = False
+            return plan
+
+    # REAL 疏散:并发打 Diff 快照以吃满单卷/实例 EBS 带宽。并发度只改变
+    # 饱和速度，不能突破实例 EBS 上限；因此必须同时记录真实写入量和墙钟。
+    wall_started = time.monotonic()
+    plan["phase"] = "checkpointing"
+    results: list[dict] = []
+    workers = min(RECLAIM_SNAPSHOT_CONCURRENCY, max(1, len(sids)))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="reclaim-snapshot"
+    ) as executor:
+        futures = [
+            executor.submit(
+                _checkpoint_one,
+                sid,
+                session_id=session_id,
+                signal=signal,
+                termination_deadline=termination_deadline,
+                checkpoint_deadline=checkpoint_deadline,
+                expected_count=len(sids),
+                monotonic_deadline=monotonic_deadline,
+            )
+            for sid in sids
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            plan["completed"] = len(results)
+            plan["evacuated_ok"] = sum(1 for item in results if item["ok"])
+            plan["failed"] = len(results) - plan["evacuated_ok"]
+
+    wall_s = time.monotonic() - wall_started
+    ok = sum(1 for item in results if item["ok"])
+    total_actual = sum(int(item.get("actual_bytes", 0)) for item in results)
+    plan.update({
+        "phase": "checkpointed" if ok == len(sids) else "partial",
+        "evacuated_ok": ok,
+        "failed": len(sids) - ok,
+        "wall_clock_s": round(wall_s, 3),
+        "total_actual_bytes": total_actual,
+        "effective_write_mib_s": round(
+            total_actual / 1024 / 1024 / wall_s, 3
+        ) if wall_s > 0 else 0,
+        "results": sorted(results, key=lambda item: item["id"]),
+    })
+    _RECLAIM_STATE["evacuated"] = ok == len(sids)
+    print(
+        f"[reclaim] REAL evacuation done: {ok}/{len(sids)} "
+        f"wall={wall_s:.3f}s actual={total_actual}B",
+        file=sys.stderr,
+        flush=True,
+    )
     return plan
 
 
@@ -1810,6 +3692,7 @@ class Handler(BaseHTTPRequestHandler):
         self.path = None
         self._otel_span = None
         self._otel_token = None
+        self._cached_request_body = None
         try:
             super().handle_one_request()
         finally:
@@ -1996,7 +3879,11 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in resp.getheaders():
             if k.lower() in hop or k.lower() == "content-length":
                 continue
-            self.send_header(k, v)
+            # 上游是不可信的 guest:丢弃含 CR/LF 的头,防止响应头注入/拆分
+            if any(c in k or c in v for c in ("\r", "\n")):
+                continue
+            self.send_header(k.replace("\r", "").replace("\n", ""),
+                             v.replace("\r", "").replace("\n", ""))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2048,6 +3935,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/reclaim/status":
                 return self._send(200, _RECLAIM_STATE)
+            if path == "/recovery/status":
+                configured_role, recovery_group, _ = (
+                    _node_recovery_identity()
+                )
+                state_volume_id = _state_volume_id()
+                return self._send(200, {
+                    "node": NODE_ID,
+                    "instance_id": _instance_id(),
+                    "availability_zone": _availability_zone(),
+                    "recovery_role": _effective_recovery_role(
+                        configured_role
+                    ),
+                    "recovery_group": recovery_group,
+                    "state_volume_id": state_volume_id,
+                    "draining": bool(_RECLAIM_STATE.get("detected")),
+                })
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "vm":
                 return self._send(200, op_get(parts[1]))
@@ -2080,9 +3983,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/vm/") and body.get("id"):
                 sid = _sandbox_id(body.get("id"))
-                op_lock = _vm_op_lock(sid)
-                try:
-                    with op_lock:
+                with _vm_operation_lock(sid):
                         if path == "/vm/create":
                             return self._send(200, self._run_vm_operation(
                                 "create", lambda: op_create(body)))
@@ -2101,9 +4002,11 @@ class Handler(BaseHTTPRequestHandler):
                         if path == "/vm/exec":
                             return self._send(200, self._run_vm_operation(
                                 "exec", lambda: op_exec(body)))
-                finally:
-                    if path == "/vm/destroy":
-                        _drop_vm_op_lock(sid, op_lock)
+            # Spot 恢复:standby 节点接管/交还状态 EBS(控制面签名调用)。
+            if path == "/recovery/mount":
+                return self._send(200, op_recovery_mount(body))
+            if path == "/recovery/unmount":
+                return self._send(200, op_recovery_unmount(body))
             # Block 1 测试钩子:仅 NODE_AGENT_ENABLE_TEST_HOOKS=1 时启用,生产默认 404。
             if ENABLE_TEST_HOOKS and path == "/reclaim/simulate":
                 # 注入一个回收信号,立即算疏散计划(EKS 节点非 spot,用它验证链路)。
@@ -2189,6 +4092,11 @@ def _startup_security_checks() -> None:
 
 if __name__ == "__main__":
     _startup_security_checks()
+    # EKS AL2023 can schedule DaemonSet pods while cloud-init is still
+    # downloading rootfs assets. When cloud-init finishes, kubelet/containerd
+    # may recreate every pod sandbox. Do not register this node or accept
+    # Firecracker workloads until the host bootstrap is fully complete.
+    _wait_for_node_bootstrap()
 
     # 启动自恢复:重建残留 VM 的操作句柄,避免重启后状态漂移(P0-1)
     try:

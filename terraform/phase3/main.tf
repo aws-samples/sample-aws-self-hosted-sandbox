@@ -5,7 +5,7 @@
 #       控制面 / node-agent / LiteLLM 等集群内资源由 stage2-control-plane 部署,不归此处。
 #
 # 架构:由 node_arch 变量控制 —— arm64(Graviton c6g.metal,默认) 或
-#       amd64(Intel x86 i7i.8xlarge,显式开启 nested virtualization)。
+#       amd64(Intel x86 R8i/M8i/C8i/I7i,显式开启 nested virtualization)。
 #       terraform apply -var="node_arch=amd64"  # 切到 Intel x86
 #
 # ⚠️ 计费:EKS 控制平面 + 沙盒节点按小时计费。用完务必 destroy。
@@ -44,25 +44,38 @@ variable "cluster_name" {
 
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI、默认实例、Firecracker/内核下载架构以及是否开启嵌套虚拟化。"
+  default     = "amd64"
+  description = "节点 CPU 架构:amd64(Intel x86,默认,r8i.8xlarge) 或 arm64(Graviton c6g.metal)。决定 AMI、默认实例、Firecracker/内核下载架构以及是否开启嵌套虚拟化。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
   }
 }
 
+variable "firecracker_version" {
+  type        = string
+  default     = "v1.16.1"
+  description = "固定的 Firecracker/jailer release。宿主 helper 另会拒绝低于 v1.14.1 的版本，避免使用已知 jailer chroot 安全缺陷版本。"
+  validation {
+    condition     = can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.firecracker_version))
+    error_message = "firecracker_version 必须是 vMAJOR.MINOR.PATCH，例如 v1.16.1。"
+  }
+}
+
 variable "sandbox_instance_type" {
   type        = string
   default     = ""
-  description = "Firecracker 沙盒节点实例类型。留空时 arm64=c6g.metal,amd64=i7i.8xlarge；x86 可覆盖为任意 i7i 规格。"
+  description = "Firecracker 沙盒节点实例类型。留空时 arm64=c6g.metal,amd64=r8i.8xlarge；x86 支持启用 nested virtualization 的 R8i/M8i/C8i/I7i。"
   validation {
     condition = (
       var.sandbox_instance_type == "" ||
       (var.node_arch == "arm64" && var.sandbox_instance_type == "c6g.metal") ||
-      (var.node_arch == "amd64" && can(regex("^i7i\\.", var.sandbox_instance_type)))
+      (
+        var.node_arch == "amd64" &&
+        can(regex("^(r8i|m8i|c8i|i7i)\\.", var.sandbox_instance_type))
+      )
     )
-    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 i7i 系列（例如 i7i.8xlarge）。"
+    error_message = "arm64 当前仅支持 c6g.metal；amd64 实例必须属于 R8i/M8i/C8i/I7i 系列。"
   }
 }
 
@@ -117,6 +130,58 @@ variable "sandbox_az_index" {
   }
 }
 
+variable "sandbox_ebs_bandwidth_weighting" {
+  type        = string
+  default     = "default"
+  description = "实验项：支持该能力的 x86 实例使用的带宽权重。default 保持默认配比；ebs-1 在裸 EC2 有效，但 2026-09-02 实测 EKS Managed Node Group 最终实例仍为 default，生产必须检查实例实际值，不能只信 Terraform 配置。"
+  validation {
+    condition = contains(
+      ["default", "ebs-1"],
+      var.sandbox_ebs_bandwidth_weighting,
+    )
+    error_message = "sandbox_ebs_bandwidth_weighting 仅支持 default 或 ebs-1。"
+  }
+}
+
+variable "recovery_standby_enabled" {
+  type        = bool
+  default     = false
+  description = "是否创建同 AZ EBS 接管用的 On-Demand warm standby 节点组。默认关闭，避免改变现网成本。"
+}
+
+variable "recovery_standby_az_indices" {
+  type        = set(number)
+  default     = [0]
+  description = "需要保留 warm standby 的 AZ 索引集合。生产三 AZ 可设 [0,1,2]；必须覆盖所有 Spot 数据节点所在 AZ。"
+  validation {
+    condition = alltrue([
+      for index in var.recovery_standby_az_indices :
+      contains([0, 1, 2], index)
+    ])
+    error_message = "recovery_standby_az_indices 仅支持 0、1、2。"
+  }
+}
+
+variable "recovery_standby_count_per_az" {
+  type        = number
+  default     = 1
+  description = "每个目标 AZ 常驻的空闲恢复节点数。"
+  validation {
+    condition     = var.recovery_standby_count_per_az >= 1
+    error_message = "recovery_standby_count_per_az 至少为 1。"
+  }
+}
+
+variable "recovery_max_claimed_hosts_per_az" {
+  type        = number
+  default     = 4
+  description = "每个 standby 节点组允许同时承载的已接管主机数；为恢复后补充新 standby 预留 max_size。"
+  validation {
+    condition     = var.recovery_max_claimed_hosts_per_az >= 1
+    error_message = "recovery_max_claimed_hosts_per_az 至少为 1。"
+  }
+}
+
 locals {
   # 架构派生:AMI、默认实例、Firecracker/内核架构。
   arch_cfg = {
@@ -128,13 +193,26 @@ locals {
     }
     amd64 = {
       ami_type         = "AL2023_x86_64_STANDARD"
-      default_instance = "i7i.8xlarge"
+      default_instance = "r8i.8xlarge"
       fc_arch          = "x86_64"
       rootfs_key       = "rootfs/rootfs-juicefs-x86_64.tar.gz"
     }
   }
   node_arch_cfg         = local.arch_cfg[var.node_arch]
   sandbox_instance_type = var.sandbox_instance_type != "" ? var.sandbox_instance_type : local.node_arch_cfg.default_instance
+  sandbox_network_performance_options = (
+    var.node_arch == "amd64" &&
+    var.sandbox_ebs_bandwidth_weighting != "default"
+    ? {
+      bandwidth_weighting = var.sandbox_ebs_bandwidth_weighting
+    }
+    : null
+  )
+  recovery_standby_az_indices = (
+    var.recovery_standby_enabled
+    ? var.recovery_standby_az_indices
+    : toset([])
+  )
 }
 
 variable "endpoint_public_access_cidrs" {
@@ -163,19 +241,87 @@ variable "state_ebs_size_gb" {
   type        = number
   default     = 400
   description = "每节点持久状态 EBS 容量(GB)。resume 时每 sandbox 峰值需 base(2G)+merged(2G)≈4G,50 个约 200G,再加 diff/rootfs/余量 → 400G。"
+  validation {
+    condition = (
+      var.state_ebs_size_gb >= 1 &&
+      var.state_ebs_size_gb <= 65536
+    )
+    error_message = "state_ebs_size_gb 必须在 gp3 支持的 1..65536 GiB。"
+  }
 }
 variable "state_ebs_iops" {
   type        = number
-  default     = 4000
-  description = "状态 EBS 的 IOPS(gp3,1000MB/s 吞吐至少需 4000 IOPS)。"
+  default     = 40000
+  description = "状态 EBS 的 IOPS。gp3 支持 3000..80000；吞吐需满足 IOPS:MiB/s 至少 4:1。真机实测 4000 IOPS 时 Spot checkpoint 先撞卷 IOPS 上限(平均 I/O 约 227KiB);r8i.8xlarge 实例上限 40000,再高无收益。"
+  validation {
+    condition = (
+      var.state_ebs_iops >= 3000 &&
+      var.state_ebs_iops <= 80000
+    )
+    error_message = "state_ebs_iops 必须在 gp3 支持的 3000..80000。"
+  }
 }
 variable "state_ebs_throughput" {
   type        = number
-  default     = 1000
-  description = "状态 EBS 吞吐(MB/s)。1000=gp3 单卷上限,让 50 个 Diff 快照并发落盘 ~16s。"
+  default     = 2000
+  description = "状态 EBS 吞吐(MiB/s)。当前 gp3 支持 125..2000；2000 MiB/s 至少需要 8000 IOPS。r8i.8xlarge 实例级 EBS 上限 1250MB/s 才是实际天花板。"
+  validation {
+    condition = (
+      var.state_ebs_throughput >= 125 &&
+      var.state_ebs_throughput <= 2000 &&
+      var.state_ebs_throughput <= var.state_ebs_iops / 4
+    )
+    error_message = "state_ebs_throughput 必须在 125..2000 MiB/s，且不能超过 state_ebs_iops / 4。"
+  }
 }
 
 # ---------- VPC(EKS 专用,3 AZ) ----------
+variable "sandbox_zram_size_gib" {
+  type        = number
+  default     = 64
+  description = "沙盒节点 zram(zstd)压缩 swap 容量(GiB,按换入原始数据计),0 关闭。内存超分越过 sbx.slice 上限时冷页换入 zram 而不是 OOM 杀 VM;真机实测 19GiB 换出只占 0.81GB 物理内存,0 次 OOM,交互 p99 4ms→40ms。kubelet 相应设 failSwapOn=false(swapBehavior=NoSwap,Pod 不使用 swap)。"
+  validation {
+    condition     = var.sandbox_zram_size_gib >= 0 && var.sandbox_zram_size_gib <= 512
+    error_message = "sandbox_zram_size_gib 必须在 0..512。"
+  }
+}
+
+locals {
+  # zram 做成 systemd unit,重启后依然生效(user-data 只在首次启动执行)
+  sandbox_zram_script = <<-EOT
+    cat >/etc/systemd/system/sbx-zram.service <<'UNIT'
+    [Unit]
+    Description=Sandbox zram swap (zstd)
+    Before=kubelet.service
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/bash -c 'modprobe zram num_devices=1 && echo zstd > /sys/block/zram0/comp_algorithm && echo ${var.sandbox_zram_size_gib}G > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p 100 /dev/zram0 && sysctl -w vm.swappiness=100'
+    ExecStop=/bin/bash -c 'swapoff /dev/zram0 || true'
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
+    systemctl daemon-reload && systemctl enable --now sbx-zram.service || echo "[pre-bootstrap] zram setup failed (non-fatal)"
+  EOT
+  sandbox_zram_setup = var.sandbox_zram_size_gib > 0 ? local.sandbox_zram_script : ""
+  # nodeadm NodeConfig:允许宿主有 swap(zram),Pod 本身不使用 swap
+  sandbox_kubelet_swap_nodeconfig = <<-EOT
+      ---
+      apiVersion: node.eks.aws/v1alpha1
+      kind: NodeConfig
+      spec:
+        kubelet:
+          config:
+            failSwapOn: false
+            memorySwap:
+              swapBehavior: NoSwap
+  EOT
+  sandbox_kubelet_swap_part = var.sandbox_zram_size_gib > 0 ? [{
+    content_type = "application/node.eks.aws"
+    content      = local.sandbox_kubelet_swap_nodeconfig
+  }] : []
+}
+
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 6.0"
@@ -219,6 +365,16 @@ module "eks" {
     kube-proxy = {}
     vpc-cni = {
       before_compute = true
+      # 沙盒节点组钉在单 AZ 的一个 /24 子网(EBS 只能同 AZ 接管)。默认
+      # WARM_ENI_TARGET=1 让每台 r8i/m8i 节点各预占一整块 ENI(实测 50 个 IP),
+      # 7 台节点就把子网耗尽,节点组滚动报 InsufficientFreeAddressesInSubnet。
+      # 沙盒节点上几乎都是 hostNetwork Pod,只需保留少量 IP。
+      configuration_values = jsonencode({
+        env = {
+          WARM_IP_TARGET    = "2"
+          MINIMUM_IP_TARGET = "4"
+        }
+      })
     }
   }
 
@@ -234,7 +390,7 @@ module "eks" {
   # system 与 sandbox 数据面分组:
   # - system_arm64:固定 On-Demand Graviton，承载业务控制面和集群系统 Pod。
   # - sandbox_*:只承载 node-agent + Firecracker microVM，带 NoSchedule 污点。
-  eks_managed_node_groups = {
+  eks_managed_node_groups = merge({
     system_arm64 = {
       kubernetes_version = "1.31"
       ami_type           = "AL2023_ARM_64_STANDARD"
@@ -271,11 +427,14 @@ module "eks" {
       # M2:默认 ON_DEMAND(非破坏);设 var.sandbox_capacity_type=SPOT 让沙盒池变抢占实例。
       capacity_type = var.sandbox_capacity_type
 
-      # Intel i7i 是虚拟化实例，必须显式打开 Nitro nested virtualization 才会暴露 /dev/kvm。
+      # Intel R8i/M8i/C8i/I7i 虚拟实例必须显式打开 Nitro nested
+      # virtualization 才会暴露 /dev/kvm。
       # c6g.metal 直接使用宿主 KVM，不设置该选项。
       cpu_options = var.node_arch == "amd64" ? {
         nested_virtualization = "enabled"
       } : {}
+
+      network_performance_options = local.sandbox_network_performance_options
 
       # Firecracker 跨机快照演示需两台常驻(min=2);x86/arm64 由 node_arch 参数化。
       # 成本优先的单机 demo:降到 1 台(单机可测 create/exec/suspend/resume/destroy 全流程,
@@ -312,9 +471,9 @@ module "eks" {
             volume_type = "gp3"
           }
         }
-        # 方案C:独立【持久状态 EBS】挂 /var/lib/sbx —— 存所有 sandbox 的内存快照(base+diff)+ rootfs。
-        # 高吞吐 gp3(1000MB/s)让 50 个 Diff 快照并发落盘 ~16s。
-        # delete_on_termination=false → spot 强制终止后卷幸存,可 attach 到新机恢复(方案C核心)。
+        # 方案C:独立状态 EBS 挂 /var/lib/sbx,存快照与 rootfs。
+        # 默认随普通终止删除，避免 bootstrap/健康检查失败留下孤儿卷；收到
+        # Spot 回收信号后 node-agent 会在 checkpoint 前原子改成 false。
         sbxdata = {
           device_name = "/dev/sdf"
           ebs = {
@@ -322,7 +481,7 @@ module "eks" {
             volume_type           = "gp3"
             iops                  = var.state_ebs_iops
             throughput            = var.state_ebs_throughput
-            delete_on_termination = false
+            delete_on_termination = true
           }
         }
       }
@@ -330,7 +489,7 @@ module "eks" {
       # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本 MIME 分段,
       # 在 nodeadm 引导前执行(pre_bootstrap_user_data 是 AL2 时代机制,AL2023 会静默忽略)。
       # Firecracker + Redis + JuiceFS + rootfs 预装,不重启 containerd → 不触发节点替换循环。
-      cloudinit_pre_nodeadm = [{
+      cloudinit_pre_nodeadm = concat([{
         content_type = "text/x-shellscript; charset=\"us-ascii\""
         content      = <<-EOT
         #!/bin/bash
@@ -343,7 +502,8 @@ module "eks" {
         mkdir -p /opt/sbx /var/lib/sbx
 
         # 方案C:挂载【持久状态 EBS】到 /var/lib/sbx —— sandbox 快照(base+diff)+ rootfs 都落这块盘。
-        # 它 delete_on_termination=false,spot 终止后幸存,可 attach 到新机恢复。
+        # 正常情况下随实例删除；Spot checkpoint 开始时 node-agent 会先把
+        # 当前 attachment 改成 delete_on_termination=false。
         # 识别:只选择 Amazon EBS,避免 i7i 上把本地 NVMe instance store 误当状态盘格式化。
         # EBS NVMe 盘的 MODEL 为 "Amazon Elastic Block Store"。首次为空盘 → mkfs;
         # 已有文件系统(从旧节点迁移来的幸存卷)→ 直接挂,不格式化(否则抹掉数据!)。
@@ -397,14 +557,24 @@ module "eks" {
 
         # Firecracker (바이너리만, 빠름) —— 架构由 Terraform node_arch 注入
         ARCH=${local.node_arch_cfg.fc_arch}
-        VER=$(curl -sf https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest \
-          | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.16.0")
+        VER="${var.firecracker_version}"
         curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
           -o /tmp/fc.tgz 2>/dev/null && \
         tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
         mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
         chmod +x /usr/local/bin/firecracker && \
-        echo "[pre-bootstrap] Firecracker OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
+        chmod +x /usr/local/bin/firecracker-jailer && \
+        echo "[pre-bootstrap] Firecracker+jailer OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
+
+        # 宿主 helper 从 S3 拉取并按 sha256 校验(内嵌会让 user-data 逼近 16KB 上限)
+        for H in sbx-vmm-runtime sbx-state-volume; do
+          aws s3 cp "${local.host_helper_s3_prefix}/$H" "/usr/local/sbin/$H.new" --region ${var.region} --only-show-errors
+        done
+        printf '%s  %s\n' ${local.host_helper_sha256["sbx-vmm-runtime"]} /usr/local/sbin/sbx-vmm-runtime.new \
+          ${local.host_helper_sha256["sbx-state-volume"]} /usr/local/sbin/sbx-state-volume.new | sha256sum -c --quiet && \
+          for H in sbx-vmm-runtime sbx-state-volume; do mv /usr/local/sbin/$H.new /usr/local/sbin/$H; done
+        chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
         curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
@@ -461,16 +631,21 @@ module "eks" {
         iptables -C INPUT -i fctap+ -j SBX-GUEST-IN 2>/dev/null || iptables -I INPUT 1 -i fctap+ -j SBX-GUEST-IN || true
         iptables -C FORWARD -i fctap+ -j SBX-GUEST-FWD 2>/dev/null || iptables -I FORWARD 1 -i fctap+ -j SBX-GUEST-FWD || true
 
+        ${local.sandbox_zram_setup}
+        touch /opt/sbx/.bootstrap-complete
         echo "[pre-bootstrap] DONE $(date)"
       EOT
-      }]
+      }], local.sandbox_kubelet_swap_part)
 
-      # 本组只承载 node-agent + 裸 Firecracker microVM。NoSchedule 防止控制面、
+      # 本组只承载 node-agent + 宿主 systemd/jailer Firecracker microVM。NoSchedule 防止控制面、
       # CoreDNS、LiteLLM 等普通 Pod 在数据节点上落盘。
       labels = {
-        role            = "sandbox"
-        sandbox         = "true"
-        "workload-tier" = "data"
+        role                                    = "sandbox"
+        sandbox                                 = "true"
+        "workload-tier"                         = "data"
+        "sandbox.memorion.ai/recovery-role"     = "active"
+        "sandbox.memorion.ai/recovery-group"    = "${var.cluster_name}-recovery-${var.sandbox_az_index}"
+        "sandbox.memorion.ai/recovery-az-index" = tostring(var.sandbox_az_index)
       }
       taints = {
         dedicated_sandbox = {
@@ -480,7 +655,124 @@ module "eks" {
         }
       }
     }
-  }
+    }, {
+    for az_index in local.recovery_standby_az_indices :
+    "sandbox_standby_${az_index}" => {
+      name               = "${var.cluster_name}-recovery-${az_index}"
+      use_name_prefix    = false
+      kubernetes_version = "1.31"
+      ami_type           = local.node_arch_cfg.ami_type
+      instance_types     = [local.sandbox_instance_type]
+      capacity_type      = "ON_DEMAND"
+
+      cpu_options = var.node_arch == "amd64" ? {
+        nested_virtualization = "enabled"
+      } : {}
+
+      network_performance_options = local.sandbox_network_performance_options
+
+      min_size = var.recovery_standby_count_per_az
+      max_size = (
+        var.recovery_standby_count_per_az +
+        var.recovery_max_claimed_hosts_per_az
+      )
+      desired_size = var.recovery_standby_count_per_az
+      subnet_ids   = [module.vpc.public_subnets[az_index]]
+
+      iam_role_additional_policies = {
+        s3_readonly = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      }
+
+      # Standby 只有根盘；被认领后由恢复控制器把旧节点幸存的状态 EBS
+      # attach 过来，node-agent 再挂载到 /var/lib/sbx。
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size = 200
+            volume_type = "gp3"
+          }
+        }
+      }
+
+      cloudinit_pre_nodeadm = concat([{
+        content_type = "text/x-shellscript; charset=\"us-ascii\""
+        content      = <<-EOT
+        #!/bin/bash
+        set -u
+        exec >> /var/log/userdata-recovery-standby.log 2>&1
+        echo "[recovery-standby] START $(date)"
+
+        mkdir -p /opt/sbx /var/lib/sbx
+
+        ARCH=${local.node_arch_cfg.fc_arch}
+        VER="${var.firecracker_version}"
+        curl -sfL "https://github.com/firecracker-microvm/firecracker/releases/download/$${VER}/firecracker-$${VER}-$${ARCH}.tgz" \
+          -o /tmp/fc.tgz 2>/dev/null && \
+        tar -xzf /tmp/fc.tgz -C /tmp 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/firecracker-$${VER}-$${ARCH}" /usr/local/bin/firecracker 2>/dev/null && \
+        mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
+        chmod +x /usr/local/bin/firecracker /usr/local/bin/firecracker-jailer || true
+
+        # 宿主 helper 从 S3 拉取并按 sha256 校验(内嵌会让 user-data 逼近 16KB 上限)
+        for H in sbx-vmm-runtime sbx-state-volume; do
+          aws s3 cp "${local.host_helper_s3_prefix}/$H" "/usr/local/sbin/$H.new" --region ${var.region} --only-show-errors
+        done
+        printf '%s  %s\n' ${local.host_helper_sha256["sbx-vmm-runtime"]} /usr/local/sbin/sbx-vmm-runtime.new \
+          ${local.host_helper_sha256["sbx-state-volume"]} /usr/local/sbin/sbx-state-volume.new | sha256sum -c --quiet && \
+          for H in sbx-vmm-runtime sbx-state-volume; do mv /usr/local/sbin/$H.new /usr/local/sbin/$H; done
+        chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
+
+        curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
+          -o /opt/sbx/vmlinux 2>/dev/null || true
+
+        aws s3 cp ${var.rootfs_s3_uri} \
+          /tmp/rootfs.tar.gz --region ${var.region} 2>/dev/null && \
+        dd if=/dev/zero of=/opt/sbx/rootfs.ext4 bs=1M count=2048 status=none 2>/dev/null && \
+        mkfs.ext4 /opt/sbx/rootfs.ext4 -q 2>/dev/null && \
+        mkdir -p /tmp/rootfs_mount && \
+        mount /opt/sbx/rootfs.ext4 /tmp/rootfs_mount 2>/dev/null && \
+        tar -xzf /tmp/rootfs.tar.gz -C /tmp/rootfs_mount 2>/dev/null && \
+        umount /tmp/rootfs_mount 2>/dev/null || true
+
+        ROOTFS_PREFIX=$(dirname ${var.rootfs_s3_uri})
+        for IMG in $(echo "${var.rootfs_images}" | tr ',' ' '); do
+          [ "$IMG" = "min" ] && continue
+          aws s3 cp "$ROOTFS_PREFIX/rootfs-$IMG.tar.gz" /tmp/rootfs-$IMG.tar.gz --region ${var.region} 2>/dev/null && \
+          dd if=/dev/zero of=/opt/sbx/rootfs-$IMG.ext4 bs=1M count=2048 status=none 2>/dev/null && \
+          mkfs.ext4 /opt/sbx/rootfs-$IMG.ext4 -q 2>/dev/null && \
+          mkdir -p /tmp/rmnt-$IMG && mount /opt/sbx/rootfs-$IMG.ext4 /tmp/rmnt-$IMG 2>/dev/null && \
+          tar -xzf /tmp/rootfs-$IMG.tar.gz -C /tmp/rmnt-$IMG 2>/dev/null && \
+          umount /tmp/rmnt-$IMG 2>/dev/null || true
+        done
+
+        dnf install -y redis6 fuse3 2>/dev/null || true
+        systemctl enable --now redis6 2>/dev/null || true
+        curl -sSL https://d.juicefs.com/install | sh - 2>/dev/null || true
+        sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+        ${local.sandbox_zram_setup}
+        touch /opt/sbx/.bootstrap-complete
+        echo "[recovery-standby] DONE $(date)"
+      EOT
+      }], local.sandbox_kubelet_swap_part)
+
+      labels = {
+        role                                    = "sandbox"
+        sandbox                                 = "true"
+        "workload-tier"                         = "data"
+        "sandbox.memorion.ai/recovery-role"     = "standby"
+        "sandbox.memorion.ai/recovery-group"    = "${var.cluster_name}-recovery-${az_index}"
+        "sandbox.memorion.ai/recovery-az-index" = tostring(az_index)
+      }
+      taints = {
+        dedicated_sandbox = {
+          key    = "dedicated"
+          value  = "sandbox"
+          effect = "NO_SCHEDULE"
+        }
+      }
+    }
+  })
 
   # 节点角色加 Bedrock 调用权限(沙盒走节点凭据链调 Bedrock;生产改 IRSA/出口代理)
   # 保留节点安全组的集群标签，供 Karpenter 安全组选择器使用
@@ -511,6 +803,8 @@ resource "aws_iam_policy" "sandbox_node_rootfs_read" {
       Resource = [
         "arn:aws:s3:::${local.rootfs_s3_path}",
         "arn:aws:s3:::${local.rootfs_s3_bucket}/${local.rootfs_s3_dir}rootfs-*.tar.gz",
+        # 宿主 helper(sbx-vmm-runtime / sbx-state-volume),user-data 下载后按 sha256 校验
+        "arn:aws:s3:::${local.host_helper_bucket}/${local.host_helper_key_dir}/*",
       ]
     }]
   })
@@ -525,6 +819,28 @@ resource "aws_iam_policy" "sandbox_node_rootfs_read" {
 # 默认 grace period 仅 15s → 节点刚起就被判 unhealthy 替换 → 无限替换循环,节点永远
 # 收敛不到全部 Ready(实测 07-07 重建时踩到,老 memory 误判为"暂态自愈")。
 # EKS 托管节点组的 API/模块不暴露 ASG grace period,只能在节点组创建后 patch ASG。
+# ---------- 宿主 helper 分发(S3 + sha256 校验) ----------
+# 首次引入时先 terraform apply -target=aws_s3_object.host_helper,再全量 apply:
+# 否则节点组滚动可能先于对象上传,新节点拉不到 helper。
+locals {
+  # dirname() 会把 "s3://" 折叠成 "s3:/",用正则去掉最后一段
+  host_helper_bucket    = regex("^s3://([^/]+)/", var.rootfs_s3_uri)[0]
+  host_helper_key_dir   = "${replace(trimprefix(var.rootfs_s3_uri, "s3://${local.host_helper_bucket}/"), "/[/][^/]+$/", "")}/bin"
+  host_helper_s3_prefix = "s3://${local.host_helper_bucket}/${local.host_helper_key_dir}"
+  host_helpers          = ["sbx-vmm-runtime", "sbx-state-volume"]
+  host_helper_sha256 = {
+    for h in local.host_helpers : h => filesha256("${path.module}/../../scripts/${h}")
+  }
+}
+
+resource "aws_s3_object" "host_helper" {
+  for_each = toset(local.host_helpers)
+  bucket   = local.host_helper_bucket
+  key      = "${local.host_helper_key_dir}/${each.key}"
+  source   = "${path.module}/../../scripts/${each.key}"
+  etag     = filemd5("${path.module}/../../scripts/${each.key}")
+}
+
 resource "null_resource" "sandbox_asg_grace_period" {
   # 节点组变化(如换机型/架构)时重新 patch
   triggers = {
@@ -574,4 +890,13 @@ output "system_node_group_name" {
 
 output "sandbox_node_group_name" {
   value = module.eks.eks_managed_node_groups["sandbox_${var.node_arch}"].node_group_id
+}
+
+output "recovery_standby_node_group_names" {
+  value = {
+    for az_index in local.recovery_standby_az_indices :
+    tostring(az_index) => module.eks.eks_managed_node_groups[
+      "sandbox_standby_${az_index}"
+    ].node_group_id
+  }
 }

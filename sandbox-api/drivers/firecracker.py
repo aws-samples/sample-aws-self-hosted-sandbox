@@ -46,6 +46,9 @@ SANDBOX_IMAGES = [
 
 import re as _re
 _IMAGE_NAME_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
+_PLACEMENT_GROUP_RE = _re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+)
 
 
 def normalize_image(image: str) -> str:
@@ -57,6 +60,13 @@ def normalize_image(image: str) -> str:
     img = (image or "").strip()
     if not img or img in ("min", "default"):
         return "min"
+    # Stage 2 historically stores the legacy container image URI in
+    # SANDBOX_IMAGE. Firecracker has always fallen back to the min rootfs when
+    # that template does not exist, so treat that configured default as min
+    # for warm-pool eligibility while preserving the public record value.
+    configured_default = os.environ.get("SANDBOX_IMAGE", "").strip()
+    if configured_default and img == configured_default:
+        return "min"
     # 允许传 "web"、"web:latest"、"123.dkr.ecr.../sbx-web:tag" 之类,取末段去 tag
     last = img.rsplit("/", 1)[-1].split(":", 1)[0]
     if not last or not _IMAGE_NAME_RE.match(last):
@@ -67,6 +77,27 @@ def normalize_image(image: str) -> str:
 def available_images() -> list[str]:
     """可用镜像模板名列表(供 Portal 创建表单下拉)。"""
     return SANDBOX_IMAGES
+
+
+def requested_placement_group(spec: SandboxSpec) -> str | None:
+    """Return an optional hard node recovery-group constraint.
+
+    Pool placement remains backwards-compatible and soft. A placement group is
+    deliberately hard: callers using it are asking for an isolated recovery
+    cohort, so silently falling back to a production node would invalidate
+    recovery guarantees and load-test results.
+    """
+    raw = (spec.meta or {}).get("placement_group")
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("meta.placement_group must be a string")
+    group = raw.strip()
+    if not _PLACEMENT_GROUP_RE.fullmatch(group):
+        raise ValueError("meta.placement_group has an invalid format")
+    return group
+
+
 # 统一路径约定:所有节点把沙盒文件放同一前缀(跨机 resume 必须)
 SBX_BASE        = "/var/lib/sbx"
 
@@ -92,9 +123,52 @@ class FirecrackerDriver:
 
     def create(self, sandbox_id: str, spec: SandboxSpec,
                pool: str | None = None) -> dict:
-        tap_idx = db.alloc_tap_idx()
-        # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时 _pick_node 内部回退不限池。
-        node_id = self._pick_node(pool=pool)
+        # Persist placement before the node side effect. If the operator
+        # crashes after node-agent starts Firecracker but before status is
+        # published, the next reconciliation retries the same node/tap instead
+        # of creating a second VM elsewhere.
+        current = db.get(sandbox_id)
+        node_id = str((current or {}).get("node", ""))
+        tap_idx = int((current or {}).get("tap_idx", 0) or 0)
+
+        if node_id and tap_idx:
+            try:
+                info = self._agent(node_id, "GET", f"/vm/{sandbox_id}")
+                if info.get("state") == "running":
+                    return {
+                        "node": node_id,
+                        "tap_idx": tap_idx,
+                        "guest_ip": info.get("ip", ""),
+                    }
+            except Exception:
+                # Reuse the journaled placement when the node itself is
+                # reachable and only the VM is absent. If the node is gone,
+                # choose a fresh node/tap below.
+                try:
+                    self._agent(node_id, "GET", "/health")
+                except Exception:
+                    node_id = ""
+                    tap_idx = 0
+
+        if not node_id:
+            # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时
+            # _pick_node 内部回退不限池。placement_group 若存在则始终为
+            # 硬约束，绝不跨恢复组回退。
+            node_id = self._pick_node(
+                pool=pool,
+                placement_group=requested_placement_group(spec),
+            )
+        if not tap_idx:
+            tap_idx = db.alloc_tap_idx()
+        if current is not None:
+            db.force_update(
+                sandbox_id,
+                {
+                    "node": node_id,
+                    "tap_idx": tap_idx,
+                    "runtime_operation": "create",
+                },
+            )
         rootfs  = f"{SBX_BASE}/{sandbox_id}/rootfs.ext4"
 
         self._agent(node_id, "POST", "/vm/create", {
@@ -121,12 +195,36 @@ class FirecrackerDriver:
     # ------------------------------------------------------------------
 
     def destroy(self, sandbox_id: str, record: dict) -> None:
+        """Legacy best-effort delete kept for the pre-CRD synchronous path."""
+        self._destroy(sandbox_id, record, require_ack=False)
+
+    def destroy_confirmed(self, sandbox_id: str, record: dict) -> None:
+        """Delete only after node-agent confirms runtime cleanup.
+
+        CRD finalizers must not disappear after a timeout or node-agent 500,
+        otherwise Kubernetes reports the sandbox deleted while Firecracker may
+        still be running. A missing runtime is already an idempotent 200 in the
+        node-agent, so every exception here is a real unconfirmed outcome.
+        """
+        self._destroy(sandbox_id, record, require_ack=True)
+
+    def _destroy(
+        self,
+        sandbox_id: str,
+        record: dict,
+        *,
+        require_ack: bool,
+    ) -> None:
         node = record.get("node")
         if node:
             try:
                 self._agent(node, "POST", "/vm/destroy", {"id": sandbox_id})
             except Exception:
-                pass   # 节点已挂/沙盒已不存在,destroy 幂等
+                if require_ack:
+                    raise
+                # Legacy behavior: node down and missing sandbox are treated
+                # as best-effort/idempotent cleanup.
+                pass
         if record.get("tap_idx"):
             db.release_tap_idx(record["tap_idx"])
 
@@ -195,7 +293,12 @@ class FirecrackerDriver:
         # 若换节点则需从 S3 下载整份内存镜像(实测跨节点 ~78s,远慢于冷建),
         # 完全背离暖池"秒级 create"的目的。仅当原节点已死/不可达时才跨节点兜底
         # (此时 S3 下载是恢复的必要代价)。
-        node = self._resume_node(record.get("node", ""))
+        # Spot recovery claims a specific same-AZ standby and mounts the
+        # source node's state EBS there. Do not let generic load balancing pick
+        # a different node that lacks the snapshot files.
+        node = record.get("recovery_target_node", "") or self._resume_node(
+            record.get("node", "")
+        )
 
         resp = self._agent(node, "POST", "/vm/resume", {
             "id":                  sandbox_id,
@@ -218,6 +321,69 @@ class FirecrackerDriver:
             "merge_time_s":    resp.get("merge_time_s"),
             "restore_mode":    resp.get("restore_mode"),
             "net_fix_ok":      resp.get("net_fix_ok"),
+        }
+
+    def mount_recovery_volume(
+        self,
+        node: str,
+        volume_id: str,
+        *,
+        timeout_s: int = 90,
+    ) -> dict:
+        return self._agent(
+            node,
+            "POST",
+            "/recovery/mount",
+            {"volume_id": volume_id, "timeout_s": timeout_s},
+            timeout=timeout_s + 15,
+        )
+
+    def unmount_recovery_volume(
+        self,
+        node: str,
+        volume_id: str,
+        *,
+        timeout_s: int = 90,
+    ) -> dict:
+        return self._agent(
+            node,
+            "POST",
+            "/recovery/unmount",
+            {"volume_id": volume_id},
+            timeout=timeout_s,
+        )
+
+    def node_health(self, node: str) -> dict:
+        return self._agent(node, "GET", "/health", timeout=15)
+
+    def checkpoint_for_repatriation(
+        self,
+        sandbox_id: str,
+        record: dict,
+    ) -> dict:
+        """Create a fresh local checkpoint without an unnecessary S3 copy."""
+        node = record["node"]
+        response = self._agent(
+            node,
+            "POST",
+            "/vm/suspend",
+            {
+                "id": sandbox_id,
+                "snapshot_local_path": (
+                    f"{SBX_BASE}/{sandbox_id}/snap"
+                ),
+                "s3_prefix": "",
+                "upload_s3": False,
+            },
+            timeout=300,
+        )
+        return {
+            "snapshot_type": response.get("snapshot_type", ""),
+            "snapshot_size_bytes": response.get("mem_file_bytes", 0),
+            "snapshot_actual_bytes": response.get("mem_actual_bytes", 0),
+            "snapshot_create_time_s": response.get(
+                "snapshot_create_time_s", 0
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -262,22 +428,41 @@ class FirecrackerDriver:
                 pass  # 原节点已死/不可达 → 跨节点兜底
         return self._pick_node()
 
-    def _pick_node(self, pool: str | None = None) -> str:
+    def _pick_node(
+        self,
+        pool: str | None = None,
+        placement_group: str | None = None,
+    ) -> str:
         # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
         # 拿不到注册表(如本地测试用 FC_NODES)时回退到逐个探 /health。
         # pool:M2 池亲和(spot / protected)。先在目标池内挑;目标池无活节点则
         #   回退不限池(宁可跨池放置也不让 create 失败 —— 池分离是优化非硬约束)。
+        # placement_group:恢复组硬约束；即使目标池无节点也只在同组内回退。
         registry = self._active_nodes_from_registry()
         if registry:
-            picked = self._pick_from_registry(registry, pool)
+            picked = self._pick_from_registry(
+                registry, pool, placement_group
+            )
             if picked:
                 return picked
             if pool is not None:  # 目标池无可达节点 → 回退不限池
-                picked = self._pick_from_registry(registry, None)
+                picked = self._pick_from_registry(
+                    registry, None, placement_group
+                )
                 if picked:
                     return picked
+            if placement_group is not None:
+                raise RuntimeError(
+                    "no reachable node in placement group "
+                    f"{placement_group!r}"
+                )
             raise RuntimeError("all registered nodes unreachable")
 
+        if placement_group is not None:
+            raise RuntimeError(
+                "node registry unavailable for placement group "
+                f"{placement_group!r}"
+            )
         nodes = self._list_metal_nodes()
         if not nodes:
             raise RuntimeError("no available .metal nodes")
@@ -296,12 +481,23 @@ class FirecrackerDriver:
             raise RuntimeError("all nodes unreachable")
         return best_node
 
-    def _pick_from_registry(self, registry: list[tuple[str, int, str]],
-                            pool: str | None) -> str | None:
+    def _pick_from_registry(
+        self,
+        registry: list[tuple[str, int, str, str]],
+        pool: str | None,
+        placement_group: str | None = None,
+    ) -> str | None:
         """在心跳注册表候选里按 free_mem_mib 降序挑第一个可达(且池匹配)的节点。
-        pool=None 不限池;否则只选 node_pool==pool 的。挑不到返回 None。"""
-        for node_id, _mem, node_pool in sorted(registry, key=lambda x: -x[1]):
+        pool=None 不限池;placement_group 非空时必须精确匹配。挑不到返回 None。"""
+        for node_id, _mem, node_pool, node_group in sorted(
+            registry, key=lambda x: -x[1]
+        ):
             if pool is not None and node_pool != pool:
+                continue
+            if (
+                placement_group is not None
+                and node_group != placement_group
+            ):
                 continue
             try:
                 self._agent(node_id, "GET", "/health")  # 存活兜底确认
@@ -310,9 +506,12 @@ class FirecrackerDriver:
                 continue
         return None
 
-    def _active_nodes_from_registry(self) -> list[tuple[str, int, str]]:
+    def _active_nodes_from_registry(
+        self,
+    ) -> list[tuple[str, int, str, str]]:
         """
-        从 DynamoDB 心跳注册表拉活节点,返回 [(node_ident, free_mem_mib, pool), ...]。
+        从 DynamoDB 心跳注册表拉活节点,返回
+        [(node_ident, free_mem_mib, pool, recovery_group), ...]。
         node_ident 用 ip(node-agent 心跳里写的内网 IP),与 _agent 的 host 解析一致。
         pool 为节点池归属(spot / protected);老节点未上报 pool 时默认 "protected"
         (保守:当作不可回收池,避免把活跃沙盒误放到未知池)。
@@ -322,12 +521,27 @@ class FirecrackerDriver:
             nodes = db.list_active_nodes()
         except Exception:
             return []
-        out: list[tuple[str, int, str]] = []
+        out: list[tuple[str, int, str, str]] = []
         for n in nodes:
             ident = n.get("ip") or n.get("node_id")
-            if ident:
+            # A reclaiming node must stop receiving new sandboxes immediately.
+            # A standby has no active state volume yet and exists only as a
+            # same-AZ EBS takeover target.
+            if (
+                ident
+                and not bool(n.get("draining"))
+                and (n.get("recovery_role") or "active") != "standby"
+                and not n.get("recovery_claim_id")
+                and not n.get("repatriation_claim_id")
+            ):
                 node_pool = (n.get("pool") or "protected").strip().lower()
-                out.append((ident, int(n.get("free_mem_mib", 0)), node_pool))
+                recovery_group = str(n.get("recovery_group") or "").strip()
+                out.append((
+                    ident,
+                    int(n.get("free_mem_mib", 0)),
+                    node_pool,
+                    recovery_group,
+                ))
         return out
 
     def _list_metal_nodes(self) -> list[str]:

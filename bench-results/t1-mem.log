@@ -1,0 +1,472 @@
+launch ok 256 / 256 []
+t= 15s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 30s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 45s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 60s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 75s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 90s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=105s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=120s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=135s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=150s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=165s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=180s fc=256 fc_rss=65GiB avail=179GiB free=170GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+launch ok 256 / 256 []
+t= 15s fc=256 fc_rss=94GiB avail=150GiB free=127GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 30s fc=256 fc_rss=112GiB avail=132GiB free=105GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 45s fc=256 fc_rss=152GiB avail=91GiB free=63GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 60s fc=256 fc_rss=195GiB avail=48GiB free=21GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 75s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 90s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=105s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=120s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=135s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=150s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=165s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=180s fc=256 fc_rss=197GiB avail=46GiB free=19GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+launch ok 256 / 256 []
+t= 15s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 30s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 45s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 60s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 75s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 90s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=105s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=120s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=135s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=150s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=165s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t=180s fc=256 fc_rss=231GiB avail=12GiB free=1GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+launch ok 202 / 256 ['ConnectionResetError: [Errno 54] Connection reset by peer|', 'TimeoutError: timed out|']
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 373, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 263, in main
+    emit({"host": sample(pod, args.seconds)})
+                  ~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/bench/overcommit_bench.py", line 192, in sample
+    r = subprocess.run(
+        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+         "python3", "-c", SAMPLER],
+        capture_output=True, text=True, timeout=120,
+    )
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 2155, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/subprocess.py", line 1269, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['kubectl', '-n', 'sandbox-system', 'exec', 'node-agent-gwpxw', '--', 'env', 'SAMPLE_S=3.0', 'python3', '-c', '\nimport json, os, time\ndef meminfo():\n    out = {}\n    for line in open("/proc/meminfo"):\n        k, v = line.split(":", 1)\n        out[k] = int(v.split()[0])\n    return out\ndef cpu():\n    f = open("/proc/stat").readline().split()[1:]\n    return [int(x) for x in f]\ndef psi(kind):\n    try:\n        res = {}\n        for line in open(f"/proc/pressure/{kind}"):\n            parts = line.split()\n            res[parts[0]] = {k: float(v) for k, v in (p.split("=") for p in parts[1:] if "=" in p and not p.startswith("total"))}\n        return res\n    except OSError:\n        return {}\ndef fc_procs():\n    n = 0; rss = 0; threads = 0\n    for pid in os.listdir("/proc"):\n        if not pid.isdigit():\n            continue\n        try:\n            comm = open(f"/proc/{pid}/comm").read().strip()\n            if comm != "firecracker":\n                continue\n            for line in open(f"/proc/{pid}/status"):\n                if line.startswith("VmRSS:"):\n                    rss += int(line.split()[1])\n                elif line.startswith("Threads:"):\n                    threads += int(line.split()[1])\n            n += 1\n        except OSError:\n            continue\n    return n, rss, threads\nc1 = cpu(); t1 = time.time(); time.sleep(float(os.environ.get("SAMPLE_S", "3"))); c2 = cpu(); t2 = time.time()\nd = [b - a for a, b in zip(c1, c2)]; tot = sum(d) or 1\nnames = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]\ncpu_pct = {n: round(100.0 * d[i] / tot, 2) for i, n in enumerate(names) if i < len(d)}\nm = meminfo(); n, rss, th = fc_procs()\nst = os.statvfs("/var/lib/sbx")\ndef ipt():\n    try:\n        import subprocess\n        return sum(1 for l in subprocess.run(["iptables","-S","FORWARD"],capture_output=True,text=True).stdout.splitlines() if l.startswith("-A"))\n    except Exception:\n        return -1\nla = open("/proc/loadavg").read().split()\nvmstat = {}\nfor line in open("/proc/vmstat"):\n    k, v = line.split()\n    if k in ("oom_kill","pswpin","pswpout","pgmajfault","thp_fault_alloc","compact_stall"):\n        vmstat[k] = int(v)\nprint(json.dumps({\n  "mem_total_mib": m["MemTotal"]//1024, "mem_available_mib": m["MemAvailable"]//1024,\n  "mem_free_mib": m["MemFree"]//1024, "anon_mib": m.get("AnonPages",0)//1024,\n  "cached_mib": m.get("Cached",0)//1024, "committed_as_mib": m.get("Committed_AS",0)//1024,\n  "anon_huge_mib": m.get("AnonHugePages",0)//1024, "slab_mib": m.get("Slab",0)//1024,\n  "pagetables_mib": m.get("PageTables",0)//1024, "dirty_mib": m.get("Dirty",0)//1024,\n  "fc_count": n, "fc_rss_mib": rss//1024, "fc_threads": th,\n  "cpu_pct": cpu_pct, "loadavg": [float(x) for x in la[:3]], "running_tasks": la[3],\n  "psi_cpu": psi("cpu"), "psi_mem": psi("memory"), "psi_io": psi("io"),\n  "sbx_disk_used_gib": round((st.f_blocks - st.f_bfree) * st.f_frsize / 2**30, 2),\n  "sbx_disk_total_gib": round(st.f_blocks * st.f_frsize / 2**30, 2),\n  "iptables_forward_rules": ipt(), "vmstat": vmstat,\n}))\n']' timed out after 120 seconds
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+    h=json.loads(sys.stdin.read())['host']
+      ~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniconda/base/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    print('t=%3ds fc=%d fc_rss=%dGiB avail=%dGiB free=%dGiB psi_mem_full10=%s oom_kill=%s pswpout=%s'%(11*15,h['fc_count'],h['fc_rss_mib']//1024,h['mem_available_mib']//1024,h['mem_free_mib']//1024,h['psi_mem'].get('full',{}).get('avg10'),h['vmstat'].get('oom_kill'),h['vmstat'].get('pswpout')))
+                                                                                                             ~^^^^^^^^^^^^
+KeyError: 'fc_count'
+t=180s fc=0 fc_rss=0GiB avail=245GiB free=245GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+default     28s         Normal    NodeHasSufficientMemory   node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasSufficientMemory
+default     28s         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+default     28s         Normal    NodeHasSufficientPID      node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasSufficientPID
+default     28s         Warning   Rebooted                  node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal has been rebooted, boot id: 74ac4887-3bec-4ca2-ac8b-802b2c7b3453
+default     28s         Normal    NodeReady                 node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeReady
+default            30s         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+##### i-0201a94150ca2d192 [Success]
+alive=0 units_active=0 failed_units=0
+0
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.398731    7786 flags.go:64] FLAG: --eviction-soft-grace-period=""
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.398734    7786 flags.go:64] FLAG: --experimental-allocatable-ignore-eviction="false"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.398761    7786 flags.go:64] FLAG: --image-gc-high-threshold="85"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.398764    7786 flags.go:64] FLAG: --image-gc-low-threshold="80"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.414787    7786 container_manager_linux.go:269] "Creating Container Manager object based on Node Config" nodeConfig={"NodeName":"ip-10-0-101-236.ec2.internal","RuntimeCgroupsName":"/runtime.slice/containerd.service","SystemCgroupsName":"","KubeletCgroupsName":"","KubeletOOMScoreAdj":-999,"ContainerRuntime":"","CgroupsPerQOS":true,"CgroupRoot":"/","CgroupDriver":"systemd","KubeletRootDir":"/var/lib/kubelet","ProtectKernelDefaults":true,"KubeReservedCgroupName":"/runtime","SystemReservedCgroupName":"/system","ReservedSystemCPUs":{},"EnforceNodeAllocatable":{"pods":{}},"KubeReserved":{"cpu":"150m","ephemeral-storage":"1Gi","memory":"5667Mi"},"SystemReserved":null,"HardEvictionThresholds":[{"Signal":"memory.available","Operator":"LessThan","Value":{"Quantity":"100Mi","Percentage":0},"GracePeriod":0,"MinReclaim":null},{"Signal":"nodefs.available","Operator":"LessThan","Value":{"Quantity":null,"Percentage":0.1},"GracePeriod":0,"MinReclaim":null},{"Signal":"nodefs.inodesFree","Operator":"LessThan","Value":{"Quantity":null,"Percentage":0.05},"GracePeriod":0,"MinReclaim":null}],"QOSReserved":{},"CPUManagerPolicy":"none","CPUManagerPolicyOptions":null,"TopologyManagerScope":"container","CPUManagerReconcilePeriod":10000000000,"ExperimentalMemoryManagerPolicy":"None","ExperimentalMemoryManagerReservedMemory":null,"PodPidsLimit":-1,"EnforceCPULimits":true,"CPUCFSQuotaPeriod":100000000,"TopologyManagerPolicy":"none","TopologyManagerPolicyOptions":null,"CgroupVersion":2}
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.428266    7786 kubelet_node_status.go:680] "Recording event message for node" node="ip-10-0-101-236.ec2.internal" event="NodeHasNoDiskPressure"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.558089    7786 eviction_manager.go:189] "Eviction manager: starting control loop"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: E1016 06:16:22.558658    7786 eviction_manager.go:285] "Eviction manager: failed to get summary stats" err="failed to get node info: node \"ip-10-0-101-236.ec2.internal\" not found"
+Oct 16 06:16:22 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:22.659193    7786 kubelet_node_status.go:680] "Recording event message for node" node="ip-10-0-101-236.ec2.internal" event="NodeHasNoDiskPressure"
+Oct 16 06:16:23 ip-10-0-101-236.ec2.internal kubelet[7786]: I1016 06:16:23.303480    7786 kubelet_node_status.go:680] "Recording event message for node" node="ip-10-0-101-236.ec2.internal" event="NodeHasNoDiskPressure"
+active
+active
+	

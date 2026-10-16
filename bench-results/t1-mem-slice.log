@@ -1,0 +1,56 @@
+=== stage memA (+384 MiB/VM)
+launch ok 256 / 256 []
+t= 15s fc=256 fc_rss=91GiB avail=153GiB free=132GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+t= 60s fc=256 fc_rss=197GiB avail=46GiB free=26GiB psi_mem_full10=0.18 oom_kill=0 pswpout=0
+t=180s fc=256 fc_rss=197GiB avail=46GiB free=26GiB psi_mem_full10=0.0 oom_kill=0 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+default     13m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal   Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            21m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+default            16m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            13m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            12m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+default            9m54s       Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+06:37:53 alive=256 oomkilled_units=0 slice_mem=217GiB slice_max=218GiB slice_oom_events=0 global_oom=0 avail=46GiB kubelet=active
+node Ready
+=== stage memB (+128 MiB/VM)
+launch ok 256 / 256 []
+t= 15s fc=245 fc_rss=215GiB avail=26GiB free=26GiB psi_mem_full10=55.58 oom_kill=12 pswpout=0
+t= 60s fc=240 fc_rss=216GiB avail=27GiB free=26GiB psi_mem_full10=1.5 oom_kill=16 pswpout=0
+t=180s fc=240 fc_rss=216GiB avail=27GiB free=26GiB psi_mem_full10=0.0 oom_kill=16 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+default     18m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal   Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            26m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+default            21m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            18m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            18m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+default            15m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+06:43:09 alive=240 oomkilled_units=16 slice_mem=217GiB slice_max=218GiB slice_oom_events=16 global_oom=16 avail=27GiB kubelet=active
+node Ready
+=== stage memC (+128 MiB/VM)
+launch ok 240 / 256 ['sandbox ms-0005: exec failed (vsock agent unreachable, SSH unreachable). Ensure guest vsock-exec-agent is running or SSH is configured in rootfs.|', 'sandbox ms-0009: exec failed (vsock agent unreachable, SSH unreachable). Ensure guest vsock-exec-agent is running or SSH is configured in rootfs.|']
+t= 15s fc=208 fc_rss=214GiB avail=28GiB free=28GiB psi_mem_full10=59.43 oom_kill=48 pswpout=0
+t= 60s fc=208 fc_rss=214GiB avail=28GiB free=28GiB psi_mem_full10=0.04 oom_kill=48 pswpout=0
+t=180s fc=208 fc_rss=215GiB avail=28GiB free=28GiB psi_mem_full10=0.0 oom_kill=48 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+default     25m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal   Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            33m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal   Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+default            28m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            25m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal    Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            25m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+default            22m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal   Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+06:50:06 alive=208 oomkilled_units=48 slice_mem=216GiB slice_max=218GiB slice_oom_events=48 global_oom=48 avail=28GiB kubelet=active
+node Ready
+=== stage memD (+256 MiB/VM)
+launch ok 208 / 256 ['sandbox ms-0002: exec failed (vsock agent unreachable, SSH unreachable). Ensure guest vsock-exec-agent is running or SSH is configured in rootfs.|', 'sandbox ms-0005: exec failed (vsock agent unreachable, SSH unreachable). Ensure guest vsock-exec-agent is running or SSH is configured in rootfs.|']
+t= 15s fc=178 fc_rss=216GiB avail=26GiB free=26GiB psi_mem_full10=51.26 oom_kill=78 pswpout=0
+t= 60s fc=168 fc_rss=216GiB avail=26GiB free=26GiB psi_mem_full10=0.27 oom_kill=88 pswpout=0
+t=180s fc=168 fc_rss=216GiB avail=26GiB free=26GiB psi_mem_full10=0.0 oom_kill=88 pswpout=0
+MemoryPressure=False DiskPressure=False PIDPressure=False Ready=True 
+default     31m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal   Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            39m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-236.ec2.internal             Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+default            34m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal              Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            31m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-86.ec2.internal              Node ip-10-0-101-86.ec2.internal status is now: NodeHasNoDiskPressure
+default            30m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal             Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+default            27m         Normal    NodeHasNoDiskPressure     node/ip-10-0-101-240.ec2.internal             Node ip-10-0-101-240.ec2.internal status is now: NodeHasNoDiskPressure
+06:55:57 alive=168 oomkilled_units=88 slice_mem=218GiB slice_max=218GiB slice_oom_events=88 global_oom=88 avail=26GiB kubelet=active
+node Ready
