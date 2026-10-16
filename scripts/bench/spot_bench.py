@@ -154,7 +154,12 @@ def main() -> int:
             pod_exec(pod, host("sync"), timeout=900)
             rec["pre_sample"] = ob.sample(pod, 3)
 
-            # 6) 触发真实 checkpoint 路径
+            # 6) 触发前确认节点上只有本次测试的 VM:/reclaim/simulate 会 checkpoint
+            #    本机全部 running VM,混入别人的沙盒既干扰对方也污染数据。
+            foreign = pod_exec(pod, "ls /var/lib/sbx | grep -v -E '^(\\.|" + a.prefix + "-)' || true").split()
+            if foreign:
+                raise RuntimeError(f"refusing to trigger: foreign sandboxes on node: {foreign[:10]}")
+            # 7) 触发真实 checkpoint 路径
             agent.call("POST", "/reclaim/reset", {}, timeout=30)
             import threading
             samples = []

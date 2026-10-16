@@ -1329,6 +1329,15 @@ def op_snapshot_base(body: dict) -> dict:
         # 打完 base 立即恢复运行(base 是运行期快照,不释放 RAM)
         _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
     dt = time.monotonic() - t0
+    # 趁 base 刚写完(大概率仍在页缓存)把哈希算进缓存。否则 Spot 回收时第一次
+    # suspend 要把 dense base 从 EBS 冷读一遍,与快照写入争抢实例 EBS 带宽
+    # (真机实测读流量 200~630 MiB/s,checkpoint 有效写入只剩 ~450 MiB/s)。
+    # 只预热缓存,校验逻辑不变。
+    try:
+        for name in ("vm.snapshot.base", "vm.mem.base"):
+            _snapshot_file_hash(f"{snap_dir}/{name}", name)
+    except OSError:
+        pass
     return {"base_created": True, "base_snapshot_time_s": round(dt, 3),
             "base_mem_bytes": os.path.getsize(base_mem)}
 
