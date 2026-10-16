@@ -18,7 +18,9 @@ validate_device() {
 }
 
 mounted_source() {
-  findmnt -n -o SOURCE --target "$SBX_BASE" 2>/dev/null || true
+  # 必须用 --mountpoint 精确匹配:--target 返回"包含该路径的文件系统",
+  # 未挂载时会返回根盘,导致误判 "already mounted" 而拒绝接管(真机实测)。
+  findmnt -n -o SOURCE --mountpoint "$SBX_BASE" 2>/dev/null || true
 }
 
 mount_volume() {
