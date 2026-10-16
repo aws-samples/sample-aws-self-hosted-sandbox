@@ -6,7 +6,7 @@
 > 2026-08-12 的 P1 可观测性部署验证见
 > [`P1可观测性-真机测试报告-2026-08-12.md`](P1可观测性-真机测试报告-2026-08-12.md)。
 
-> 验证日期：2026-06-14 ｜ 账号：427169985960 ｜ Region：us-east-1
+> 验证日期：2026-06-14 ｜ 账号：<ACCOUNT_ID> ｜ Region：us-east-1
 > 验证方式：在真实 AWS 环境按 README「快速开始（Agent 部署指南）」逐步执行
 > 工具版本：terraform 1.15.2 / kubectl 1.36 / helm 4.2.0 / aws-cli / docker(colima) 29.5.3
 
@@ -93,7 +93,7 @@ kubectl get runtimeclass | grep kata-qemu                                     # 
 | 中文版（第 254 行） | `KARPENTER_NODE_ROLE="${ACCT}:role/claude-sbx-karpenter-node"` | ❌ 生成非法 role 值 |
 | 英文版（第 625 行） | `KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"` | ✅ 正确 |
 
-`terraform/stage2-control-plane/karpenter.tf` 第 218/257 行确认 `EC2NodeClass.spec.role` 取的是 role **名字**（`aws_iam_role.karpenter_node.name`）。中文版会让 `role:` 字段变成 `427169985960:role/claude-sbx-karpenter-node`，EC2NodeClass 校验失败。
+`terraform/stage2-control-plane/karpenter.tf` 第 218/257 行确认 `EC2NodeClass.spec.role` 取的是 role **名字**（`aws_iam_role.karpenter_node.name`）。中文版会让 `role:` 字段变成 `<ACCOUNT_ID>:role/claude-sbx-karpenter-node`，EC2NodeClass 校验失败。
 
 **建议**：中文版第 254 行改为 `KARPENTER_NODE_ROLE="claude-sbx-karpenter-node"`，与英文版一致。
 

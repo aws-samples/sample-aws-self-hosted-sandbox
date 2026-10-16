@@ -1,0 +1,8 @@
+result: bench-results/t2-fis-e2e-20-rerun.json
+{
+  "status": "passed",
+  "checkpoint_s": 37.919,
+  "effective_write_mib_s": 648.333,
+  "recovery_s": 242.546
+}
+exit=0

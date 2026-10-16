@@ -1,0 +1,14 @@
+result: bench-results/t2-fis-e2e-20.json
+Traceback (most recent call last):
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/spot_recovery_e2e.py", line 1067, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/spot_recovery_e2e.py", line 914, in main
+    recovered = wait_until(
+        "all sandboxes recovered",
+    ...<2 lines>...
+        interval_s=2,
+    )
+  File "/Users/teaguexiao/Documents/aws-claude-sandbox-poc/.claude/worktrees/quirky-diffie-0d86c6/scripts/spot_recovery_e2e.py", line 223, in wait_until
+    raise TimeoutError(f"timed out waiting for {description}; last={last!r}")
+TimeoutError: timed out waiting for all sandboxes recovered; last=None

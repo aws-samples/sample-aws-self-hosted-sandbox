@@ -1,0 +1,10 @@
+<nil>                  default            Node   ip-10-0-101-236.ec2.internal   Starting                  <none>
+2026-10-16T05:50:42Z   default            Node   ip-10-0-101-236.ec2.internal   NodeNotReady              Node ip-10-0-101-236.ec2.internal status is now: NodeNotReady
+2026-10-16T06:16:22Z   default            Node   ip-10-0-101-236.ec2.internal   NodeAllocatableEnforced   Updated Node Allocatable limit across pods
+2026-10-16T06:16:22Z   default            Node   ip-10-0-101-236.ec2.internal   Starting                  Starting kubelet.
+2026-10-16T06:16:22Z   default            Node   ip-10-0-101-236.ec2.internal   InvalidDiskCapacity       invalid capacity 0 on image filesystem
+2026-10-16T06:16:23Z   default            Node   ip-10-0-101-236.ec2.internal   NodeHasNoDiskPressure     Node ip-10-0-101-236.ec2.internal status is now: NodeHasNoDiskPressure
+2026-10-16T06:16:23Z   default            Node   ip-10-0-101-236.ec2.internal   Rebooted                  Node ip-10-0-101-236.ec2.internal has been rebooted, boot id: 74ac4887-3bec-4ca2-ac8b-802b2c7b3453
+2026-10-16T06:16:23Z   default            Node   ip-10-0-101-236.ec2.internal   NodeReady                 Node ip-10-0-101-236.ec2.internal status is now: NodeReady
+2026-10-16T06:16:23Z   default            Node   ip-10-0-101-236.ec2.internal   NodeHasSufficientMemory   Node ip-10-0-101-236.ec2.internal status is now: NodeHasSufficientMemory
+2026-10-16T06:16:23Z   default            Node   ip-10-0-101-236.ec2.internal   NodeHasSufficientPID      Node ip-10-0-101-236.ec2.internal status is now: NodeHasSufficientPID

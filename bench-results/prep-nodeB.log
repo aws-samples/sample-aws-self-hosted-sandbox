@@ -1,0 +1,7 @@
+##### i-0b9d6b8c481b56ae6 [Success]
+zfs-2.3.9-1
+zfs-kmod-2.3.9-1
+deps_s=8 build_install_s=57
+zfs: dev=/dev/nvme2n1 lz4 1M  arc_max=8589934592
+fsx: 2 OSTs; stripe=stripe_count:  -1 stripe_size:   16777216 pattern:       raid0 stripe_offset: -1  
+	

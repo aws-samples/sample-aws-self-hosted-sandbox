@@ -342,3 +342,119 @@ output "zfs_volume_id" {
 output "cleanup_tag_filter" {
   value = "Name=tag:BenchTest,Values=${var.test_id}"
 }
+
+# ---------- vCPU 上限探针(独立 EC2,不经过 EKS) ----------
+
+variable "probe_instances" {
+  type = map(object({
+    instance_type = string
+    steps         = string
+  }))
+  default     = {}
+  description = "key => {instance_type, steps(逗号分隔的目标 VM 数)}。空 map 不创建。"
+}
+
+variable "probe_rootfs_s3" {
+  type    = string
+  default = ""
+}
+
+resource "aws_iam_role" "probe" {
+  count       = length(var.probe_instances) > 0 ? 1 : 0
+  name_prefix = "sbx-bench-probe-"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "probe_ssm" {
+  count      = length(var.probe_instances) > 0 ? 1 : 0
+  role       = aws_iam_role.probe[0].name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "probe_s3" {
+  count = length(var.probe_instances) > 0 ? 1 : 0
+  name  = "probe-rootfs-read-results-write"
+  role  = aws_iam_role.probe[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::${var.artifact_bucket}/rootfs/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::${var.artifact_bucket}/bench/${var.test_id}/*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "probe" {
+  count       = length(var.probe_instances) > 0 ? 1 : 0
+  name_prefix = "sbx-bench-probe-"
+  role        = aws_iam_role.probe[0].name
+}
+
+resource "aws_instance" "probe" {
+  for_each                    = var.probe_instances
+  ami                         = data.aws_ssm_parameter.al2023_ami.value
+  instance_type               = each.value.instance_type
+  subnet_id                   = data.aws_subnet.sandbox.id
+  vpc_security_group_ids      = [aws_security_group.bench.id]
+  iam_instance_profile        = aws_iam_instance_profile.probe[0].name
+  associate_public_ip_address = true
+
+  dynamic "cpu_options" {
+    for_each = can(regex("\\.metal", each.value.instance_type)) ? [] : [1]
+    content {
+      nested_virtualization = "enabled"
+    }
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 50
+    delete_on_termination = true
+    encrypted             = true
+  }
+
+  user_data = join("\n", [
+    "#!/bin/bash",
+    "export RESULT_S3='s3://${var.artifact_bucket}/bench/${var.test_id}/nested-cap'",
+    "export ROOTFS_S3='${var.probe_rootfs_s3}'",
+    "export STEPS='${each.value.steps}'",
+    "export HOLD_S=90",
+    "export AWS_REGION='${var.region}'",
+    file("${path.module}/../../scripts/bench/nested-cap-probe.sh"),
+  ])
+
+  instance_initiated_shutdown_behavior = "terminate"
+
+  tags = {
+    Name = "sbx-bench-probe-${each.key}-${var.test_id}"
+  }
+  volume_tags = merge(local.common_tags, {
+    Name = "sbx-bench-probe-${each.key}-${var.test_id}"
+  })
+
+  depends_on = [aws_iam_role_policy_attachment.probe_ssm, aws_iam_role_policy.probe_s3]
+}
+
+output "probe_instance_ids" {
+  value = { for k, v in aws_instance.probe : k => v.id }
+}

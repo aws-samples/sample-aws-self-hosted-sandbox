@@ -1,0 +1,302 @@
+{
+  "test_id": "oc1016b",
+  "run_id": "9c48ed41",
+  "started_at": "2026-10-16T09:01:09.958623+00:00",
+  "config": {
+    "api_url": "",
+    "api_key": "<redacted>",
+    "namespace": "sandbox-system",
+    "region": "us-east-1",
+    "test_id": "oc1016b",
+    "run_id": "",
+    "pool": "spot",
+    "placement_group": "sbx-standby-test-oc1016b",
+    "count": 20,
+    "memory_mib": 2048,
+    "dirty_mib": 1200,
+    "create_concurrency": 8,
+    "exec_concurrency": 12,
+    "base_timeout_s": 1200,
+    "checkpoint_timeout_s": 150,
+    "recovery_timeout_s": 900,
+    "pre_checkpoint_quiesce_s": 300,
+    "pre_checkpoint_dirty_limit_mib": 64,
+    "node_agent_url": "",
+    "node_agent_auth_secret": "<redacted>",
+    "trigger_mode": "fis",
+    "fis_template_id": "EXT3hW7Qr7Ffm4J64",
+    "terminate_source": false,
+    "keep_sandboxes": false,
+    "output": "bench-results/t2-fis-e2e-20.json"
+  },
+  "sandboxes": [],
+  "sandbox_ids": [
+    "0b023139",
+    "0e57f7e2",
+    "2484c3ec",
+    "2aca3247",
+    "584cecae",
+    "64b52bde",
+    "84ea8e4a",
+    "8b00d108",
+    "8baf0998",
+    "8f9bf43b",
+    "94506af2",
+    "a249b8ae",
+    "a2c415a5",
+    "a851174f",
+    "aac34675",
+    "b3e0fc7e",
+    "bc816759",
+    "d8dcb9e0",
+    "dc88934a",
+    "e67c730f"
+  ],
+  "source_node": "10.0.101.197",
+  "base_wait_s": 168.182,
+  "dirty_fill_s": 20.889,
+  "dirty_total_mib": 24000,
+  "source_node_agent_pod": "node-agent-q4fcp",
+  "pre_checkpoint_quiesce": {
+    "threshold_mib": 64,
+    "before": {
+      "dirty_kib": 1156,
+      "writeback_kib": 0,
+      "writeback_tmp_kib": 0
+    },
+    "after": {
+      "dirty_kib": 84,
+      "writeback_kib": 0,
+      "writeback_tmp_kib": 0
+    },
+    "sync_elapsed_s": 2.308,
+    "elapsed_s": 7.783
+  },
+  "fis_experiment_id": "EXPDqCauAQ4LjThEkJ",
+  "fis_started_at": "2026-10-16T09:04:52.667210+00:00",
+  "fis_status_during_checkpoint": "completed",
+  "recovery_session_id": "b2c76ebc021146418aacb3fd7ae9f58f",
+  "checkpoint_plan": {
+    "session_id": "b2c76ebc021146418aacb3fd7ae9f58f",
+    "node": "ip-10-0-101-197.ec2.internal",
+    "instance_id": "i-06478cccbd971b6eb",
+    "availability_zone": "us-east-1a",
+    "state_volume_id": "vol-067690868a520f605",
+    "signal": {
+      "type": "spot-termination",
+      "action": "terminate",
+      "time": "2026-10-16T09:07:05Z"
+    },
+    "count": 20,
+    "sandboxes": [
+      "bc816759",
+      "94506af2",
+      "2aca3247",
+      "dc88934a",
+      "64b52bde",
+      "b3e0fc7e",
+      "8b00d108",
+      "aac34675",
+      "0e57f7e2",
+      "8baf0998",
+      "8f9bf43b",
+      "a851174f",
+      "0b023139",
+      "a249b8ae",
+      "2484c3ec",
+      "584cecae",
+      "e67c730f",
+      "84ea8e4a",
+      "a2c415a5",
+      "d8dcb9e0"
+    ],
+    "est_evac_s": 46.0,
+    "mode": "REAL",
+    "phase": "checkpointed",
+    "termination_deadline": "2026-10-16T09:07:05+00:00",
+    "checkpoint_deadline": "2026-10-16T09:06:57+00:00",
+    "snapshot_concurrency": 8,
+    "volume_preservation": {
+      "preserved": true,
+      "instance_id": "i-06478cccbd971b6eb",
+      "volume_id": "vol-067690868a520f605",
+      "device": "/dev/sdf",
+      "elapsed_s": 1.952
+    },
+    "completed": 20,
+    "evacuated_ok": 20,
+    "failed": 0,
+    "wall_clock_s": 36.245,
+    "total_actual_bytes": 25802362880,
+    "effective_write_mib_s": 678.918,
+    "results": [
+      {
+        "id": "0b023139",
+        "ok": true,
+        "elapsed_s": 14.45,
+        "actual_bytes": 1290604544,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "0e57f7e2",
+        "ok": true,
+        "elapsed_s": 10.734,
+        "actual_bytes": 1291436032,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "2484c3ec",
+        "ok": true,
+        "elapsed_s": 14.528,
+        "actual_bytes": 1291538432,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "2aca3247",
+        "ok": true,
+        "elapsed_s": 15.202,
+        "actual_bytes": 1288933376,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "584cecae",
+        "ok": true,
+        "elapsed_s": 13.785,
+        "actual_bytes": 1291161600,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "64b52bde",
+        "ok": true,
+        "elapsed_s": 15.111,
+        "actual_bytes": 1288888320,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "84ea8e4a",
+        "ok": true,
+        "elapsed_s": 5.737,
+        "actual_bytes": 1289875456,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "8b00d108",
+        "ok": true,
+        "elapsed_s": 14.43,
+        "actual_bytes": 1288929280,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "8baf0998",
+        "ok": true,
+        "elapsed_s": 12.224,
+        "actual_bytes": 1290661888,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "8f9bf43b",
+        "ok": true,
+        "elapsed_s": 13.343,
+        "actual_bytes": 1290657792,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "94506af2",
+        "ok": true,
+        "elapsed_s": 15.282,
+        "actual_bytes": 1288855552,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "a249b8ae",
+        "ok": true,
+        "elapsed_s": 14.554,
+        "actual_bytes": 1291493376,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "a2c415a5",
+        "ok": true,
+        "elapsed_s": 5.761,
+        "actual_bytes": 1290223616,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "a851174f",
+        "ok": true,
+        "elapsed_s": 14.93,
+        "actual_bytes": 1291649024,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "aac34675",
+        "ok": true,
+        "elapsed_s": 15.401,
+        "actual_bytes": 1288921088,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "b3e0fc7e",
+        "ok": true,
+        "elapsed_s": 14.691,
+        "actual_bytes": 1288892416,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "bc816759",
+        "ok": true,
+        "elapsed_s": 14.603,
+        "actual_bytes": 1288916992,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "d8dcb9e0",
+        "ok": true,
+        "elapsed_s": 5.807,
+        "actual_bytes": 1290391552,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "dc88934a",
+        "ok": true,
+        "elapsed_s": 15.472,
+        "actual_bytes": 1289007104,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      },
+      {
+        "id": "e67c730f",
+        "ok": true,
+        "elapsed_s": 5.88,
+        "actual_bytes": 1291325440,
+        "snapshot_type": "diff",
+        "journal_errors": []
+      }
+    ]
+  },
+  "checkpoint_elapsed_from_trigger_s": 64.555,
+  "source_instance_id": "i-06478cccbd971b6eb",
+  "source_volume_id": "vol-067690868a520f605",
+  "status": "failed",
+  "error": "TimeoutError: timed out waiting for all sandboxes recovered; last=None",
+  "finished_at": "2026-10-16T09:20:53.545333+00:00",
+  "sandbox_cleanup_deferred": true
+}
