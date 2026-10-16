@@ -885,6 +885,37 @@ _BASE_SNAPSHOT_FILES = frozenset(("vm.snapshot.base", "vm.mem.base"))
 _BASE_HASH_CACHE: dict[str, tuple[tuple[int, int, int, int, int], str]] = {}
 _BASE_HASH_CACHE_LOCK = threading.Lock()
 
+# Diff 快照的落盘方式:
+#   sparse  旧方式。Diff 写成新的稀疏文件,resume 时按 SEEK_DATA/SEEK_HOLE 叠加到
+#           base 上。要求文件系统的空洞粒度精确到 4 KiB 页(XFS/ext4 满足);
+#           ZFS(空洞粒度=recordsize)和 Lustre 不满足 → 未写的页被当成"有数据"
+#           以零覆盖 base,resume 后 guest 静默损坏(真机实测 triple fault)。
+#   inplace 先把 base block-clone 成同尺寸 vm.mem,再让 Firecracker 把 Diff 原地
+#           写进去(Firecracker 对已存在且尺寸匹配的 mem 文件做原地合并),结果即
+#           完整内存镜像,resume 直接 load,不依赖 SEEK_DATA。
+#   auto    ZFS 上用 inplace,其余用 sparse(默认)。
+SNAPSHOT_DIFF_MODE = os.environ.get("SNAPSHOT_DIFF_MODE", "auto").strip().lower()
+_INPLACE_MARKER = "vm.mem.inplace"
+# 这些文件系统自带端到端块校验,inplace 的整份 vm.mem 不在关键路径上再做
+# sha256(否则每个沙盒要冷读一遍完整内存镜像,吃掉 Spot 窗口的 EBS 带宽)。
+_CHECKSUMMING_FS = frozenset(("zfs",))
+
+
+def _fs_type(path: str) -> str:
+    try:
+        return subprocess.run(
+            ["stat", "-f", "-c", "%T", path],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _diff_mode(snap_dir: str) -> str:
+    if SNAPSHOT_DIFF_MODE in ("sparse", "inplace"):
+        return SNAPSHOT_DIFF_MODE
+    return "inplace" if _fs_type(snap_dir) == "zfs" else "sparse"
+
 
 class SnapshotIntegrityError(RuntimeError):
     pass
@@ -934,11 +965,29 @@ def _clear_base_hash_cache(sandbox_dir: str) -> None:
             del _BASE_HASH_CACHE[path]
 
 
+_FS_INTEGRITY_FILES = frozenset(("vm.mem", "vm.mem.base"))
+
+
+def _fs_checksummed_mem(snap_dir: str) -> bool:
+    """inplace 模式且文件系统自带块校验:整份内存镜像交给文件系统担保。"""
+    return (
+        _diff_mode(snap_dir) == "inplace"
+        and _fs_type(snap_dir) in _CHECKSUMMING_FS
+    )
+
+
 def _write_snapshot_manifest(snap_dir: str) -> dict:
     files = {}
+    fs_checksummed = _fs_checksummed_mem(snap_dir)
     for name in _SNAPSHOT_FILES:
         path = os.path.join(snap_dir, name)
         if os.path.isfile(path):
+            if fs_checksummed and name in _FS_INTEGRITY_FILES:
+                files[name] = {
+                    "size": os.path.getsize(path),
+                    "integrity": f"filesystem:{_fs_type(snap_dir)}",
+                }
+                continue
             files[name] = {
                 "size": os.path.getsize(path),
                 "sha256": _snapshot_file_hash(path, name),
@@ -976,6 +1025,18 @@ def _verify_snapshot_manifest(snap_dir: str) -> dict:
             raise SnapshotIntegrityError(f"snapshot file is missing: {name}")
         if os.path.getsize(path) != expected.get("size"):
             raise SnapshotIntegrityError(f"snapshot size mismatch: {name}")
+        integrity = expected.get("integrity")
+        if integrity:
+            # 只接受由自带块校验的文件系统担保的 inplace 内存镜像
+            if (
+                name not in _FS_INTEGRITY_FILES
+                or integrity != f"filesystem:{_fs_type(snap_dir)}"
+                or _fs_type(snap_dir) not in _CHECKSUMMING_FS
+            ):
+                raise SnapshotIntegrityError(
+                    f"snapshot integrity mode unsupported here: {name} {integrity}"
+                )
+            continue
         if _snapshot_file_hash(path, name) != expected.get("sha256"):
             raise SnapshotIntegrityError(f"snapshot checksum mismatch: {name}")
     if "vm.snapshot" not in files or "vm.mem" not in files:
@@ -1335,6 +1396,8 @@ def op_snapshot_base(body: dict) -> dict:
     # 只预热缓存,校验逻辑不变。
     try:
         for name in ("vm.snapshot.base", "vm.mem.base"):
+            if name in _FS_INTEGRITY_FILES and _fs_checksummed_mem(snap_dir):
+                continue  # 由文件系统块校验担保,不做 sha256
             _snapshot_file_hash(f"{snap_dir}/{name}", name)
     except OSError:
         pass
@@ -1423,6 +1486,33 @@ def op_suspend(body: dict) -> dict:
             )
         else:
             # 有 base:Diff 快照(只写自 base 以来的脏页)
+            marker = f"{snap_dir}/{_INPLACE_MARKER}"
+            inplace = False
+            if _diff_mode(snap_dir) == "inplace":
+                staged = f"{diff_mem}.clone"
+                clone = subprocess.run(
+                    ["cp", "--reflink=always", base_mem, staged],
+                    capture_output=True, text=True,
+                )
+                if clone.returncode == 0:
+                    if VMM_LAUNCH_MODE == "host-systemd" and VMM_USE_JAILER:
+                        uid = _runtime_uid(sid)
+                        os.chown(staged, uid, uid)
+                    os.replace(staged, diff_mem)
+                    with open(marker, "w") as stream:
+                        stream.write("full\n")
+                    inplace = True
+                    snap_type = "diff-inplace"
+                else:
+                    try:
+                        os.remove(staged)
+                    except FileNotFoundError:
+                        pass
+            if not inplace:
+                try:
+                    os.remove(marker)
+                except FileNotFoundError:
+                    pass
             try:
                 _fc(sock, "PUT", "/snapshot/create", {
                     "snapshot_type": "Diff",
@@ -1661,7 +1751,11 @@ def op_resume(body: dict) -> dict:
     diff_mem = f"{snap_dir}/vm.mem"
     mem_backend_path = diff_mem
     merge_time = 0.0
-    if os.path.exists(base_mem) and os.path.exists(diff_mem):
+    inplace_image = os.path.exists(f"{snap_dir}/{_INPLACE_MARKER}")
+    if inplace_image:
+        # inplace:vm.mem 已是完整内存镜像(base 克隆 + 原地 Diff),直接 load。
+        pass
+    elif os.path.exists(base_mem) and os.path.exists(diff_mem):
         # ⚠️ 正确性:只要存在 base,就【必须】把 vm.mem 合并到 base 上再 load,不能直接 load vm.mem。
         #   原因:Diff 的 mem 是稀疏文件,自 base 以来【未改动的干净页是空洞(读为0)】。
         #   直接 load diff → 干净页变成 0 → 内存损坏。即使 diff 看起来"很满"(满载),
@@ -1751,7 +1845,15 @@ def op_resume(body: dict) -> dict:
     # FC 语义(官方文档):load 时重置脏页位图 → resume 后的 Diff 基准 = 本次 load 的完整内存镜像。
     # 因此 merged 必须成为下一轮 Diff 的 base。同时旧 base/diff 作废,删除以省空间。
     # ⚠️ merged 正被 FC mmap 当运行内存,不能删/不能动它的 inode → 用 os.replace 原子改名(inode 不变)。
-    if mem_backend_path.endswith("vm.mem.merged"):
+    if inplace_image:
+        try:
+            # 与 merged 同理:完整镜像转正为下一代 base(inode 不变,mmap 不受影响)
+            os.replace(diff_mem, base_mem)
+            mem_backend_path = base_mem
+            os.remove(f"{snap_dir}/{_INPLACE_MARKER}")
+        except OSError:
+            pass
+    elif mem_backend_path.endswith("vm.mem.merged"):
         try:
             # 删旧 diff(已并入 merged)
             if os.path.exists(diff_mem):

@@ -527,6 +527,12 @@ PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
 
 > 关键正确性修复：resume 无条件把 Diff 合并到 base 再 load（干净页在 Diff 里是空洞，直接 load 会静默损坏内存）。
 > 完整设计、实测数据与踩坑见 **[docs/firecracker-ebs-diff-design.md](docs/firecracker-ebs-diff-design.md)**。
+>
+> Diff 落盘方式由 node-agent 环境变量 `SNAPSHOT_DIFF_MODE` 控制：`sparse`（稀疏 Diff，resume 时按 SEEK_DATA/SEEK_HOLE 叠加到 base，
+> 要求文件系统空洞粒度为 4 KiB，XFS/ext4 满足）、`inplace`（先 reflink 克隆 base 成同尺寸 `vm.mem`，再让 Firecracker 原地写入 Diff，
+> resume 直接 load，不依赖 SEEK_DATA）、`auto`（默认：ZFS 上用 `inplace`，其余用 `sparse`）。ZFS 空洞粒度=recordsize，用 `sparse`
+> 会以零覆盖 base 致 guest 静默损坏，故 ZFS 必须走 `inplace`；此时 `vm.mem`/`vm.mem.base` 的完整性由文件系统块校验担保，
+> manifest 记 `integrity: filesystem:zfs` 而不再计算 sha256。
 
 #### 快照落盘与跨机恢复（现状说明，务必先读）
 
