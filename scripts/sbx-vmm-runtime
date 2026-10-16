@@ -12,6 +12,11 @@ JAILER_BASE="${JAILER_BASE:-/srv/jailer}"
 FC_BIN="${FC_BIN:-/usr/local/bin/firecracker}"
 JAILER_BIN="${JAILER_BIN:-/usr/local/bin/firecracker-jailer}"
 FC_MIN_VERSION="${FC_MIN_VERSION:-1.14.1}"
+# 所有 VMM 归入同一个 slice,并给 slice 设内存上限:超分越过物理内存时由
+# slice 内的 cgroup OOM 杀掉单个 VM(OOMPolicy=stop),而不是全局内存耗尽把
+# kubelet/containerd/SSM 一起拖进颠簸、整机 NotReady(真机实测)。
+VMM_SLICE="${VMM_SLICE:-sbx.slice}"
+VMM_SLICE_MEMORY_MAX="${VMM_SLICE_MEMORY_MAX:-88%}"
 JAILER_EXEC_NAME="${FC_BIN##*/}"
 
 die() {
@@ -156,6 +161,15 @@ run_jailer() {
     --api-sock "/run/$socket_name"
 }
 
+ensure_slice() {
+  # set-property 持久化到 /etc/systemd/system.control,只在值不一致时写一次。
+  local conf="/etc/systemd/system.control/${VMM_SLICE}.d/50-MemoryMax.conf"
+  if ! grep -qx "MemoryMax=${VMM_SLICE_MEMORY_MAX}" "$conf" 2>/dev/null; then
+    systemctl set-property "$VMM_SLICE" "MemoryMax=${VMM_SLICE_MEMORY_MAX}" >/dev/null \
+      || die "failed to set MemoryMax on $VMM_SLICE"
+  fi
+}
+
 start_vmm() {
   local sid=""
   local socket_name=""
@@ -223,8 +237,11 @@ start_vmm() {
     command=("$FC_BIN" --api-sock "$socket_path")
   fi
 
+  ensure_slice
+
   systemd-run \
     --unit "$unit" \
+    --slice "$VMM_SLICE" \
     --collect \
     --service-type exec \
     --property "Description=Firecracker sandbox $sid" \

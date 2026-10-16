@@ -63,6 +63,12 @@ system 节点，承载控制面、LiteLLM、Ingress 与 CoreDNS。sandbox 节点
     stage2/node-agent。当前默认固定 `v1.16.1`；宿主 helper 会拒绝低于
     `v1.14.1` 的 Firecracker/jailer。
     直接先删旧 node-agent Pod 会连带杀死仍在旧 Pod cgroup 内的 VMM。
+15. **VMM 统一归入 `sbx.slice` 并设内存上限**：`sbx-vmm-runtime` 现用
+    `systemd-run --slice sbx.slice` 启动所有 Firecracker VMM，并把该 slice 的
+    `MemoryMax` 设为 `88%`（可用环境变量 `VMM_SLICE`、`VMM_SLICE_MEMORY_MAX` 覆盖）。
+    内存超分越过物理内存时，由 slice 内 cgroup OOM 只杀单个 VM，避免全局内存耗尽
+    拖垮 kubelet/containerd/SSM 导致整机 NotReady。该设置持久化在
+    `/etc/systemd/system.control/sbx.slice.d/50-MemoryMax.conf`。
 
 ---
 

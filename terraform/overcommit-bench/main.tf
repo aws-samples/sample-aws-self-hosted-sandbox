@@ -55,7 +55,28 @@ variable "artifact_bucket" {
 
 variable "build_host_enabled" {
   type    = bool
-  default = true
+  default = false
+}
+
+variable "zfs_target_instance_id" {
+  type        = string
+  default     = ""
+  description = "非空时创建一块与状态盘同规格的 gp3,挂到该实例作为 ZFS 对照组的 pool 设备。"
+}
+
+variable "zfs_volume_size_gib" {
+  type    = number
+  default = 400
+}
+
+variable "zfs_volume_iops" {
+  type    = number
+  default = 40000
+}
+
+variable "zfs_volume_throughput" {
+  type    = number
+  default = 2000
 }
 
 variable "build_instance_type" {
@@ -197,6 +218,13 @@ resource "aws_security_group" "bench" {
     protocol    = "tcp"
     cidr_blocks = [data.aws_vpc.this.cidr_block]
   }
+  # FSx 文件服务器之间互通
+  ingress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    self      = true
+  }
 }
 
 resource "aws_instance" "build" {
@@ -243,6 +271,28 @@ resource "aws_instance" "build" {
   depends_on = [aws_iam_role_policy_attachment.build_ssm]
 }
 
+# ---------- ZFS 对照组的独立 EBS（可选）----------
+
+resource "aws_ebs_volume" "zfs" {
+  count             = var.zfs_target_instance_id != "" ? 1 : 0
+  availability_zone = data.aws_subnet.sandbox.availability_zone
+  type              = "gp3"
+  size              = var.zfs_volume_size_gib
+  iops              = var.zfs_volume_iops
+  throughput        = var.zfs_volume_throughput
+  encrypted         = true
+  tags = {
+    Name = "sbx-bench-zfs-${var.test_id}"
+  }
+}
+
+resource "aws_volume_attachment" "zfs" {
+  count       = var.zfs_target_instance_id != "" ? 1 : 0
+  device_name = "/dev/sdg"
+  volume_id   = aws_ebs_volume.zfs[0].id
+  instance_id = var.zfs_target_instance_id
+}
+
 # ---------- FSx for Lustre（可选对照组）----------
 
 resource "aws_fsx_lustre_file_system" "bench" {
@@ -283,6 +333,10 @@ output "fsx_dns_name" {
 
 output "fsx_mount_name" {
   value = var.fsx_enabled ? aws_fsx_lustre_file_system.bench[0].mount_name : ""
+}
+
+output "zfs_volume_id" {
+  value = var.zfs_target_instance_id != "" ? aws_ebs_volume.zfs[0].id : ""
 }
 
 output "cleanup_tag_filter" {
