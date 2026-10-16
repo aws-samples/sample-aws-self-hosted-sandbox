@@ -319,6 +319,16 @@ module "eks" {
     kube-proxy = {}
     vpc-cni = {
       before_compute = true
+      # 沙盒节点组钉在单 AZ 的一个 /24 子网(EBS 只能同 AZ 接管)。默认
+      # WARM_ENI_TARGET=1 让每台 r8i/m8i 节点各预占一整块 ENI(实测 50 个 IP),
+      # 7 台节点就把子网耗尽,节点组滚动报 InsufficientFreeAddressesInSubnet。
+      # 沙盒节点上几乎都是 hostNetwork Pod,只需保留少量 IP。
+      configuration_values = jsonencode({
+        env = {
+          WARM_IP_TARGET    = "2"
+          MINIMUM_IP_TARGET = "4"
+        }
+      })
     }
   }
 
