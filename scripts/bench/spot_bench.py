@@ -34,7 +34,9 @@ SIGNAL_USR2 = _SIG.format("SIGUSR2")
 
 
 def pod_exec(pod: str, script: str, timeout: int = 600) -> str:
-    r = subprocess.run(["kubectl", "-n", ob.NS, "exec", "-i", pod, "--", "bash", "-s"],
+    cmd = (["bash", "-s"] if ob.LOCAL else
+           ["kubectl", "-n", ob.NS, "exec", "-i", pod, "--", "bash", "-s"])
+    r = subprocess.run(cmd,
                        input=script, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError(f"pod exec failed: {r.stderr[-800:]}")

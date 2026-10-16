@@ -1747,6 +1747,20 @@ def op_checkpoint(body: dict) -> dict:
 
 # ---------- 内存模板(共享 base) ----------
 _MEMTPL_DIR = os.path.join(SBX_BASE, ".memtpl")
+# 从模板拉起的沙盒,其快照里固化的 rootfs 路径一直是模板源沙盒的目录;
+# 记下源 id,之后每次 resume 都要在 jail 内挂同一个别名。
+_TEMPLATE_SOURCE_FILE = "template.source"
+
+
+def _template_alias(sandbox_dir: str) -> list[tuple[str, str]]:
+    try:
+        with open(os.path.join(sandbox_dir, _TEMPLATE_SOURCE_FILE)) as stream:
+            source = stream.read().strip()
+    except OSError:
+        return []
+    if not _VMM_ID_RE.fullmatch(source):
+        return []
+    return [(sandbox_dir, source)]
 _TEMPLATE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 
 
@@ -1827,6 +1841,8 @@ def op_create_from_template(body: dict) -> dict:
     subprocess.run(["cp", "--reflink=auto", f"{tdir}/rootfs.ext4", f"{d}/rootfs.ext4"],
                    check=True, capture_output=True)
     os.chmod(f"{d}/rootfs.ext4", 0o644)
+    with open(f"{d}/{_TEMPLATE_SOURCE_FILE}", "w") as stream:
+        stream.write(source_id)
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
     mem_mib = max(1, st.st_size // (1024 * 1024))
     try:
@@ -2270,6 +2286,7 @@ def op_resume(body: dict) -> dict:
         snapshot_mem_mib,
         bind_dirs=runtime_bind_dirs,
         log_name="vm-resume.log",
+        bind_aliases=_template_alias(d),
     )
 
     if not _wait_sock(sock):
@@ -4339,4 +4356,10 @@ if __name__ == "__main__":
           f"denied: {DENIED_CALLER_CIDR}, auth: hmac-v1, "
           f"test hooks: {'on' if ENABLE_TEST_HOOKS else 'off'}, "
           f"guest firewall: {'on' if GUEST_FIREWALL else 'off'})")
-    ThreadingHTTPServer((listen_host, LISTEN_PORT), Handler).serve_forever()
+    class _Server(ThreadingHTTPServer):
+        # 默认 listen backlog 只有 5:控制面/批量操作并发直连时(真机 32 路)
+        # 连接队列溢出被 RST(ConnectionResetError)。
+        request_queue_size = 128
+        daemon_threads = True
+
+    _Server((listen_host, LISTEN_PORT), Handler).serve_forever()
