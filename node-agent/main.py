@@ -483,6 +483,19 @@ def _runtime_uid(sandbox_id: str) -> int:
     return 100000 + int.from_bytes(digest[:4], "big") % 2_000_000_000
 
 
+def _vmm_writable_dir(sandbox_id: str, path: str) -> None:
+    """建 VMM 需要写入的目录(如快照目录)。
+
+    jailer 只在启动时 chown -R 沙盒目录;启动之后由 node-agent(root)新建的
+    子目录仍归 root,降权运行的 firecracker 写快照会 EACCES(真机实测
+    snapshot/create → Permission denied)。这里把目录交给该 VM 的运行 uid。
+    """
+    os.makedirs(path, exist_ok=True)
+    if VMM_LAUNCH_MODE == "host-systemd" and VMM_USE_JAILER:
+        uid = _runtime_uid(sandbox_id)
+        os.chown(path, uid, uid)
+
+
 def _runtime_bind_dirs(sandbox_id: str, extra_dirs=None) -> list[str]:
     candidates = [f"{SBX_BASE}/{sandbox_id}", *(extra_dirs or [])]
     result: list[str] = []
@@ -1293,7 +1306,7 @@ def op_snapshot_base(body: dict) -> dict:
         vm = _VMS.get(sid)
     if not vm:
         raise KeyError(sid)
-    os.makedirs(snap_dir, exist_ok=True)
+    _vmm_writable_dir(sid, snap_dir)
     sock = vm["sock"]
     base_snap = f"{snap_dir}/vm.snapshot.base"
     base_mem  = f"{snap_dir}/vm.mem.base"
@@ -1330,7 +1343,7 @@ def op_suspend(body: dict) -> dict:
     if not vm:
         raise KeyError(sid)
 
-    os.makedirs(snap_dir, exist_ok=True)
+    _vmm_writable_dir(sid, snap_dir)
     sock = vm["sock"]
 
     # 方案 B：JuiceFS 模式下，暂停前先 flush 脏页到 S3

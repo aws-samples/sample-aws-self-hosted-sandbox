@@ -502,10 +502,13 @@ module "eks" {
         chmod +x /usr/local/bin/firecracker-jailer && \
         echo "[pre-bootstrap] Firecracker+jailer OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
 
-        echo "${base64gzip(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
-          | base64 -d | gunzip >/usr/local/sbin/sbx-vmm-runtime
-        echo "${base64gzip(file("${path.module}/../../scripts/sbx-state-volume"))}" \
-          | base64 -d | gunzip >/usr/local/sbin/sbx-state-volume
+        # 宿主 helper 从 S3 拉取并按 sha256 校验(内嵌会让 user-data 逼近 16KB 上限)
+        for H in sbx-vmm-runtime sbx-state-volume; do
+          aws s3 cp "${local.host_helper_s3_prefix}/$H" "/usr/local/sbin/$H.new" --region ${var.region} --only-show-errors
+        done
+        printf '%s  %s\n' ${local.host_helper_sha256["sbx-vmm-runtime"]} /usr/local/sbin/sbx-vmm-runtime.new \
+          ${local.host_helper_sha256["sbx-state-volume"]} /usr/local/sbin/sbx-state-volume.new | sha256sum -c --quiet && \
+          for H in sbx-vmm-runtime sbx-state-volume; do mv /usr/local/sbin/$H.new /usr/local/sbin/$H; done
         chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
@@ -630,10 +633,13 @@ module "eks" {
         mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
         chmod +x /usr/local/bin/firecracker /usr/local/bin/firecracker-jailer || true
 
-        echo "${base64gzip(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
-          | base64 -d | gunzip >/usr/local/sbin/sbx-vmm-runtime
-        echo "${base64gzip(file("${path.module}/../../scripts/sbx-state-volume"))}" \
-          | base64 -d | gunzip >/usr/local/sbin/sbx-state-volume
+        # 宿主 helper 从 S3 拉取并按 sha256 校验(内嵌会让 user-data 逼近 16KB 上限)
+        for H in sbx-vmm-runtime sbx-state-volume; do
+          aws s3 cp "${local.host_helper_s3_prefix}/$H" "/usr/local/sbin/$H.new" --region ${var.region} --only-show-errors
+        done
+        printf '%s  %s\n' ${local.host_helper_sha256["sbx-vmm-runtime"]} /usr/local/sbin/sbx-vmm-runtime.new \
+          ${local.host_helper_sha256["sbx-state-volume"]} /usr/local/sbin/sbx-state-volume.new | sha256sum -c --quiet && \
+          for H in sbx-vmm-runtime sbx-state-volume; do mv /usr/local/sbin/$H.new /usr/local/sbin/$H; done
         chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
@@ -702,6 +708,28 @@ module "eks" {
 # 默认 grace period 仅 15s → 节点刚起就被判 unhealthy 替换 → 无限替换循环,节点永远
 # 收敛不到全部 Ready(实测 07-07 重建时踩到,老 memory 误判为"暂态自愈")。
 # EKS 托管节点组的 API/模块不暴露 ASG grace period,只能在节点组创建后 patch ASG。
+# ---------- 宿主 helper 分发(S3 + sha256 校验) ----------
+# 首次引入时先 terraform apply -target=aws_s3_object.host_helper,再全量 apply:
+# 否则节点组滚动可能先于对象上传,新节点拉不到 helper。
+locals {
+  # dirname() 会把 "s3://" 折叠成 "s3:/",用正则去掉最后一段
+  host_helper_bucket    = regex("^s3://([^/]+)/", var.rootfs_s3_uri)[0]
+  host_helper_key_dir   = "${replace(trimprefix(var.rootfs_s3_uri, "s3://${local.host_helper_bucket}/"), "/[/][^/]+$/", "")}/bin"
+  host_helper_s3_prefix = "s3://${local.host_helper_bucket}/${local.host_helper_key_dir}"
+  host_helpers          = ["sbx-vmm-runtime", "sbx-state-volume"]
+  host_helper_sha256 = {
+    for h in local.host_helpers : h => filesha256("${path.module}/../../scripts/${h}")
+  }
+}
+
+resource "aws_s3_object" "host_helper" {
+  for_each = toset(local.host_helpers)
+  bucket   = local.host_helper_bucket
+  key      = "${local.host_helper_key_dir}/${each.key}"
+  source   = "${path.module}/../../scripts/${each.key}"
+  etag     = filemd5("${path.module}/../../scripts/${each.key}")
+}
+
 resource "null_resource" "sandbox_asg_grace_period" {
   # 节点组变化(如换机型/架构)时重新 patch
   triggers = {
