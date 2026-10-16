@@ -33,6 +33,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -114,6 +115,49 @@ def _rootfs_template_path(name: str) -> str:
     if not name or name in ("min", "default") or not _ROOTFS_NAME_RE.match(name):
         return ROOTFS
     return _available_rootfs_templates().get(name, ROOTFS)
+
+
+# rootfs 模板在根盘 /opt/sbx,沙盒目录在状态盘 SBX_BASE:跨文件系统时
+# cp --reflink=auto 退化成整份实拷(每沙盒 2 GiB)。在状态盘上缓存一份
+# 稀疏化模板,沙盒 rootfs 从缓存 reflink(XFS reflink=1 / ZFS block clone),
+# 只有 guest 改写的块才占新空间。ROOTFS_TEMPLATE_CACHE=0 关闭。
+ROOTFS_TEMPLATE_CACHE = os.environ.get(
+    "ROOTFS_TEMPLATE_CACHE", "1"
+).lower() in ("1", "true")
+_TEMPLATE_CACHE_DIR = os.path.join(SBX_BASE, ".templates")
+_TEMPLATE_CACHE_LOCK = threading.Lock()
+
+
+def _cached_rootfs_template(src: str) -> str:
+    """返回与 SBX_BASE 同文件系统的模板副本路径;失败时回退 src。"""
+    if not ROOTFS_TEMPLATE_CACHE:
+        return src
+    try:
+        st = os.stat(src)
+        if os.stat(SBX_BASE).st_dev == st.st_dev:
+            return src
+        name = os.path.basename(src)
+        # 源模板变化(重建/更新)时 size/mtime 变化 → 新缓存文件
+        cached = os.path.join(
+            _TEMPLATE_CACHE_DIR, f"{name}.{st.st_size}.{st.st_mtime_ns}"
+        )
+        if os.path.exists(cached):
+            return cached
+        with _TEMPLATE_CACHE_LOCK:
+            if os.path.exists(cached):
+                return cached
+            os.makedirs(_TEMPLATE_CACHE_DIR, exist_ok=True)
+            tmp = f"{cached}.tmp"
+            subprocess.run(["cp", "--sparse=always", src, tmp], check=True)
+            os.chmod(tmp, 0o444)
+            os.replace(tmp, cached)
+        return cached
+    except Exception as exc:  # 缓存只是优化,任何失败都回退原路径
+        print(f"[rootfs] template cache disabled for {src}: {exc}",
+              file=sys.stderr, flush=True)
+        return src
+
+
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
 VMM_LAUNCH_MODE = os.environ.get(
@@ -305,11 +349,29 @@ def _vm_operation_lock(sandbox_id: str):
 
 # ---------- tap 网络 ----------
 
+# tap_idx 是控制面全局只增计数器(db.alloc_tap_idx),累计创建超过 255 次后旧的
+# 172.18.{tap_idx}.x 映射会生成非法地址(ip addr add 静默失败 → guest 无 IPv4)。
+# 1..255 保持旧映射(已有快照里 guest 的 IP 固化在内存态,恢复时必须一致);
+# 更大的 idx 映射进 172.19.0.0/16 的 /30 块(16384 个,取模复用)。
+_TAP_LEGACY_MAX_IDX = 255
+_TAP_EXT_BLOCKS = 16384
+
+
+def _tap_addresses(tap_idx: int) -> tuple[str, str]:
+    """tap_idx → (host_ip, guest_ip),同一 /30 内 .1/.2。"""
+    if tap_idx < 0:
+        raise ValueError(f"invalid tap_idx {tap_idx}")
+    if tap_idx <= _TAP_LEGACY_MAX_IDX:
+        return f"172.18.{tap_idx}.1", f"172.18.{tap_idx}.2"
+    offset = ((tap_idx - _TAP_LEGACY_MAX_IDX - 1) % _TAP_EXT_BLOCKS) * 4
+    third, fourth = divmod(offset, 256)
+    return f"172.19.{third}.{fourth + 1}", f"172.19.{third}.{fourth + 2}"
+
+
 def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
     """建 tap + /30 子网。返回 (tap_name, host_ip, guest_ip)。"""
     tap      = f"fctap{tap_idx}"
-    host_ip  = f"172.18.{tap_idx}.1"
-    guest_ip = f"172.18.{tap_idx}.2"
+    host_ip, guest_ip = _tap_addresses(tap_idx)
     host_if  = _host_iface()
     # 幂等清理同名残留 tap:suspend/destroy 后 tap 设备不会自动消失,
     # 若 tap_idx 被复用(暖池 resume、tap_idx 回收重分配),残留的旧 tap 会让
@@ -318,8 +380,14 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
     subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "tuntap", "add", tap, "mode", "tap"],
                    stderr=subprocess.DEVNULL)
-    subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
-                   stderr=subprocess.DEVNULL)
+    # 地址配置失败不能静默吞掉:否则 guest 起来但没有网络,只有 vsock 能用。
+    addr = subprocess.run(["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
+                          capture_output=True, text=True)
+    if addr.returncode != 0:
+        subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
+        raise RuntimeError(
+            f"ip addr add {host_ip}/30 dev {tap} failed: {addr.stderr.strip()}"
+        )
     subprocess.run(["ip", "link", "set", tap, "up"])
     # NAT(幂等)
     # nosec B602 / nosemgrep: subprocess-shell-true -- shell=True 仅为 "-C 检查 || -A 添加" 幂等惯用法;
@@ -339,6 +407,13 @@ def _setup_tap(tap_idx: int) -> tuple[str, str, str]:
 
 def _teardown_tap(tap: str) -> None:
     subprocess.run(["ip", "link", "del", tap], stderr=subprocess.DEVNULL)
+    # 同时删掉 _setup_tap 追加的 FORWARD 规则,否则每次创建都残留一条,
+    # 高密度/长时间运行后 FORWARD 链线性膨胀。
+    subprocess.run(
+        ["iptables", "-D", "FORWARD", "-i", tap, "-o", _host_iface(),
+         "-j", "ACCEPT"],
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _host_iface() -> str:
@@ -941,8 +1016,11 @@ def op_create(body: dict) -> dict:
     # CoW 复制基础 rootfs 到沙盒目录(src 是全局基础镜像,dst 是沙盒私有副本)。
     # 按控制面传的 rootfs_template 选模板 /opt/sbx/rootfs-{name}.ext4;不存在则回退默认 ROOTFS。
     dest_rootfs = f"{d}/rootfs.ext4"
-    src_rootfs  = _rootfs_template_path(body.get("rootfs_template", ""))
+    src_rootfs  = _cached_rootfs_template(
+        _rootfs_template_path(body.get("rootfs_template", ""))
+    )
     subprocess.run(["cp", "--reflink=auto", src_rootfs, dest_rootfs], check=True)
+    os.chmod(dest_rootfs, 0o644)
 
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
 
@@ -2592,6 +2670,7 @@ def _has_local_sandbox_state() -> bool:
     try:
         return any(
             entry.is_dir(follow_symlinks=False)
+            and _VMM_ID_RE.fullmatch(entry.name)
             and _managed_sandbox_dir(entry.path)
             for entry in os.scandir(SBX_BASE)
         )
