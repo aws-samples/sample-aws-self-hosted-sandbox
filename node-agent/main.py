@@ -774,8 +774,13 @@ def _launch_vmm(
     *,
     bind_dirs=None,
     log_name: str = "vmm.log",
+    bind_aliases=None,
 ) -> tuple[int, str, str]:
-    """Launch one VMM and return (pid, host_api_socket, runtime_unit)."""
+    """Launch one VMM and return (pid, host_api_socket, runtime_unit).
+
+    bind_aliases: [(sandbox_dir, alias_id)],在 jail 内把该目录再挂到
+    /var/lib/sbx/{alias_id}(内存模板恢复用,见 op_create_from_template)。
+    """
     sid = _validated_vmm_id(sandbox_id)
     d = f"{SBX_BASE}/{sid}"
     os.makedirs(d, exist_ok=True)
@@ -799,6 +804,11 @@ def _launch_vmm(
         ]
         for path in _runtime_bind_dirs(sid, bind_dirs):
             args.extend(["--bind-dir", path])
+        for path, alias in bind_aliases or []:
+            managed = _managed_sandbox_dir(str(path))
+            if not managed or not _VMM_ID_RE.fullmatch(str(alias)):
+                raise ValueError(f"unsafe jail bind alias: {path}:{alias}")
+            args.extend(["--bind-alias", f"{managed}:{alias}"])
         result = _host_control(HOST_VMM_CTL, args, timeout=45)
         pid = int(result.get("pid", 0) or 0)
         sock = str(result.get("socket", ""))
@@ -812,6 +822,8 @@ def _launch_vmm(
         raise RuntimeError(
             f"unsupported VMM_LAUNCH_MODE={VMM_LAUNCH_MODE!r}"
         )
+    if bind_aliases:
+        raise RuntimeError("bind aliases require host-systemd + jailer")
     if VMM_USE_JAILER:
         raise RuntimeError(
             "VMM_USE_JAILER requires VMM_LAUNCH_MODE=host-systemd"
@@ -1188,9 +1200,27 @@ def _file_identity(path: str) -> tuple[int, int, int, int, int]:
     )
 
 
+# 内存模板文件(.memtpl/*/vm.mem)发布后只读、被各沙盒硬链接为 vm.mem.base。
+# 硬链接/jailer chown 会改 ctime,按 (dev, ino) + size/mtime 认模板摘要,
+# 避免每个沙盒都把同一份模板冷读一遍。
+_TEMPLATE_DIGESTS: dict[tuple[int, int], tuple[int, int, str]] = {}
+
+
+def _template_digest(path: str) -> str | None:
+    st = os.stat(path)
+    with _BASE_HASH_CACHE_LOCK:
+        hit = _TEMPLATE_DIGESTS.get((st.st_dev, st.st_ino))
+    if hit and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+        return hit[2]
+    return None
+
+
 def _snapshot_file_hash(path: str, name: str) -> str:
     if name not in _BASE_SNAPSHOT_FILES:
         return _sha256_file(path)
+    template = _template_digest(path)
+    if template:
+        return template
     identity = _file_identity(path)
     with _BASE_HASH_CACHE_LOCK:
         cached = _BASE_HASH_CACHE.get(path)
@@ -1659,6 +1689,186 @@ def op_snapshot_base(body: dict) -> dict:
         pass
     return {"base_created": True, "base_snapshot_time_s": round(dt, 3),
             "base_mem_bytes": os.path.getsize(base_mem)}
+
+
+# ---------- 周期性原地 checkpoint ----------
+# 运行中定期把"自上次 base 以来的脏页"落盘并转正为新 base:暂停 → Diff(原地写进 base
+# 的 reflink 克隆) → 立即恢复 → 原子替换 base。Firecracker 写 Diff 成功后会重置脏页
+# 位图,于是 Spot 回收时 suspend 的 Diff 只剩"最近一个周期内"的脏页。
+def op_checkpoint(body: dict) -> dict:
+    sid = _sandbox_id(body.get("id"))
+    with _LOCK:
+        vm = _VMS.get(sid)
+    if not vm or vm.get("state") != "running":
+        raise RuntimeError(f"sandbox {sid} not running")
+    snap_dir = f"{SBX_BASE}/{sid}/snap"
+    base_mem = f"{snap_dir}/vm.mem.base"
+    base_snap = f"{snap_dir}/vm.snapshot.base"
+    if not os.path.exists(base_mem):
+        raise RuntimeError(f"sandbox {sid} has no base snapshot")
+    ck_mem = f"{snap_dir}/vm.mem.ckpt"
+    ck_snap = f"{snap_dir}/vm.snapshot.ckpt"
+    for leftover in (ck_mem, ck_snap):
+        try:
+            os.remove(leftover)
+        except FileNotFoundError:
+            pass
+    t_clone = time.monotonic()
+    subprocess.run(["cp", "--reflink=always", base_mem, ck_mem],
+                   check=True, capture_output=True)
+    if VMM_LAUNCH_MODE == "host-systemd" and VMM_USE_JAILER:
+        uid = _runtime_uid(sid)
+        os.chown(ck_mem, uid, uid)
+    clone_s = time.monotonic() - t_clone
+    sock = vm["sock"]
+    t_pause = time.monotonic()
+    _fc(sock, "PATCH", "/vm", {"state": "Paused"})
+    try:
+        _fc(sock, "PUT", "/snapshot/create", {
+            "snapshot_type": "Diff",
+            "snapshot_path": ck_snap,
+            "mem_file_path": ck_mem,
+        }, timeout=float(body.get("timeout_s", 120)))
+    finally:
+        _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
+    paused_s = time.monotonic() - t_pause
+    written = 0
+    try:
+        # 本轮新写入的块 = 克隆后不再与 base 共享的部分;用分配量差近似(XFS/ZFS 都适用)
+        written = max(0, os.stat(ck_mem).st_blocks * 512)
+    except OSError:
+        pass
+    os.replace(ck_mem, base_mem)
+    os.replace(ck_snap, base_snap)
+    _clear_base_hash_cache(f"{SBX_BASE}/{sid}")
+    return {"checkpoint": True, "paused_s": round(paused_s, 3),
+            "clone_s": round(clone_s, 3), "allocated_bytes": written}
+
+
+# ---------- 内存模板(共享 base) ----------
+_MEMTPL_DIR = os.path.join(SBX_BASE, ".memtpl")
+_TEMPLATE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
+
+
+def _template_dir(name) -> str:
+    if not isinstance(name, str) or not _TEMPLATE_NAME_RE.fullmatch(name):
+        raise RequestValidationError("bad_template", "template")
+    return os.path.join(_MEMTPL_DIR, name)
+
+
+def op_template_publish(body: dict) -> dict:
+    """把一个运行中的沙盒发布成内存模板:同一时刻的完整内存 + VM 状态 + rootfs。"""
+    sid = _sandbox_id(body.get("id"))
+    tdir = _template_dir(body.get("template"))
+    with _LOCK:
+        vm = _VMS.get(sid)
+    if not vm or vm.get("state") != "running":
+        raise RuntimeError(f"sandbox {sid} not running")
+    d = f"{SBX_BASE}/{sid}"
+    stage = f"{d}/snap"
+    _vmm_writable_dir(sid, stage)
+    t_mem, t_snap = f"{stage}/tpl.mem", f"{stage}/tpl.snapshot"
+    sock = vm["sock"]
+    t0 = time.monotonic()
+    _fc(sock, "PATCH", "/vm", {"state": "Paused"})
+    try:
+        _fc(sock, "PUT", "/snapshot/create", {
+            "snapshot_type": "Full", "snapshot_path": t_snap, "mem_file_path": t_mem,
+        }, timeout=600)
+        # rootfs 必须与内存同一时刻:VM 暂停期间复制
+        os.makedirs(tdir, exist_ok=True)
+        subprocess.run(["cp", "--reflink=auto", f"{d}/rootfs.ext4", f"{tdir}/rootfs.ext4.tmp"],
+                       check=True, capture_output=True)
+    finally:
+        _fc(sock, "PATCH", "/vm", {"state": "Resumed"})
+    publish_s = time.monotonic() - t0
+    os.replace(f"{tdir}/rootfs.ext4.tmp", f"{tdir}/rootfs.ext4")
+    os.replace(t_snap, f"{tdir}/vm.snapshot")
+    os.replace(t_mem, f"{tdir}/vm.mem")
+    for f in ("vm.mem", "vm.snapshot", "rootfs.ext4"):
+        os.chmod(f"{tdir}/{f}", 0o444)
+    digest = _sha256_file(f"{tdir}/vm.mem")
+    st = os.stat(f"{tdir}/vm.mem")
+    with _BASE_HASH_CACHE_LOCK:
+        _TEMPLATE_DIGESTS[(st.st_dev, st.st_ino)] = (st.st_size, st.st_mtime_ns, digest)
+    meta = {"source_id": sid, "mem_bytes": st.st_size, "sha256": digest,
+            "published_at": _now_iso()}
+    with open(f"{tdir}/template.json", "w") as stream:
+        json.dump(meta, stream)
+    return {"template": os.path.basename(tdir), "publish_s": round(publish_s, 3), **meta}
+
+
+def op_create_from_template(body: dict) -> dict:
+    """从内存模板拉起新沙盒:vm.mem.base 硬链接到模板(同一 inode,宿主页缓存共享,
+    不再为每个沙盒写 Full base),rootfs 从模板 reflink,网卡/vsock 在 load 时覆盖。"""
+    sid = _sandbox_id(body.get("id"))
+    tdir = _template_dir(body.get("template"))
+    tap_idx = _int_in_range(body.get("tap_idx"), 0, MAX_TAP_IDX, "tap_idx")
+    with open(f"{tdir}/template.json") as stream:
+        meta = json.load(stream)
+    source_id = _sandbox_id(meta["source_id"], "template.source_id")
+    if source_id == sid:
+        raise RequestValidationError("template_source_reuse", "id")
+    with _LOCK:
+        if sid in _VMS:
+            raise RuntimeError(f"sandbox {sid} already exists")
+    st = os.stat(f"{tdir}/vm.mem")
+    with _BASE_HASH_CACHE_LOCK:
+        if (st.st_dev, st.st_ino) not in _TEMPLATE_DIGESTS:
+            _TEMPLATE_DIGESTS[(st.st_dev, st.st_ino)] = (
+                st.st_size, st.st_mtime_ns, meta["sha256"])
+    t0 = time.monotonic()
+    d = f"{SBX_BASE}/{sid}"
+    snap_dir = f"{d}/snap"
+    os.makedirs(snap_dir, exist_ok=True)
+    os.link(f"{tdir}/vm.mem", f"{snap_dir}/vm.mem.base")
+    shutil.copyfile(f"{tdir}/vm.snapshot", f"{snap_dir}/vm.snapshot.base")
+    shutil.copyfile(f"{tdir}/vm.snapshot", f"{snap_dir}/vm.snapshot.tpl")
+    subprocess.run(["cp", "--reflink=auto", f"{tdir}/rootfs.ext4", f"{d}/rootfs.ext4"],
+                   check=True, capture_output=True)
+    os.chmod(f"{d}/rootfs.ext4", 0o644)
+    tap, host_ip, guest_ip = _setup_tap(tap_idx)
+    mem_mib = max(1, st.st_size // (1024 * 1024))
+    try:
+        pid, sock, runtime_unit = _launch_vmm(
+            sid, "api-resume.sock", mem_mib, bind_dirs=[d], log_name="vm-resume.log",
+            bind_aliases=[(d, source_id)])
+        if not _wait_sock(sock):
+            _stop_vmm(sid, {"pid": pid, "runtime_unit": runtime_unit})
+            raise RuntimeError("firecracker resume socket 未就绪")
+        t_load = time.monotonic()
+        _fc(sock, "PUT", "/snapshot/load", {
+            "snapshot_path": f"{snap_dir}/vm.snapshot.tpl",
+            "mem_backend": {"backend_path": f"{snap_dir}/vm.mem.base", "backend_type": "File"},
+            "track_dirty_pages": True,
+            "resume_vm": True,
+            "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
+            "vsock_override": {"uds_path": f"{d}/v.sock"},
+        })
+        load_s = time.monotonic() - t_load
+    except Exception:
+        _teardown_tap(tap)
+        raise
+    vm = {"state": "running", "pid": pid, "sock": sock, "tap": tap, "tap_idx": tap_idx,
+          "ip": guest_ip, "dir": d, "runtime_unit": runtime_unit, "template": meta.get("source_id")}
+    with _LOCK:
+        _VMS[sid] = vm
+    _persist_runtime_metadata(sid, vm)
+    # guest 内的 IP/网关仍是模板源的,经 vsock 改成本沙盒 tap 的 /30
+    net_ok = False
+    for _ in range(10):
+        try:
+            r = _vsock_exec(f"{d}/v.sock",
+                            f"ip addr flush dev eth0; ip addr add {guest_ip}/30 dev eth0; "
+                            f"ip route replace default via {host_ip}; echo NET_OK", timeout=8)
+            if "NET_OK" in (r.get("stdout") or ""):
+                net_ok = True
+                break
+        except Exception:
+            time.sleep(0.3)
+    return {"state": "running", "ip": guest_ip, "from_template": os.path.basename(tdir),
+            "create_s": round(time.monotonic() - t0, 3), "load_s": round(load_s, 3),
+            "guest_net_reconfigured": net_ok}
 
 
 def op_suspend(body: dict) -> dict:
@@ -4002,6 +4212,15 @@ class Handler(BaseHTTPRequestHandler):
                         if path == "/vm/exec":
                             return self._send(200, self._run_vm_operation(
                                 "exec", lambda: op_exec(body)))
+                        if path == "/vm/checkpoint":
+                            return self._send(200, self._run_vm_operation(
+                                "checkpoint", lambda: op_checkpoint(body)))
+                        if path == "/vm/template_publish":
+                            return self._send(200, self._run_vm_operation(
+                                "template_publish", lambda: op_template_publish(body)))
+                        if path == "/vm/create_from_template":
+                            return self._send(200, self._run_vm_operation(
+                                "create_from_template", lambda: op_create_from_template(body)))
             # Spot 恢复:standby 节点接管/交还状态 EBS(控制面签名调用)。
             if path == "/recovery/mount":
                 return self._send(200, op_recovery_mount(body))

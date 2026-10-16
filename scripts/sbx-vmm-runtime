@@ -109,6 +109,7 @@ run_jailer() {
   local uid=""
   local gid=""
   local bind_dirs=()
+  local bind_aliases=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id) sid="${2:-}"; shift 2 ;;
@@ -116,6 +117,7 @@ run_jailer() {
       --uid) uid="${2:-}"; shift 2 ;;
       --gid) gid="${2:-}"; shift 2 ;;
       --bind-dir) bind_dirs+=("${2:-}"); shift 2 ;;
+      --bind-alias) bind_aliases+=("${2:-}"); shift 2 ;;
       *) die "unknown run-jailer argument: $1" ;;
     esac
   done
@@ -142,6 +144,21 @@ run_jailer() {
     mkdir -p "$target"
     mount --bind "$source" "$target"
     chown -R "$uid:$gid" "$source"
+  done
+
+  # --bind-alias SRC:ALIAS:把沙盒自己的目录在 jail 内再挂一份到 /var/lib/sbx/ALIAS。
+  # 从内存模板恢复时,快照里固化的 rootfs 路径是模板源沙盒的目录,Firecracker 不支持
+  # 覆盖 drive 路径;别名让它打开的其实是本沙盒自己的 rootfs 副本。
+  local alias_spec alias_src alias_name
+  for alias_spec in "${bind_aliases[@]}"; do
+    alias_src="${alias_spec%%:*}"
+    alias_name="${alias_spec#*:}"
+    validate_bind_dir "$alias_src"
+    valid_id "$alias_name" || die "invalid bind alias: $alias_name"
+    [[ "$alias_name" != "$sid" ]] || die "bind alias must differ from sandbox id"
+    target="$jail_root/var/lib/sbx/$alias_name"
+    mkdir -p "$target"
+    mount --bind "$alias_src" "$target"
   done
 
   mount --bind /opt/sbx "$jail_root/opt/sbx"
@@ -178,6 +195,7 @@ start_vmm() {
   local gid=""
   local jailed="1"
   local bind_dirs=()
+  local bind_aliases=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id) sid="${2:-}"; shift 2 ;;
@@ -187,6 +205,7 @@ start_vmm() {
       --gid) gid="${2:-}"; shift 2 ;;
       --jailer) jailed="${2:-}"; shift 2 ;;
       --bind-dir) bind_dirs+=("${2:-}"); shift 2 ;;
+      --bind-alias) bind_aliases+=("${2:-}"); shift 2 ;;
       *) die "unknown start argument: $1" ;;
     esac
   done
@@ -233,7 +252,11 @@ start_vmm() {
     for source in "${bind_dirs[@]}"; do
       command+=(--bind-dir "$source")
     done
+    for source in "${bind_aliases[@]}"; do
+      command+=(--bind-alias "$source")
+    done
   else
+    [[ ${#bind_aliases[@]} -eq 0 ]] || die "bind aliases require the jailer"
     command=("$FC_BIN" --api-sock "$socket_path")
   fi
 
