@@ -134,7 +134,7 @@ def node_agent_pod(node: str) -> str:
 def auth_secret() -> str:
     out = subprocess.run(
         ["kubectl", "-n", NS, "get", "secret", "node-agent-auth",
-         "-o", "jsonpath={.data.NODE_AGENT_AUTH_SECRET}"],
+         "-o", "jsonpath={.data.NODE_AGENT_AUTH_KEY}"],
         check=True, capture_output=True, text=True,
     ).stdout
     return base64.b64decode(out).decode()
@@ -167,13 +167,14 @@ class Agent:
         payload = json.dumps(body).encode() if body is not None else b""
         ts, nonce = str(int(time.time())), uuid.uuid4().hex
         sha = hashlib.sha256(payload).hexdigest()
+        # 与 node-agent/agent_auth.py 一致:canonical = v1\nts\nnonce\nMETHOD\ntarget\nsha
         canonical = "\n".join(("v1", ts, nonce, method, path, sha)).encode()
         sig = hmac.new(self.secret.encode(), canonical, hashlib.sha256).hexdigest()
         req = urllib.request.Request(
             self.url + path, data=payload if body is not None else None, method=method,
-            headers={"Content-Type": "application/json", "X-SBX-Auth-Version": "v1",
-                     "X-SBX-Timestamp": ts, "X-SBX-Nonce": nonce,
-                     "X-SBX-Content-SHA256": sha, "X-SBX-Signature": sig},
+            headers={"Content-Type": "application/json",
+                     "X-Sbx-Agent-Timestamp": ts, "X-Sbx-Agent-Nonce": nonce,
+                     "X-Sbx-Agent-Content-SHA256": sha, "X-Sbx-Agent-Signature": f"v1={sig}"},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:

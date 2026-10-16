@@ -6,6 +6,20 @@
 
 ---
 
+> [!CAUTION]
+> **Multi-tenant deployments: read before running untrusted code**
+>
+> - **Deployments built from any commit before [`2ea68f2`](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/commit/2ea68f2) ([PR #31](https://github.com/aws-samples/sample-aws-self-hosted-sandbox/pull/31), V2401449830) are exposed to cross-tenant root RCE.**
+>   In those versions node-agent runs as root on `0.0.0.0:8002` with no authentication and an allow-all caller gate. Code inside any sandbox can reach it through the tap gateway and run commands as root in other tenants' microVMs, destroy / suspend / resume them, and write arbitrary files on the host as root. Guests can also reach IMDS and read the node role's credentials.
+>   Do not run untrusted or multi-tenant workloads on these versions. Upgrade the control plane and node-agent together. This is a breaking change: the new node-agent rejects unsigned requests, so an old control plane gets 401 from it. Restarting the node-agent DaemonSet also stops the microVMs on that node, so suspend or drain sandboxes first.
+> - **From `2ea68f2` on, node-agent must not run multi-tenant unless both of these are in place:**
+>   1. **HMAC-SHA256 request signing**: `NODE_AGENT_AUTH_KEY` (or `NODE_AGENT_AUTH_KEY_FILE`, at least 32 bytes) set to the same value on the control plane and on every node-agent. node-agent refuses to start without it. stage2 Terraform generates the key into a Kubernetes Secret.
+>   2. **`ALLOWED_CALLER_CIDR` set to the control-plane Pod CIDR**: only the range control-plane Pods actually get addresses from (with VPC CNI, the subnets of the system node group). An empty value denies every caller and node-agent refuses to start. The guest tap range `172.18.0.0/16` is always denied.
+> - **The stage2 default is wider than the control-plane Pod CIDR.** If `node_agent_allowed_caller_cidrs` is left empty, stage2 uses the whole cluster VPC CIDR, because in the sample VPC the system and sandbox nodes share subnets. For multi-tenant use, run control-plane Pods in subnets that sandbox nodes do not use, and set `node_agent_allowed_caller_cidrs` to those subnets.
+> - Keep `NODE_AGENT_GUEST_FIREWALL=1` and `NODE_AGENT_ENABLE_TEST_HOOKS=0` (both are the defaults). Known residual risks remain even with both controls: one HMAC key is shared by all nodes, control-plane → node-agent traffic is plaintext HTTP inside the VPC, and jailer is off by default.
+>
+> To check a checkout: `git merge-base --is-ancestor 2ea68f2 HEAD && echo fixed || echo VULNERABLE`
+
 ### Overview
 
 A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and a Kubernetes-managed platform control plane.
@@ -18,6 +32,7 @@ A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's 
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
 - **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
 - **Zero credentials in sandboxes**: Bedrock credentials live only in LiteLLM Pod's IRSA role
+- **Hardened node-agent host plane** (V2401449830): HMAC-signed control-plane requests on every non-health route, fail-closed caller allowlist, management-IP bind, host iptables isolating guests from the host, IMDS, other guests and other nodes' agents, and strict server-side path / S3-prefix validation
 - **Platform observability**: low-cardinality Prometheus metrics, centralized JSON logs in CloudWatch, cross-component OpenTelemetry/X-Ray traces, five alert classes, an eight-panel dashboard, SHA-256 snapshot verification, AMP remote-write, and automated AMG configuration
 
 ### Use Cases
@@ -225,7 +240,6 @@ FC_NODES=$(kubectl get nodes -l sandbox=true \
   -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
 API_KEY=$(openssl rand -hex 32)
 LITELLM_KEY=$(openssl rand -hex 32)
-NODE_AGENT_AUTH_SECRET=$(openssl rand -hex 32)
 terraform apply -auto-approve \
   -var="fc_nodes=${FC_NODES}" \
   -var="sandbox_image=public.ecr.aws/amazonlinux/amazonlinux:2023" \
@@ -236,7 +250,6 @@ terraform apply -auto-approve \
   -var="create_ingress_nginx=false" \
   -var="sandbox_domain=sbx.example.com" \
   -var="api_keys=${API_KEY}" \
-  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}" \
   -var="litellm_master_key=${LITELLM_KEY}"
 # Terraform creates: IRSA roles, K8s resources (sandbox-system namespace +
 # control-plane Deployment + node-agent DaemonSet), api-keys Secret + ConfigMap.
@@ -328,7 +341,6 @@ cd terraform/stage2-control-plane && terraform destroy -auto-approve \
   -var="enable_fargate=false" \
   -var="create_ingress_nginx=false" \
   -var="api_keys=placeholder" \
-  -var="node_agent_auth_secret=placeholder-placeholder-1234567890" \
   -var="litellm_master_key=placeholder"
 
 # Delete orphaned pod ENIs left by terminated nodes (VPC CNI creates them; they are NOT

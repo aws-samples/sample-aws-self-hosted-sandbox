@@ -24,6 +24,7 @@ class TestNodeAgentObservability(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         os.environ["SBX_BASE"] = cls.tmp.name
+        os.environ["NODE_AGENT_AUTH_KEY"] = "k" * 48
         os.environ["FC_BIN"] = os.path.join(cls.tmp.name, "firecracker")
         pathlib.Path(os.environ["FC_BIN"]).touch(mode=0o755)
 
@@ -60,67 +61,29 @@ class TestNodeAgentObservability(unittest.TestCase):
         self.main._HEARTBEAT_LAST_ITERATION = time.monotonic()
 
     def test_node_agent_hmac_auth_rejects_replay_and_tampering(self):
-        secret = "a" * 48
-        now = 1_700_000_000
+        agent_auth = self.main.agent_auth
+        key = b"a" * 48
+        verifier = agent_auth.Verifier(key)
         body = b'{"id":"sbx-1"}'
+        timestamp = str(int(time.time()))
         nonce = "nonce-0123456789abcdef"
-        timestamp = str(now)
         content_hash = hashlib.sha256(body).hexdigest()
-        signature = hmac.new(
-            secret.encode(),
-            self.main._auth_canonical_request(
-                "POST",
-                "/vm/destroy",
-                timestamp,
-                nonce,
-                content_hash,
-            ),
-            hashlib.sha256,
-        ).hexdigest()
         headers = {
-            "X-SBX-Auth-Version": "v1",
-            "X-SBX-Timestamp": timestamp,
-            "X-SBX-Nonce": nonce,
-            "X-SBX-Content-SHA256": content_hash,
-            "X-SBX-Signature": signature,
+            agent_auth.HEADER_TIMESTAMP: timestamp,
+            agent_auth.HEADER_NONCE: nonce,
+            agent_auth.HEADER_CONTENT_SHA256: content_hash,
+            agent_auth.HEADER_SIGNATURE: agent_auth.sign(
+                key, timestamp, nonce, "POST", "/vm/destroy", content_hash),
         }
-        self.main._AUTH_NONCES.clear()
-        with (
-            patch.object(
-                self.main, "NODE_AGENT_AUTH_SECRET", secret
-            ),
-            patch.object(
-                self.main, "NODE_AGENT_AUTH_REQUIRED", True
-            ),
-        ):
-            allowed, reason = self.main._verify_node_agent_auth(
-                "POST",
-                "/vm/destroy",
-                body,
-                headers,
-                now=now,
-            )
-            self.assertTrue(allowed, reason)
-            replayed, replay_reason = self.main._verify_node_agent_auth(
-                "POST",
-                "/vm/destroy",
-                body,
-                headers,
-                now=now,
-            )
-            self.assertFalse(replayed)
-            self.assertIn("already used", replay_reason)
-
-            self.main._AUTH_NONCES.clear()
-            tampered, tamper_reason = self.main._verify_node_agent_auth(
-                "POST",
-                "/vm/destroy",
-                b'{"id":"other"}',
-                headers,
-                now=now,
-            )
-            self.assertFalse(tampered)
-            self.assertIn("hash mismatch", tamper_reason)
+        self.assertEqual(
+            verifier.verify_headers(headers, "POST", "/vm/destroy"), content_hash)
+        self.assertTrue(agent_auth.body_matches(body, content_hash))
+        with self.assertRaises(agent_auth.AuthError):  # nonce 重放
+            verifier.verify_headers(headers, "POST", "/vm/destroy")
+        tampered = dict(headers, **{agent_auth.HEADER_NONCE: "nonce-fedcba9876543210"})
+        with self.assertRaises(agent_auth.AuthError):  # 签名与 nonce 不匹配
+            verifier.verify_headers(tampered, "POST", "/vm/destroy")
+        self.assertFalse(agent_auth.body_matches(b'{"id":"sbx-2"}', content_hash))
 
     def test_host_systemd_runtime_is_independent_from_agent_process(self):
         sandbox_id = "sbx-host-runtime"
@@ -458,8 +421,12 @@ class TestNodeAgentObservability(unittest.TestCase):
             ) as verify:
                 result = self.main.op_resume({
                     "id": "already-resumed",
-                    "snapshot_local_path": "/must/not/be/read",
-                    "rootfs_path": "/must/not/be/read/rootfs.ext4",
+                    # 路径须通过服务端校验({SBX_BASE}/{id}/...),但目录并不存在:
+                    # 幂等返回时不得读取它们
+                    "snapshot_local_path": os.path.join(
+                        self.main.SBX_BASE, "already-resumed", "snap"),
+                    "rootfs_path": os.path.join(
+                        self.main.SBX_BASE, "already-resumed", "rootfs.ext4"),
                     "tap_idx": 10,
                 })
             verify.assert_not_called()

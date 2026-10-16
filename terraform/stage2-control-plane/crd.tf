@@ -189,7 +189,7 @@ resource "kubernetes_deployment" "firecracker_operator" {
         }
         annotations = {
           "sandbox.platform/config-sha256"          = sha256(jsonencode(kubernetes_config_map.control_plane.data))
-          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
+          "sandbox.platform/node-agent-auth-sha256" = sha256(random_password.node_agent_auth.result)
         }
       }
       spec {

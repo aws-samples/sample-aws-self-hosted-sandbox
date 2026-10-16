@@ -35,6 +35,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from sandbox_api import db
+from sandbox_api import node_agent_auth
 from sandbox_api.autosleep import AutoSleeper
 from sandbox_api.crd import (
     CRDCreateOutcomeUnknown,
@@ -43,7 +44,6 @@ from sandbox_api.crd import (
 )
 from sandbox_api.driver import SandboxSpec, ServiceSpec, UnsupportedOperation
 from sandbox_api.idle_detection import IdleDetector
-from sandbox_api.node_agent_auth import auth_headers as node_agent_auth_headers
 from sandbox_api.observability import (
     RESUME_INFLIGHT,
     RESUME_QUEUE_WAIT,
@@ -1228,34 +1228,15 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         req_body = self.rfile.read(n) if n else None
 
-        hop = {
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-            "host",
-            "x-sbx-auth-version",
-            "x-sbx-timestamp",
-            "x-sbx-nonce",
-            "x-sbx-content-sha256",
-            "x-sbx-signature",
-        }
-        fwd = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+        hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+               "te", "trailers", "transfer-encoding", "upgrade", "host"}
+        fwd = {k: v for k, v in self.headers.items()
+               if k.lower() not in hop and k.lower() not in node_agent_auth.AUTH_HEADERS}
         fwd["X-Request-ID"] = getattr(self, "request_id", "")
         inject_trace_headers(fwd)
-        fwd.update(
-            node_agent_auth_headers(
-                self.command,
-                upstream_path,
-                req_body,
-            )
-        )
-
         try:
+            # 转发给 node-agent 的请求由控制面签名(外部客户端自带的同名头已在上面剔除)
+            fwd.update(node_agent_auth.signed_headers(self.command, upstream_path, req_body))
             conn = http.client.HTTPConnection(node_host, timeout=30)
             conn.request(self.command, upstream_path, body=req_body, headers=fwd)
             resp = conn.getresponse()
@@ -1282,35 +1263,28 @@ class Handler(BaseHTTPRequestHandler):
         """WebSocket 反代:向 node-agent 建原始 TCP,重放请求(含 Upgrade 头),再双向透传。"""
         host, _, port_s = node_host.partition(":")
         try:
+            agent_auth_headers = node_agent_auth.signed_headers(self.command, upstream_path)
+        except RuntimeError as e:
+            self._send(503, {"error": "node-agent auth not configured", "hint": str(e)})
+            return True
+        try:
             up = socket.create_connection((host, int(port_s or NODE_AGENT_PORT)), timeout=10)
         except OSError as e:
             self._send(502, {"error": "ws node-agent unreachable", "hint": str(e)})
             return True
         lines = [f"{self.command} {upstream_path} HTTP/1.1"]
         for k, v in self.headers.items():
-            if k.lower() in {
-                "host",
-                "x-request-id",
-                "x-sbx-auth-version",
-                "x-sbx-timestamp",
-                "x-sbx-nonce",
-                "x-sbx-content-sha256",
-                "x-sbx-signature",
-            }:
+            if k.lower() in {"host", "x-request-id"} or k.lower() in node_agent_auth.AUTH_HEADERS:
                 continue
             lines.append(f"{k}: {v}")
         lines.append(f"Host: {node_host}")
         lines.append(f"X-Request-ID: {getattr(self, 'request_id', '')}")
+        for k, v in agent_auth_headers.items():
+            lines.append(f"{k}: {v}")
         trace_headers: dict[str, str] = {}
         inject_trace_headers(trace_headers)
         if traceparent := trace_headers.get("traceparent"):
             lines.append(f"traceparent: {traceparent}")
-        for key, value in node_agent_auth_headers(
-            self.command,
-            upstream_path,
-            b"",
-        ).items():
-            lines.append(f"{key}: {value}")
         up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         with _idle_detector.connection(sid):
             _raw_tunnel(

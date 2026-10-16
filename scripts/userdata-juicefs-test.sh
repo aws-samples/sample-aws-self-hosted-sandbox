@@ -105,5 +105,19 @@ sysctl -w net.ipv4.ip_forward=1
 HOST_IF=$(ip route | awk '/default/{print $5; exit}')
 iptables -t nat -C POSTROUTING -o "$HOST_IF" -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -o "$HOST_IF" -j MASQUERADE
+# guest 隔离(V2401449830):guest 不得访问宿主任何端口(含 node-agent :8002)、IMDS、
+# 其他 guest、其他节点的 node-agent。与 node-agent 启动时安装的链同名同内容(幂等重建)。
+for CH in SBX-GUEST-IN SBX-GUEST-FWD; do iptables -N "$CH" 2>/dev/null || true; iptables -F "$CH" || true; done
+iptables -A SBX-GUEST-IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
+iptables -A SBX-GUEST-IN -p tcp --dport 8002 -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix "sbx-guest-agent-probe " || true
+iptables -A SBX-GUEST-IN -j DROP || true
+iptables -A SBX-GUEST-FWD -o fctap+ -j DROP || true
+iptables -A SBX-GUEST-FWD -d 169.254.169.254/32 -j DROP || true
+iptables -A SBX-GUEST-FWD -d 169.254.170.23/32 -j DROP || true
+iptables -A SBX-GUEST-FWD -p tcp --dport 8002 -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix "sbx-guest-agent-probe " || true
+iptables -A SBX-GUEST-FWD -p tcp --dport 8002 -j DROP || true
+iptables -A SBX-GUEST-FWD -j RETURN || true
+iptables -C INPUT -i fctap+ -j SBX-GUEST-IN 2>/dev/null || iptables -I INPUT 1 -i fctap+ -j SBX-GUEST-IN || true
+iptables -C FORWARD -i fctap+ -j SBX-GUEST-FWD 2>/dev/null || iptables -I FORWARD 1 -i fctap+ -j SBX-GUEST-FWD || true
 
 echo "[userdata] COMPLETE $(date)"

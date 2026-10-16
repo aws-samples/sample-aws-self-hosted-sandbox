@@ -74,12 +74,11 @@ bash scripts/build_and_push.sh \
 
 ```bash
 cd terraform/stage2-control-plane && terraform init
-NODE_AGENT_AUTH_SECRET=$(openssl rand -hex 32)  # 生成一次并安全保存，后续 apply 复用
 terraform apply \
   -var="sandbox_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/claude-sbx:poc" \
   -var="control_plane_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/sandbox-control-plane:latest" \
-  -var="node_agent_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
-  -var="node_agent_auth_secret=${NODE_AGENT_AUTH_SECRET}"
+  -var="node_agent_image=<ACCT>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest"
+# 控制面 ↔ node-agent 的 HMAC 密钥由 Terraform 自动生成(Secret node-agent-auth)
 ```
 
 ### 4. 端到端测试
@@ -103,7 +102,7 @@ bash scripts/e2e_test.sh --api-key "$API_KEY"
 | FC_NODES | | 心跳表为空时的 fallback；只填 `sandbox=true` 节点内网 IP |
 | WARM_POOL_SIZE | 5 | 暖池沙盒数 |
 | NODE_AGENT_PORT | 8002 | node-agent 监听端口 |
-| NODE_AGENT_AUTH_SECRET | （生产必填） | 控制面/operator 到 node-agent 的 HMAC-SHA256 独立密钥 |
+| NODE_AGENT_AUTH_KEY / NODE_AGENT_AUTH_KEY_FILE | （必填,Terraform 生成） | 控制面/operator 到 node-agent 的 HMAC-SHA256 密钥(≥32 字节) |
 
 本地测试还应运行 `smoke_test.py`、`crd_test.py`、`recovery_test.py`、
 `node-agent/observability_test.py`、`node-agent/reclaim_test.py` 和

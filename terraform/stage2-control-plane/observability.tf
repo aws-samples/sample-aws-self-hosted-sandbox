@@ -222,6 +222,48 @@ locals {
             }
           },
           {
+            # 安全检测(V2401449830):guest tap 网段来源访问 node-agent 永远是攻击信号。
+            # 宿主 iptables 已丢弃此类包(并以 "sbx-guest-agent-probe" 前缀写内核日志),
+            # 这里覆盖防火墙被绕过/未安装时到达应用层的请求。
+            alert = "NodeAgentGuestSourceRequest"
+            expr  = "increase(node_agent_security_events_total{reason=\"guest_source\"}[5m]) > 0"
+            for   = "0m"
+            labels = {
+              severity = "critical"
+              category = "security"
+            }
+            annotations = {
+              summary     = "A sandbox guest address reached node-agent"
+              description = "Requests from the tap range (172.18.0.0/16) reached node-agent on {{ $labels.kubernetes_node }}. Check the SBX-GUEST-IN iptables chain and the node kernel log for sbx-guest-agent-probe."
+            }
+          },
+          {
+            alert = "NodeAgentUnauthenticatedRequests"
+            expr  = "sum by (kubernetes_node, reason) (increase(node_agent_security_events_total{kind=\"auth_denied\",reason!=\"guest_source\"}[5m])) > 0"
+            for   = "0m"
+            labels = {
+              severity = "warning"
+              category = "security"
+            }
+            annotations = {
+              summary     = "node-agent rejected unauthenticated or unauthorized requests"
+              description = "Reason {{ $labels.reason }} on {{ $labels.kubernetes_node }}: callers outside ALLOWED_CALLER_CIDR, missing/invalid HMAC signatures or replayed nonces."
+            }
+          },
+          {
+            alert = "NodeAgentPathTraversalAttempt"
+            expr  = "sum by (kubernetes_node, reason) (increase(node_agent_security_events_total{kind=\"invalid_request\",reason=~\"bad_path|path_outside_sbx_base|path_owner_mismatch|symlink|bad_s3_prefix|bad_id|bad_kernel\"}[5m])) > 0"
+            for   = "0m"
+            labels = {
+              severity = "critical"
+              category = "security"
+            }
+            annotations = {
+              summary     = "node-agent rejected a request with an out-of-convention host path or S3 prefix"
+              description = "An authenticated caller sent absolute/traversal paths, a foreign S3 prefix or an invalid sandbox id ({{ $labels.reason }}). The control plane never does this; treat as a compromised caller."
+            }
+          },
+          {
             alert = "SandboxOrphanGrowth"
             expr  = "increase(reconcile_actions_total{action=\"orphaned\"}[15m]) > 0"
             for   = "0m"

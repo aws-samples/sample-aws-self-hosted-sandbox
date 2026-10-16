@@ -23,7 +23,6 @@
 #     -var="node_agent_image=<acct>.dkr.ecr.us-east-1.amazonaws.com/node-agent:latest" \
 #     -var="litellm_url=http://litellm.litellm.svc.cluster.local:4000" \
 #     -var="snapshot_s3_bucket=<your-bucket>" \
-#     -var="node_agent_auth_secret=<openssl-rand-hex-32>"
 
 terraform {
   required_version = ">= 1.5"
@@ -32,6 +31,7 @@ terraform {
     kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.0" }
     helm       = { source = "hashicorp/helm", version = "~> 2.0" }
     null       = { source = "hashicorp/null", version = "~> 3.0" }
+    random     = { source = "hashicorp/random", version = "~> 3.0" }
   }
 }
 
@@ -67,6 +67,15 @@ variable "fc_nodes" {
   type        = string
   description = "Comma-separated private IPs of Firecracker sandbox nodes running node-agent"
   default     = ""
+}
+
+# node-agent 受保护路由的来源白名单(逗号分隔 CIDR)。留空 = 集群 VPC CIDR
+# (控制面 Pod 走 VPC CNI 拿 VPC 内地址)。node-agent 对空白名单 fail closed,
+# 因此这里始终下发非空值;guest tap 网段 172.18.0.0/16 另由 DENIED_CALLER_CIDR 永久拒绝。
+variable "node_agent_allowed_caller_cidrs" {
+  type        = string
+  default     = ""
+  description = "Comma-separated CIDRs allowed to call node-agent protected routes (default: cluster VPC CIDR). Authentication (HMAC) is always required in addition."
 }
 
 variable "nlb_hostname" {
@@ -285,6 +294,11 @@ resource "aws_s3_bucket" "snapshots" {
 }
 
 locals {
+  snapshot_bucket_or_placeholder  = local.snapshot_bucket != "" ? local.snapshot_bucket : "placeholder"
+  node_agent_allowed_caller_cidrs = var.node_agent_allowed_caller_cidrs != "" ? var.node_agent_allowed_caller_cidrs : data.aws_vpc.cluster.cidr_block
+}
+
+locals {
   snapshot_bucket = var.snapshot_s3_bucket != "" ? var.snapshot_s3_bucket : (
     length(aws_s3_bucket.snapshots) > 0 ? aws_s3_bucket.snapshots[0].id : ""
   )
@@ -447,24 +461,29 @@ resource "aws_iam_role" "node_agent" {
 resource "aws_iam_role_policy" "node_agent" {
   name = "node-agent-policy"
   role = aws_iam_role.node_agent.id
+  # 最小权限:只能读写快照桶的 sbx/ 前缀(与 node-agent 校验的 s3_prefix 约定一致),
+  # 读 / 写分开声明,不授予 DeleteObject(aws s3 sync 不带 --delete)。
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # S3 快照上传/下载
       {
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-        Resource = local.snapshot_bucket != "" ? [
-          "arn:aws:s3:::${local.snapshot_bucket}",
-          "arn:aws:s3:::${local.snapshot_bucket}/*",
-        ] : ["arn:aws:s3:::placeholder"]
+        Sid       = "SnapshotList"
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}"]
+        Condition = { StringLike = { "s3:prefix" = ["sbx/*"] } }
       },
-      # ECR 拉镜像(rootfs 构建产物)
       {
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken", "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer"]
-        Resource = ["*"]
+        Sid      = "SnapshotRead"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}/sbx/*"]
+      },
+      {
+        Sid      = "SnapshotWrite"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = ["arn:aws:s3:::${local.snapshot_bucket_or_placeholder}/sbx/*"]
       },
       # 节点心跳 + Spot 疏散实时 journal。主状态表更新带
       # attribute_exists(id) 条件，node-agent 无法凭空创建沙盒记录。
@@ -488,6 +507,7 @@ resource "aws_iam_role_policy" "node_agent" {
         Resource = ["*"]
       },
       {
+        Sid      = "NodeHeartbeat"
         Effect   = "Allow"
         Action   = ["ec2:ModifyInstanceAttribute"]
         Resource = ["arn:aws:ec2:${var.region}:${local.account_id}:instance/*"]
@@ -499,6 +519,15 @@ resource "aws_iam_role_policy" "node_agent" {
       },
     ]
   })
+}
+
+# ---------- 控制面 ↔ node-agent 鉴权密钥 ----------
+# node-agent 只接受带 HMAC 签名的请求(见 node-agent/agent_auth.py)。密钥由 Terraform 生成,
+# 存为 sandbox-system 下的 Secret,只注入控制面 Deployment 与 node-agent DaemonSet。
+# 轮换:terraform apply -replace=random_password.node_agent_auth 后滚动重启两者。
+resource "random_password" "node_agent_auth" {
+  length  = 64
+  special = false
 }
 
 # ---------- Kubernetes: Namespace ----------
@@ -709,18 +738,10 @@ variable "api_keys" {
   description = "逗号分隔的 Bearer token 列表，注入控制面 API_KEYS env（生产必填）"
 }
 
-variable "node_agent_auth_secret" {
-  type        = string
-  sensitive   = true
-  description = "控制面到 node-agent 的独立 HMAC 密钥，至少 32 字符。建议用 openssl rand -hex 32 生成。"
-  validation {
-    condition     = length(var.node_agent_auth_secret) >= 32
-    error_message = "node_agent_auth_secret 至少 32 个字符。"
-  }
-}
-
-locals {
-  node_agent_auth_secret = var.node_agent_auth_secret
+variable "node_agent_enable_test_hooks" {
+  type        = bool
+  default     = false
+  description = "开启 node-agent 测试钩子(/reclaim/simulate、/reclaim/reset),仅用于压测/演练;生产保持关闭。"
 }
 
 resource "kubernetes_secret" "control_plane_api_keys" {
@@ -740,7 +761,7 @@ resource "kubernetes_secret" "node_agent_auth" {
     namespace = kubernetes_namespace.sandbox_system.metadata[0].name
   }
   data = {
-    NODE_AGENT_AUTH_SECRET = local.node_agent_auth_secret
+    NODE_AGENT_AUTH_KEY = random_password.node_agent_auth.result
   }
   type = "Opaque"
 }
@@ -798,7 +819,6 @@ resource "kubernetes_config_map" "control_plane" {
     LISTEN_PORT                      = "8000"
     LISTEN_HOST                      = "0.0.0.0"
     NODE_AGENT_PORT                  = "8002"
-    NODE_AGENT_AUTH_REQUIRED         = "1"
     # 端口暴露:对外访问前缀(NLB 自带域名)。供控制面 /admin/cluster 返回给 Portal 拼
     # 可点击 URL(http://<nlb>/s/<id>/<port>/)。留空则 Portal 回退相对路径(仅本地 port-forward 可访问)。
     NLB_HOSTNAME = var.nlb_hostname
@@ -829,8 +849,9 @@ resource "kubernetes_deployment" "control_plane" {
       metadata {
         labels = { app = "sandbox-control-plane", fargate = "true" }
         annotations = {
-          "sandbox.platform/config-sha256"          = sha256(jsonencode(kubernetes_config_map.control_plane.data))
-          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
+          "sandbox.platform/config-sha256" = sha256(jsonencode(kubernetes_config_map.control_plane.data))
+          # 密钥轮换时触发滚动重启
+          "sandbox.platform/node-agent-auth-sha256" = sha256(random_password.node_agent_auth.result)
         }
       }
       spec {
@@ -863,6 +884,7 @@ resource "kubernetes_deployment" "control_plane" {
           env_from {
             secret_ref { name = kubernetes_secret.control_plane_api_keys.metadata[0].name }
           }
+          # 调用 node-agent 的 HMAC 签名密钥
           env_from {
             secret_ref { name = kubernetes_secret.node_agent_auth.metadata[0].name }
           }
@@ -953,7 +975,8 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
       metadata {
         labels = { app = "node-agent" }
         annotations = {
-          "sandbox.platform/node-agent-auth-sha256" = sha256(local.node_agent_auth_secret)
+          # 密钥轮换时触发滚动重启
+          "sandbox.platform/node-agent-auth-sha256" = sha256(random_password.node_agent_auth.result)
         }
       }
       spec {
@@ -966,7 +989,12 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           value    = "sandbox"
           effect   = "NoSchedule"
         }
-        # 需要 hostNetwork + hostPID 才能操作 tap/Firecracker
+        # 需要 hostNetwork 才能操作 tap/iptables。
+        # hostPID:VMM 由宿主 systemd 托管(sbx.slice 下的 transient service),node-agent 经
+        # nsenter -t 1 调用宿主 helper,才能做到 node-agent Pod 重建时 microVM 不中断
+        # (2026-10-16 真机实测 Pod 替换 22s 期间 guest 持续运行)。容器本身已是 privileged,
+        # hostPID 带来的额外暴露有限;其余宿主执行面隔离(HMAC、来源 CIDR、绑定管理 IP、
+        # guest iptables 隔离、路径校验)全部保留。
         host_network = true
         host_pid     = true
         # 需要特权容器操作 KVM/tap/iptables
@@ -984,18 +1012,49 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             name  = "NODE_AGENT_PORT"
             value = "8002"
           }
+          # ---- 宿主执行面安全(V2401449830)----
+          # 只绑节点主网卡 IP(管理面),不再 0.0.0.0;心跳上报同一地址。
           env {
-            name  = "NODE_AGENT_AUTH_REQUIRED"
-            value = "1"
+            name = "NODE_AGENT_LISTEN_HOST"
+            value_from {
+              field_ref { field_path = "status.hostIP" }
+            }
           }
           env {
-            name = "NODE_AGENT_AUTH_SECRET"
+            name = "NODE_ADVERTISE_IP"
+            value_from {
+              field_ref { field_path = "status.hostIP" }
+            }
+          }
+          # 受保护路由来源白名单(空值 node-agent 会拒绝启动);guest tap 网段永久拒绝。
+          env {
+            name  = "ALLOWED_CALLER_CIDR"
+            value = local.node_agent_allowed_caller_cidrs
+          }
+          env {
+            name  = "DENIED_CALLER_CIDR"
+            # tap_idx<=255 用 172.18.x,>255 映射到 172.19.x(见 node-agent _tap_addresses)
+            value = "172.18.0.0/16,172.19.0.0/16"
+          }
+          # 控制面 ↔ node-agent HMAC 密钥(缺失则 node-agent 拒绝启动)
+          env {
+            name = "NODE_AGENT_AUTH_KEY"
             value_from {
               secret_key_ref {
                 name = kubernetes_secret.node_agent_auth.metadata[0].name
-                key  = "NODE_AGENT_AUTH_SECRET"
+                key  = "NODE_AGENT_AUTH_KEY"
               }
             }
+          }
+          # 测试钩子(/reclaim/simulate、/reclaim/reset)生产关闭
+          env {
+            name  = "NODE_AGENT_ENABLE_TEST_HOOKS"
+            value = var.node_agent_enable_test_hooks ? "1" : "0"
+          }
+          # 启动时安装 guest 隔离 iptables 规则(SBX-GUEST-IN / SBX-GUEST-FWD)
+          env {
+            name  = "NODE_AGENT_GUEST_FIREWALL"
+            value = "1"
           }
           env {
             name  = "SBX_BASE"
@@ -1119,9 +1178,11 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             mount_path = "/srv/jailer"
           }
           # B2: rootfs 模板 + guest kernel 在宿主 /opt/sbx,node-agent 需挂入做 CoW 源
+          # 只读:node-agent 只从模板 CoW 复制,从不写 /opt/sbx(防模板/kernel 被篡改投毒)
           volume_mount {
             name       = "fc-assets"
             mount_path = "/opt/sbx"
+            read_only  = true
           }
           volume_mount {
             name       = "cloud-init-data"

@@ -89,11 +89,10 @@ class HttpClient:
                 hashlib.sha256,
             ).hexdigest()
             headers.update({
-                "X-SBX-Auth-Version": "v1",
-                "X-SBX-Timestamp": timestamp,
-                "X-SBX-Nonce": nonce,
-                "X-SBX-Content-SHA256": content_hash,
-                "X-SBX-Signature": signature,
+                "X-Sbx-Agent-Timestamp": timestamp,
+                "X-Sbx-Agent-Nonce": nonce,
+                "X-Sbx-Agent-Content-SHA256": content_hash,
+                "X-Sbx-Agent-Signature": f"v1={signature}",
             })
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -388,7 +387,7 @@ def discover_node_agent_auth_secret(namespace: str) -> str:
                 "secret",
                 "node-agent-auth",
                 "-o",
-                "jsonpath={.data.NODE_AGENT_AUTH_SECRET}",
+                "jsonpath={.data.NODE_AGENT_AUTH_KEY}",
             ],
             check=True,
             capture_output=True,
@@ -456,10 +455,10 @@ def main() -> int:
     parser.add_argument("--node-agent-url", default="")
     parser.add_argument(
         "--node-agent-auth-secret",
-        default=os.environ.get("NODE_AGENT_AUTH_SECRET", ""),
+        default=os.environ.get("NODE_AGENT_AUTH_KEY", ""),
         help=(
             "HMAC secret for direct node-agent calls. Prefer the "
-            "NODE_AGENT_AUTH_SECRET environment variable."
+            "NODE_AGENT_AUTH_KEY environment variable."
         ),
     )
     parser.add_argument(
