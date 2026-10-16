@@ -2806,12 +2806,19 @@ def _state_volume_device(volume_id: str = "") -> str:
     target = _normalize_volume_id(volume_id)
     if target:
         compact = target.replace("-", "")
-        for path in (
-            f"/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{compact}",
-            f"/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{target}",
-        ):
-            if os.path.exists(path):
-                return os.path.realpath(path)
+        wanted = {
+            f"nvme-Amazon_Elastic_Block_Store_{compact}",
+            f"nvme-Amazon_Elastic_Block_Store_{target}",
+        }
+        # 只用目录里真实存在的条目名拼路径,不把请求里的 volume_id 拼进文件系统路径
+        by_id = "/dev/disk/by-id"
+        try:
+            entries = sorted(os.listdir(by_id))
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry in wanted:
+                return os.path.realpath(os.path.join(by_id, entry))
         try:
             out = subprocess.run(
                 ["lsblk", "-ndo", "PATH,SERIAL"],
@@ -3872,7 +3879,11 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in resp.getheaders():
             if k.lower() in hop or k.lower() == "content-length":
                 continue
-            self.send_header(k, v)
+            # 上游是不可信的 guest:丢弃含 CR/LF 的头,防止响应头注入/拆分
+            if any(c in k or c in v for c in ("\r", "\n")):
+                continue
+            self.send_header(k.replace("\r", "").replace("\n", ""),
+                             v.replace("\r", "").replace("\n", ""))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
