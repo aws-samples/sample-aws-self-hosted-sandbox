@@ -142,6 +142,9 @@ run_jailer() {
   mount --bind /opt/sbx "$jail_root/opt/sbx"
   mount -o remount,bind,ro "$jail_root/opt/sbx"
 
+  # 不用 --new-pid-ns:jailer 会把 firecracker fork 进新 PID ns 后父进程退出,
+  # systemd(Type=exec)把主进程退出当成服务结束,KillMode=mixed 随即 SIGKILL
+  # 整个 unit。让 jailer 直接 exec firecracker,保持它是 unit 的 MainPID。
   exec "$JAILER_BIN" \
     --id "$sid" \
     --exec-file "$FC_BIN" \
@@ -149,7 +152,6 @@ run_jailer() {
     --gid "$gid" \
     --chroot-base-dir "$JAILER_BASE" \
     --cgroup-version 2 \
-    --new-pid-ns \
     -- \
     --api-sock "/run/$socket_name"
 }

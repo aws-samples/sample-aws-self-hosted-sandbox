@@ -654,7 +654,8 @@ def _stop_vmm(sandbox_id: str, vm: dict) -> None:
 
 def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
                mem_mib: int, kernel: str, env: dict,
-               guest_ip: str = "", host_ip: str = "") -> tuple[int, str, str]:
+               guest_ip: str = "", host_ip: str = "",
+               balloon: dict | None = None) -> tuple[int, str, str]:
     """
     启动 Firecracker，返回 (pid, api_sock, runtime_unit)。
     生产模式由宿主 systemd + jailer 提供独立 cgroup/chroot。
@@ -719,6 +720,18 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
             "iface_id": "eth0",
             "host_dev_name": tap,
         })
+        # 可选 virtio-balloon(只能 boot 前配置):free_page_reporting 让 guest
+        # 把释放的页还给宿主(宿主 RSS 随之下降),是内存超分的前提之一。
+        if balloon:
+            _fc(sock, "PUT", "/balloon", {
+                "amount_mib": int(balloon.get("amount_mib", 0)),
+                "deflate_on_oom": bool(balloon.get("deflate_on_oom", True)),
+                "stats_polling_interval_s": int(
+                    balloon.get("stats_polling_interval_s", 0)
+                ),
+                **({"free_page_reporting": True}
+                   if balloon.get("free_page_reporting") else {}),
+            })
         # vsock 配置失败不阻断 VM 启动(exec 回退 SSH)。
         vsock_path = f"{d}/v.sock"
         try:
@@ -1035,6 +1048,7 @@ def op_create(body: dict) -> dict:
             env,
             guest_ip=guest_ip,
             host_ip=host_ip,
+            balloon=body.get("balloon") or None,
         )
     except Exception:
         _teardown_tap(tap)

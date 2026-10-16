@@ -502,10 +502,10 @@ module "eks" {
         chmod +x /usr/local/bin/firecracker-jailer && \
         echo "[pre-bootstrap] Firecracker+jailer OK" || echo "[pre-bootstrap] Firecracker install failed (non-fatal)"
 
-        echo "${base64encode(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
-          | base64 -d >/usr/local/sbin/sbx-vmm-runtime
-        echo "${base64encode(file("${path.module}/../../scripts/sbx-state-volume"))}" \
-          | base64 -d >/usr/local/sbin/sbx-state-volume
+        echo "${base64gzip(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
+          | base64 -d | gunzip >/usr/local/sbin/sbx-vmm-runtime
+        echo "${base64gzip(file("${path.module}/../../scripts/sbx-state-volume"))}" \
+          | base64 -d | gunzip >/usr/local/sbin/sbx-state-volume
         chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         # 커널 (16MB, 빠름) —— 架构由 Terraform node_arch 注入
@@ -630,10 +630,10 @@ module "eks" {
         mv "/tmp/release-$${VER}-$${ARCH}/jailer-$${VER}-$${ARCH}" /usr/local/bin/firecracker-jailer 2>/dev/null && \
         chmod +x /usr/local/bin/firecracker /usr/local/bin/firecracker-jailer || true
 
-        echo "${base64encode(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
-          | base64 -d >/usr/local/sbin/sbx-vmm-runtime
-        echo "${base64encode(file("${path.module}/../../scripts/sbx-state-volume"))}" \
-          | base64 -d >/usr/local/sbin/sbx-state-volume
+        echo "${base64gzip(file("${path.module}/../../scripts/sbx-vmm-runtime"))}" \
+          | base64 -d | gunzip >/usr/local/sbin/sbx-vmm-runtime
+        echo "${base64gzip(file("${path.module}/../../scripts/sbx-state-volume"))}" \
+          | base64 -d | gunzip >/usr/local/sbin/sbx-state-volume
         chmod 0755 /usr/local/sbin/sbx-vmm-runtime /usr/local/sbin/sbx-state-volume
 
         curl -sfL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/${local.node_arch_cfg.fc_arch}/vmlinux-5.10.223" \
