@@ -803,6 +803,8 @@ resource "aws_iam_policy" "sandbox_node_rootfs_read" {
       Resource = [
         "arn:aws:s3:::${local.rootfs_s3_path}",
         "arn:aws:s3:::${local.rootfs_s3_bucket}/${local.rootfs_s3_dir}rootfs-*.tar.gz",
+        # 宿主 helper(sbx-vmm-runtime / sbx-state-volume),user-data 下载后按 sha256 校验
+        "arn:aws:s3:::${local.host_helper_bucket}/${local.host_helper_key_dir}/*",
       ]
     }]
   })
