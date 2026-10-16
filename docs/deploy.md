@@ -108,6 +108,20 @@ fi
 选择 `amd64` 时，Terraform 会在 Launch Template 中显式设置
 `nested_virtualization=enabled`。若查询结果或目标区域不支持该能力，不要继续 apply。
 
+> Terraform 变量的 `node_arch` 默认值现为 `amd64`（phase3 与 stage2 需保持一致）；
+> 选 Graviton 时必须显式传 `-var="node_arch=arm64"`（上面的 `NODE_ARCH` 变量已覆盖此点）。
+
+本轮真机测试（r8i 超分 + Spot 快照）调整了以下默认值，部署时无需额外传参，如需改回可显式覆盖：
+
+| 变量 | 所属 | 新默认值 | 说明 |
+|---|---|---|---|
+| `state_ebs_iops` / `state_ebs_throughput` | phase3 | 40000 / 2000 | 原 4000 / 1000；低 IOPS 下 Spot checkpoint 先撞卷 IOPS 上限 |
+| `sandbox_zram_size_gib` | phase3 | 64 | 沙盒节点 zram(zstd) swap，0 关闭；kubelet 同时设 `failSwapOn=false`、`swapBehavior=NoSwap`；内存超分越过 `sbx.slice` 上限时换出冷页而非 OOM 杀 VM |
+| `balloon_free_page_reporting` | stage2 | true | 新建 microVM 默认挂 virtio-balloon 并开启 free page reporting（node-agent env `BALLOON_FREE_PAGE_REPORTING`）；create 请求显式传 `balloon` 时以请求为准 |
+| `reclaim_auto_evacuate` | stage2 | true | 原 false；关闭则 Spot 中断只做 DRY-RUN |
+| `reclaim_snapshot_concurrency` | stage2 | 8 | 原 12 |
+| `spot_recovery_od_recycle_enabled` | stage2 | false | 原 true；OD 回收的卷交接阶段存在已知 bug，修复前保持关闭 |
+
 ---
 
 ## Step 1: 创建 DynamoDB 状态表（必做，勿跳）

@@ -103,14 +103,14 @@ variable "warm_pool_size" {
 
 variable "reclaim_auto_evacuate" {
   type        = bool
-  default     = false
-  description = "收到 Spot interruption/rebalance 信号后是否真实并发快照。生产压测通过前保持 false。"
+  default     = true
+  description = "收到 Spot interruption/rebalance 信号后是否真实并发快照。2026-10-16 FIS 真实中断实测 20/20 checkpoint + 20/20 恢复且内存校验一致,默认开启;关闭则只做 DRY-RUN。"
 }
 
 variable "reclaim_snapshot_concurrency" {
   type        = number
-  default     = 12
-  description = "单节点 Spot 疏散时并发 Firecracker snapshot 数。用于尽快吃满 EBS，但不会突破实例级 EBS 上限。"
+  default     = 8
+  description = "单节点 Spot 疏散时并发 Firecracker snapshot 数。真机实测 r8i.8xlarge 上 8 与 12/16 总吞吐相同而单任务尾延迟更低,再高只会排队;不会突破实例级 EBS 上限。"
   validation {
     condition     = var.reclaim_snapshot_concurrency >= 1 && var.reclaim_snapshot_concurrency <= 64
     error_message = "reclaim_snapshot_concurrency 必须在 1..64。"
@@ -127,6 +127,12 @@ variable "reclaim_commit_reserve_s" {
   type        = number
   default     = 8
   description = "120 秒窗口尾部预留给 journal/fsync/状态传播的秒数。"
+}
+
+variable "balloon_free_page_reporting" {
+  type        = bool
+  default     = true
+  description = "新建 microVM 默认挂 virtio-balloon 并开启 free page reporting,让 guest 释放的内存还给宿主(内存超分的前提)。真机实测:关闭时 guest 释放 3GiB 后宿主 RSS 不回落,开启后 10s 内降回 240MiB。"
 }
 
 variable "spot_recovery_enabled" {
@@ -167,8 +173,8 @@ variable "spot_recovery_min_standby_per_az" {
 
 variable "spot_recovery_od_recycle_enabled" {
   type        = bool
-  default     = true
-  description = "恢复完成后把状态 EBS 迁回同 AZ 空闲 Spot 节点，并精确缩容被认领的 OD 实例。"
+  default     = false
+  description = "恢复完成后把状态 EBS 迁回同 AZ 空闲 Spot 节点，并精确缩容被认领的 OD 实例。2026-10-16 FIS 实测卷交接阶段循环 spot_recovery_od_recycle_failed,已恢复沙盒再次离线;修复前默认关闭。"
 }
 
 variable "control_plane_replicas" {
@@ -211,8 +217,8 @@ variable "activity_touch_min_s" {
 
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。需与 phase3 的 node_arch 一致。"
+  default     = "amd64"
+  description = "节点 CPU 架构:amd64(Intel x86,默认) 或 arm64(Graviton)。需与 phase3 的 node_arch 一致。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
@@ -1061,6 +1067,10 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "RECLAIM_COMMIT_RESERVE_S"
             value = tostring(var.reclaim_commit_reserve_s)
+          }
+          env {
+            name  = "BALLOON_FREE_PAGE_REPORTING"
+            value = var.balloon_free_page_reporting ? "1" : "0"
           }
           env {
             name  = "CLOUD_INIT_STATUS_PATH"

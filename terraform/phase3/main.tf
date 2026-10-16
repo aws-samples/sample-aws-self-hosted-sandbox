@@ -44,8 +44,8 @@ variable "cluster_name" {
 
 variable "node_arch" {
   type        = string
-  default     = "arm64"
-  description = "节点 CPU 架构:arm64(Graviton,默认) 或 amd64(Intel x86)。决定 AMI、默认实例、Firecracker/内核下载架构以及是否开启嵌套虚拟化。"
+  default     = "amd64"
+  description = "节点 CPU 架构:amd64(Intel x86,默认,r8i.8xlarge) 或 arm64(Graviton c6g.metal)。决定 AMI、默认实例、Firecracker/内核下载架构以及是否开启嵌套虚拟化。"
   validation {
     condition     = contains(["arm64", "amd64"], var.node_arch)
     error_message = "node_arch 仅支持 \"arm64\" 或 \"amd64\"。"
@@ -251,8 +251,8 @@ variable "state_ebs_size_gb" {
 }
 variable "state_ebs_iops" {
   type        = number
-  default     = 4000
-  description = "状态 EBS 的 IOPS。gp3 支持 3000..80000；吞吐需满足 IOPS:MiB/s 至少 4:1。"
+  default     = 40000
+  description = "状态 EBS 的 IOPS。gp3 支持 3000..80000；吞吐需满足 IOPS:MiB/s 至少 4:1。真机实测 4000 IOPS 时 Spot checkpoint 先撞卷 IOPS 上限(平均 I/O 约 227KiB);r8i.8xlarge 实例上限 40000,再高无收益。"
   validation {
     condition = (
       var.state_ebs_iops >= 3000 &&
@@ -263,8 +263,8 @@ variable "state_ebs_iops" {
 }
 variable "state_ebs_throughput" {
   type        = number
-  default     = 1000
-  description = "状态 EBS 吞吐(MiB/s)。当前 gp3 支持 125..2000；2000 MiB/s 至少需要 8000 IOPS。"
+  default     = 2000
+  description = "状态 EBS 吞吐(MiB/s)。当前 gp3 支持 125..2000；2000 MiB/s 至少需要 8000 IOPS。r8i.8xlarge 实例级 EBS 上限 1250MB/s 才是实际天花板。"
   validation {
     condition = (
       var.state_ebs_throughput >= 125 &&
@@ -276,6 +276,52 @@ variable "state_ebs_throughput" {
 }
 
 # ---------- VPC(EKS 专用,3 AZ) ----------
+variable "sandbox_zram_size_gib" {
+  type        = number
+  default     = 64
+  description = "沙盒节点 zram(zstd)压缩 swap 容量(GiB,按换入原始数据计),0 关闭。内存超分越过 sbx.slice 上限时冷页换入 zram 而不是 OOM 杀 VM;真机实测 19GiB 换出只占 0.81GB 物理内存,0 次 OOM,交互 p99 4ms→40ms。kubelet 相应设 failSwapOn=false(swapBehavior=NoSwap,Pod 不使用 swap)。"
+  validation {
+    condition     = var.sandbox_zram_size_gib >= 0 && var.sandbox_zram_size_gib <= 512
+    error_message = "sandbox_zram_size_gib 必须在 0..512。"
+  }
+}
+
+locals {
+  # zram 做成 systemd unit,重启后依然生效(user-data 只在首次启动执行)
+  sandbox_zram_script = <<-EOT
+    cat >/etc/systemd/system/sbx-zram.service <<'UNIT'
+    [Unit]
+    Description=Sandbox zram swap (zstd)
+    Before=kubelet.service
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/bash -c 'modprobe zram num_devices=1 && echo zstd > /sys/block/zram0/comp_algorithm && echo ${var.sandbox_zram_size_gib}G > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p 100 /dev/zram0 && sysctl -w vm.swappiness=100'
+    ExecStop=/bin/bash -c 'swapoff /dev/zram0 || true'
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
+    systemctl daemon-reload && systemctl enable --now sbx-zram.service || echo "[pre-bootstrap] zram setup failed (non-fatal)"
+  EOT
+  sandbox_zram_setup = var.sandbox_zram_size_gib > 0 ? local.sandbox_zram_script : ""
+  # nodeadm NodeConfig:允许宿主有 swap(zram),Pod 本身不使用 swap
+  sandbox_kubelet_swap_nodeconfig = <<-EOT
+      ---
+      apiVersion: node.eks.aws/v1alpha1
+      kind: NodeConfig
+      spec:
+        kubelet:
+          config:
+            failSwapOn: false
+            memorySwap:
+              swapBehavior: NoSwap
+  EOT
+  sandbox_kubelet_swap_part = var.sandbox_zram_size_gib > 0 ? [{
+    content_type = "application/node.eks.aws"
+    content      = local.sandbox_kubelet_swap_nodeconfig
+  }] : []
+}
+
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 6.0"
@@ -434,7 +480,7 @@ module "eks" {
       # AL2023(nodeadm)下用 cloudinit_pre_nodeadm 注入 shell 脚本 MIME 分段,
       # 在 nodeadm 引导前执行(pre_bootstrap_user_data 是 AL2 时代机制,AL2023 会静默忽略)。
       # Firecracker + Redis + JuiceFS + rootfs 预装,不重启 containerd → 不触发节点替换循环。
-      cloudinit_pre_nodeadm = [{
+      cloudinit_pre_nodeadm = concat([{
         content_type = "text/x-shellscript; charset=\"us-ascii\""
         content      = <<-EOT
         #!/bin/bash
@@ -561,10 +607,11 @@ module "eks" {
         # NAT
         sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 
+        ${local.sandbox_zram_setup}
         touch /opt/sbx/.bootstrap-complete
         echo "[pre-bootstrap] DONE $(date)"
       EOT
-      }]
+      }], local.sandbox_kubelet_swap_part)
 
       # 本组只承载 node-agent + 宿主 systemd/jailer Firecracker microVM。NoSchedule 防止控制面、
       # CoreDNS、LiteLLM 等普通 Pod 在数据节点上落盘。
@@ -624,7 +671,7 @@ module "eks" {
         }
       }
 
-      cloudinit_pre_nodeadm = [{
+      cloudinit_pre_nodeadm = concat([{
         content_type = "text/x-shellscript; charset=\"us-ascii\""
         content      = <<-EOT
         #!/bin/bash
@@ -679,10 +726,11 @@ module "eks" {
         systemctl enable --now redis6 2>/dev/null || true
         curl -sSL https://d.juicefs.com/install | sh - 2>/dev/null || true
         sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+        ${local.sandbox_zram_setup}
         touch /opt/sbx/.bootstrap-complete
         echo "[recovery-standby] DONE $(date)"
       EOT
-      }]
+      }], local.sandbox_kubelet_swap_part)
 
       labels = {
         role                                    = "sandbox"

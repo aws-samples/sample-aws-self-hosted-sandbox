@@ -158,6 +158,20 @@ def _cached_rootfs_template(src: str) -> str:
         return src
 
 
+# 默认给每个新建 VM 挂 virtio-balloon 并开启 free page reporting:guest 释放的
+# 内存会还给宿主(真机实测 3.2GiB→240MiB);不开时宿主 RSS 只涨不降,内存超分
+# 随时间失效。create 请求显式传 balloon 时以请求为准。
+BALLOON_FREE_PAGE_REPORTING = os.environ.get(
+    "BALLOON_FREE_PAGE_REPORTING", "1"
+).lower() in ("1", "true")
+_DEFAULT_BALLOON = {
+    "amount_mib": 0,
+    "deflate_on_oom": True,
+    "stats_polling_interval_s": 0,
+    "free_page_reporting": True,
+}
+
+
 JAILER_BIN   = os.environ.get("JAILER_BIN", "/usr/local/bin/firecracker-jailer")
 FC_BIN       = os.environ.get("FC_BIN",     "/usr/local/bin/firecracker")
 VMM_LAUNCH_MODE = os.environ.get(
@@ -1122,7 +1136,9 @@ def op_create(body: dict) -> dict:
             env,
             guest_ip=guest_ip,
             host_ip=host_ip,
-            balloon=body.get("balloon") or None,
+            balloon=body.get("balloon") or (
+                _DEFAULT_BALLOON if BALLOON_FREE_PAGE_REPORTING else None
+            ),
         )
     except Exception:
         _teardown_tap(tap)
