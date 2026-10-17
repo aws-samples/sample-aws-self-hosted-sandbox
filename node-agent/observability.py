@@ -196,7 +196,8 @@ def log_event(level: str, event: str, **fields) -> None:
     )
 
 
-_VM_OPS = frozenset({"create", "destroy", "snapshot_base", "suspend", "resume", "exec"})
+_VM_OPS = frozenset({"create", "destroy", "snapshot_base", "suspend", "resume", "exec",
+                     "checkpoint", "template_publish", "create_from_template"})
 _STATIC_ROUTES = frozenset({
     "/", "/health", "/livez", "/readyz", "/metrics",
     "/reclaim/status", "/reclaim/simulate", "/reclaim/reset",

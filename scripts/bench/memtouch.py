@@ -111,7 +111,8 @@ class Worker:
         rate = self.args.rewrite_mbps * MiB
         if rate <= 0:
             return
-        pages = self.size // PAGE
+        # --hot-pct < 100 时只在前 hot-pct% 的区域内改写(热点工作集);默认整块均匀随机(最坏情况)
+        pages = max(1, int(self.size * self.args.hot_pct / 100) // PAGE)
         rng = random.Random(self.args.seed + 1)
         per_tick = max(1, int(rate / PAGE / 10))  # 每 100ms 改写的页数
         while not self.frozen.is_set():
@@ -131,7 +132,11 @@ def _cpu_burn(stop_at):
         hashlib.sha256(x).digest()
 
 
+STATE_NAME = "memtouch"
+
+
 def _write_state(name, obj):
+    name = name.replace("memtouch", STATE_NAME, 1)
     tmp = os.path.join(STATE_DIR, name + ".tmp")
     with open(tmp, "w") as f:
         json.dump(obj, f)
@@ -145,10 +150,16 @@ def main():
     ap.add_argument("--random-pct", type=float, default=20.0,
                     help="mixed 模式下替换为随机内容的页比例(%%)")
     ap.add_argument("--rewrite-mbps", type=float, default=0.0)
+    ap.add_argument("--hot-pct", type=float, default=100.0,
+                    help="改写集中在前 N%% 的内存(热点工作集),默认 100 = 整块均匀随机")
     ap.add_argument("--cpu-procs", type=int, default=0, help="并行烧 CPU 的进程数")
     ap.add_argument("--cpu-seconds", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=int.from_bytes(os.urandom(4), "big"))
+    ap.add_argument("--name", default="memtouch",
+                    help="状态文件名前缀(/run/<name>.ready|h1|h2),同一 guest 多进程时区分")
     args = ap.parse_args()
+    global STATE_NAME
+    STATE_NAME = args.name
 
     w = Worker(args)
     signal.signal(signal.SIGUSR2, w.on_freeze)

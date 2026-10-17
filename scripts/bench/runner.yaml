@@ -1,0 +1,33 @@
+# 压测 runner(测试专用,测完删除):跑在目标 sandbox 节点上,hostNetwork 使请求来源为节点 IP
+# (落在 node-agent 的 ALLOWED_CALLER_CIDR 内);hostPID + 特权用于本地采样与 nsenter。
+# 用法: sed "s/__NODE__/<node-name>/" runner.yaml | kubectl apply -f -
+#       kubectl -n sandbox-system cp scripts/bench bench-runner:/bench
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-runner
+  namespace: sandbox-system
+  labels: {app: bench-runner}
+spec:
+  nodeName: __NODE__
+  hostNetwork: true
+  hostPID: true
+  restartPolicy: Never
+  tolerations:
+    - {key: dedicated, operator: Equal, value: sandbox, effect: NoSchedule}
+  containers:
+    - name: runner
+      image: __IMAGE__
+      command: ["sleep", "infinity"]
+      securityContext: {privileged: true}
+      env:
+        - {name: BENCH_LOCAL, value: "1"}
+        - name: NODE_IP
+          valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+        - name: NODE_AGENT_AUTH_KEY
+          valueFrom: {secretKeyRef: {name: node-agent-auth, key: NODE_AGENT_AUTH_KEY}}
+      volumeMounts:
+        - {name: sbx, mountPath: /var/lib/sbx, mountPropagation: HostToContainer}
+  volumes:
+    - name: sbx
+      hostPath: {path: /var/lib/sbx}

@@ -120,7 +120,15 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+# BENCH_LOCAL=1:在目标节点上的 runner Pod 内运行(hostNetwork+hostPID+特权),
+# 直连 http://$NODE_IP:8002、本地读 /proc、本地 nsenter。合并 V2401449830 后
+# node-agent 只监听节点 IP 且只接受 VPC 来源,本机 kubectl port-forward 不再可用。
+LOCAL = os.environ.get("BENCH_LOCAL") == "1"
+
+
 def node_agent_pod(node: str) -> str:
+    if LOCAL:
+        return "local"
     out = subprocess.run(
         ["kubectl", "-n", NS, "get", "pods", "-l", "app=node-agent", "-o", "json"],
         check=True, capture_output=True, text=True,
@@ -132,6 +140,8 @@ def node_agent_pod(node: str) -> str:
 
 
 def auth_secret() -> str:
+    if LOCAL:
+        return os.environ["NODE_AGENT_AUTH_KEY"]
     out = subprocess.run(
         ["kubectl", "-n", NS, "get", "secret", "node-agent-auth",
          "-o", "jsonpath={.data.NODE_AGENT_AUTH_KEY}"],
@@ -142,6 +152,9 @@ def auth_secret() -> str:
 
 @contextlib.contextmanager
 def port_forward(pod: str):
+    if LOCAL:
+        yield f"http://{os.environ['NODE_IP']}:8002"
+        return
     port = free_port()
     proc = subprocess.Popen(
         ["kubectl", "-n", NS, "port-forward", f"pod/{pod}", f"{port}:8002"],
@@ -190,11 +203,11 @@ class Agent:
 
 
 def sample(pod: str, seconds: float = 3) -> dict:
-    r = subprocess.run(
-        ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
-         "python3", "-c", SAMPLER],
-        capture_output=True, text=True, timeout=120,
-    )
+    cmd = (["python3", "-c", SAMPLER] if LOCAL else
+           ["kubectl", "-n", NS, "exec", pod, "--", "env", f"SAMPLE_S={seconds}",
+            "python3", "-c", SAMPLER])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "SAMPLE_S": str(seconds)})
     if r.returncode != 0:
         return {"sample_error": r.stderr[-500:]}
     return json.loads(r.stdout.strip().splitlines()[-1])
