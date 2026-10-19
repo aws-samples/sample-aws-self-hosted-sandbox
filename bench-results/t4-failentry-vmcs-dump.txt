@@ -1,0 +1,48 @@
+[  459.968778] kvm_intel: VMCS 00000000b892f3d9, last attempted VM-entry on CPU 30
+[  459.969629] kvm_intel: *** Guest State ***
+[  459.970196] kvm_intel: CR0: actual=0x0000000080050033, shadow=0x0000000080050033, gh_mask=fffffffffffefff7
+[  459.971466] kvm_intel: CR4: actual=0x0000000000772ef0, shadow=0x0000000000770eb0, gh_mask=fffffffffffef871
+[  459.972767] kvm_intel: CR3 = 0x0000000003976002
+[  459.973369] kvm_intel: PDPTR0 = 0x0000000000000000  PDPTR1 = 0x0000000000000000
+[  459.974360] kvm_intel: PDPTR2 = 0x0000000000000000  PDPTR3 = 0x0000000000000000
+[  459.975335] kvm_intel: RSP = 0xffffffff82003e30  RIP = 0xffffffff818b979e
+[  459.976246] kvm_intel: RFLAGS=0x00000206         DR7 = 0x0000000000000400
+[  459.977160] kvm_intel: Sysenter RSP=fffffe0000003000 CS:RIP=0010:ffffffff81a01510
+[  459.978159] kvm_intel: CS:   sel=0x0010, attr=0x0a09b, limit=0xffffffff, base=0x0000000000000000
+[  459.979337] kvm_intel: DS:   sel=0x0000, attr=0x1c000, limit=0xffffffff, base=0x0000000000000000
+[  459.980529] kvm_intel: SS:   sel=0x0018, attr=0x0c093, limit=0xffffffff, base=0x0000000000000000
+[  459.981697] kvm_intel: ES:   sel=0x0000, attr=0x1c000, limit=0xffffffff, base=0x0000000000000000
+[  459.982872] kvm_intel: FS:   sel=0x0000, attr=0x1c000, limit=0xffffffff, base=0x0000000000000000
+[  459.984060] kvm_intel: GS:   sel=0x0000, attr=0x1c000, limit=0xffffffff, base=0xffff888007a00000
+[  459.985227] kvm_intel: GDTR:                           limit=0x0000007f, base=0xfffffe0000001000
+[  459.986409] kvm_intel: LDTR: sel=0x0000, attr=0x1c000, limit=0xffffffff, base=0x0000000000000000
+[  459.987597] kvm_intel: IDTR:                           limit=0x00000fff, base=0xfffffe0000000000
+[  459.988770] kvm_intel: TR:   sel=0x0040, attr=0x0008b, limit=0x00004087, base=0xfffffe0000003000
+[  459.989953] kvm_intel: EFER= 0x0000000000000d01 (effective)
+[  459.990698] kvm_intel: PAT = 0x0407050600070106
+[  459.991297] kvm_intel: DebugCtl = 0x0000000000000000  DebugExceptions = 0x0000000000000000
+[  459.992409] kvm_intel: Interruptibility = 00000000  ActivityState = 00000000
+[  459.993359] kvm_intel: InterruptStatus = 00ec
+[  459.993938] kvm_intel: *** Host State ***
+[  459.994476] kvm_intel: RIP = 0xffffffffc07e44a0  RSP = 0xffffcdad88987c80
+[  459.995386] kvm_intel: CS=0010 SS=0018 DS=0000 ES=0000 FS=0000 GS=0000 TR=0040
+[  459.996356] kvm_intel: FSBase=00007f5a0f37cb38 GSBase=ffff896b32da4000 TRBase=fffffe09c48ed000
+[  459.997511] kvm_intel: GDTBase=fffffe09c48eb000 IDTBase=fffffe0000000000
+[  459.998402] kvm_intel: CR0=0000000080050033 CR3=0000000585301002 CR4=0000000000772ef0
+[  459.999464] kvm_intel: Sysenter RSP=fffffe09c48ed000 CS:RIP=0010:ffffffff8c0016f0
+[  460.000467] kvm_intel: PAT = 0x0407050600070106
+[  460.001075] kvm_intel: *** Control State ***
+[  460.001637] kvm_intel: CPUBased=0xb5a06dfa SecondaryExec=0x021013fa TertiaryExec=0x0000000000000000
+[  460.002860] kvm_intel: PinBased=0x000000ff EntryControls=000053ff ExitControls=000befff
+[  460.003920] kvm_intel: ExceptionBitmap=00060042 PFECmask=00000000 PFECmatch=00000000
+[  460.004969] kvm_intel: VMEntry: intr_info=00000000 errcode=00000000 ilen=00000000
+[  460.005962] kvm_intel: VMExit: intr_info=00000000 errcode=00000000 ilen=00000001
+[  460.006962] kvm_intel:         reason=0000000c qualification=0000000000000000
+[  460.007922] kvm_intel: IDTVectoring: info=00000000 errcode=00000000
+[  460.008766] kvm_intel: TSC Offset = 0xffffff2aa3020d00
+[  460.009444] kvm_intel: TSC Multiplier = 0x0001000000000000
+[  460.010195] kvm_intel: SVI|RVI = 00|ec TPR Threshold = 0x00
+[  460.011544] kvm_intel: PostedIntrVec = 0xf2
+[  460.012095] kvm_intel: EPT pointer = 0x0000000603e2f05e
+[  460.012793] kvm_intel: Virtual processor ID = 0x0117
+[  460.018489] kvm_intel: VMCS 00000000d7662368, last attempted VM-entry on CPU 30
