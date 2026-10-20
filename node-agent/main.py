@@ -767,6 +767,220 @@ def _link_runtime_socket(sandbox_id: str, socket_name: str, target: str) -> None
         pass
 
 
+# ---------- vCPU 绑核与 vCPU 准入 ----------
+# 嵌套虚拟化(r8i/m8i/c8i 标准实例)下,L2 vCPU 线程在宿主 CPU 之间迁移会随机触发
+# KVM_EXIT_FAIL_ENTRY(reason 7),guest vCPU 总数超过约 9×宿主 vCPU 后频繁出现。
+# 每个 vCPU 线程固定到单个宿主 CPU 后,r8i.8xlarge 上 60:1 实测 0 失败;只限定到
+# 几个 CPU 一组(线程仍能在组内迁移)无效(报告 §12)。
+# 做法:VMM 起来后、vCPU 线程创建前,把进程亲和性限定到分配的 CPU(之后创建的
+# 线程继承,jailer exec 也保留);InstanceStart / snapshot load 之后再把每个
+# fc_vcpu N 线程各自固定到其中一个 CPU。分配按"已绑定 vCPU 数最少"挑选。
+VMM_PIN_VCPUS = os.environ.get("VMM_PIN_VCPUS", "true").lower() == "true"
+VMM_PIN_EXCLUDE_CPUS = os.environ.get("VMM_PIN_EXCLUDE_CPUS", "")
+# 每宿主 CPU 允许提交的 guest vCPU 数;0 = 不限。绑核时 60(实测上限),
+# 不绑核时 8(嵌套虚拟化下 FAIL_ENTRY 出现前的安全档)。
+VCPU_OVERCOMMIT_RATIO = float(os.environ.get(
+    "NODE_AGENT_VCPU_OVERCOMMIT_RATIO", "60" if VMM_PIN_VCPUS else "8"
+))
+_VCPU_THREAD_RE = re.compile(r"fc_vcpu (\d+)")
+_PIN_LOCK = threading.Lock()
+# sid → 第 i 个 vCPU 绑定的宿主 CPU。包含已预留但 VMM 尚未起来的沙盒。
+_PINNED: dict[str, list[int]] = {}
+# sid → 已提交的 vCPU 数(准入用;不绑核时也计数)。
+_COMMITTED_VCPUS: dict[str, int] = {}
+
+
+def _pin_log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+class VcpuCapacityError(RuntimeError):
+    """节点已提交的 vCPU 达到上限 → 409,控制面换节点。"""
+
+
+def _parse_cpu_list(spec: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in (spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        first, _, last = part.partition("-")
+        lo = int(first)
+        hi = int(last) if last else lo
+        cpus.update(range(lo, hi + 1))
+    return cpus
+
+
+def _host_cpus() -> list[int]:
+    try:
+        with open("/sys/devices/system/cpu/online", encoding="utf-8") as stream:
+            online = _parse_cpu_list(stream.read().strip())
+    except OSError:
+        online = set(range(os.cpu_count() or 1))
+    usable = online - _parse_cpu_list(VMM_PIN_EXCLUDE_CPUS)
+    return sorted(usable or online)
+
+
+def _vcpu_capacity() -> int:
+    if VCPU_OVERCOMMIT_RATIO <= 0:
+        return 0
+    return int(len(_host_cpus()) * VCPU_OVERCOMMIT_RATIO)
+
+
+def _vcpu_usage() -> dict:
+    with _PIN_LOCK:
+        committed = sum(_COMMITTED_VCPUS.values())
+    capacity = _vcpu_capacity()
+    return {
+        "vcpu_committed": committed,
+        "vcpu_capacity": capacity,
+        # 不限时上报 -1,控制面视为无限
+        "vcpu_free": max(0, capacity - committed) if capacity else -1,
+        "vcpu_pinning": VMM_PIN_VCPUS,
+    }
+
+
+def _reserve_vcpus(sid: str, vcpus: int) -> list[int]:
+    """准入 + 按已绑定数最少分配 vcpus 个不同的宿主 CPU(同一沙盒重复调用会补足/复用)。"""
+    vcpus = max(1, int(vcpus))
+    with _PIN_LOCK:
+        previous = _COMMITTED_VCPUS.get(sid, 0)
+        capacity = _vcpu_capacity()
+        committed = sum(_COMMITTED_VCPUS.values()) - previous
+        if capacity and committed + vcpus > capacity:
+            raise VcpuCapacityError(
+                f"vcpu_capacity_exceeded: committed={committed} "
+                f"requested={vcpus} capacity={capacity}"
+            )
+        _COMMITTED_VCPUS[sid] = vcpus
+        if not VMM_PIN_VCPUS:
+            return []
+        current = list(_PINNED.get(sid, []))[:vcpus]
+        if len(current) == vcpus:
+            _PINNED[sid] = current
+            return current
+        load = {cpu: 0 for cpu in _host_cpus()}
+        for other, cpus in _PINNED.items():
+            if other == sid:
+                continue
+            for cpu in cpus:
+                if cpu in load:
+                    load[cpu] += 1
+        for cpu in current:
+            load.pop(cpu, None)
+        extra = sorted(load, key=lambda cpu: (load[cpu], cpu))
+        current.extend(extra[: vcpus - len(current)])
+        _PINNED[sid] = current
+        return current
+
+
+def _release_vcpus(sid: str) -> None:
+    with _PIN_LOCK:
+        _PINNED.pop(sid, None)
+        _COMMITTED_VCPUS.pop(sid, None)
+
+
+def _vcpu_threads(pid: int) -> list[tuple[int, int]]:
+    """[(vcpu_index, tid)],按 index 排序。读不到(进程已退出/权限)返回 []。"""
+    out = []
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return []
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/comm", encoding="utf-8") as stream:
+                match = _VCPU_THREAD_RE.fullmatch(stream.read().strip())
+        except OSError:
+            continue
+        if match:
+            out.append((int(match.group(1)), int(tid)))
+    return sorted(out)
+
+
+def _prepin_vmm(sid: str, pid: int, vcpus: int) -> None:
+    """vCPU 线程创建前把 VMM 现有线程限定到分配的 CPU 集合(新线程继承)。"""
+    if not VMM_PIN_VCPUS or pid <= 0:
+        return
+    cpus = set(_reserve_vcpus(sid, vcpus))
+    try:
+        tids = [int(t) for t in os.listdir(f"/proc/{pid}/task")]
+    except OSError:
+        tids = [pid]
+    for tid in tids:
+        try:
+            os.sched_setaffinity(tid, cpus)
+        except OSError as exc:
+            _pin_log(f"[pin] {sid}: prepin tid {tid} failed: {exc}")
+
+
+def _pin_vcpu_threads(sid: str, pid: int, timeout: float = 5.0) -> list[int]:
+    """InstanceStart / snapshot load 之后,把每个 fc_vcpu N 线程固定到单个 CPU。
+
+    实际 vCPU 数以线程为准(resume 时调用方给的只是提示),多出来的会补分配。
+    失败只记日志不中断:VM 已在运行,绑不上只是失去 FAIL_ENTRY 防护。
+    """
+    if not VMM_PIN_VCPUS or pid <= 0:
+        return []
+    deadline = time.monotonic() + timeout
+    threads = _vcpu_threads(pid)
+    while not threads and time.monotonic() < deadline:
+        time.sleep(0.02)
+        threads = _vcpu_threads(pid)
+    if not threads:
+        _pin_log(f"[pin] {sid}: no fc_vcpu threads found for pid {pid}")
+        return []
+    try:
+        cpus = _reserve_vcpus(sid, len(threads))
+    except VcpuCapacityError as exc:
+        # 线程比预留多(resume 提示偏小)且节点已满:仍按已有预留轮转绑定
+        _pin_log(f"[pin] {sid}: {exc}; reuse existing reservation")
+        with _PIN_LOCK:
+            cpus = list(_PINNED.get(sid, [])) or [_host_cpus()[0]]
+    for index, tid in threads:
+        cpu = cpus[index % len(cpus)]
+        try:
+            os.sched_setaffinity(tid, {cpu})
+        except OSError as exc:
+            _pin_log(f"[pin] {sid}: pin vcpu {index} (tid {tid}) to cpu {cpu} failed: {exc}")
+    # 其余线程(API、virtio/vsock 设备模拟)不进 KVM_RUN、不持有 VMCS,迁移不会触发
+    # FAIL_ENTRY;放开到全部 CPU,避免它们和本 VM 的 vCPU 抢同一个核。真机 A/B
+    # (1920 VM、64 个繁忙)对空闲 VM 的 exec 延迟没有可测差异(报告 §13)。
+    _unpin_vmm_threads(sid, pid, {tid for _index, tid in threads})
+    return cpus
+
+
+def _unpin_vmm_threads(sid: str, pid: int, vcpu_tids: set[int]) -> None:
+    cpus = set(_host_cpus())
+    try:
+        tids = [int(t) for t in os.listdir(f"/proc/{pid}/task")]
+    except OSError:
+        return
+    for tid in tids:
+        if tid in vcpu_tids:
+            continue
+        try:
+            os.sched_setaffinity(tid, cpus)
+        except OSError as exc:
+            _pin_log(f"[pin] {sid}: unpin vmm thread {tid} failed: {exc}")
+
+
+def _adopt_pinning(sid: str, pid: int) -> None:
+    """node-agent 重启后,从存活 VMM 的线程亲和性重建预留表(不改动绑定)。"""
+    threads = _vcpu_threads(pid) if pid > 0 else []
+    cpus = []
+    for _index, tid in threads:
+        try:
+            allowed = os.sched_getaffinity(tid)
+        except OSError:
+            continue
+        if len(allowed) == 1:
+            cpus.append(next(iter(allowed)))
+    with _PIN_LOCK:
+        _COMMITTED_VCPUS[sid] = max(1, len(threads))
+        if cpus:
+            _PINNED[sid] = cpus
+
+
 def _launch_vmm(
     sandbox_id: str,
     socket_name: str,
@@ -897,6 +1111,7 @@ def _read_proc_cmdline(path: str) -> bytes:
 
 def _stop_vmm(sandbox_id: str, vm: dict) -> None:
     """Stop a host-owned service or the legacy child process."""
+    _release_vcpus(sandbox_id)
     if vm.get("runtime_unit"):
         _host_control(
             HOST_VMM_CTL,
@@ -947,6 +1162,7 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
         raise RuntimeError("firecracker API socket 未就绪")
 
     try:
+        _prepin_vmm(sandbox_id, pid, cpu)
         # 配置 VM（JuiceFS 模式：通过 boot_args 把 Redis/S3 地址注入 guest init）
         # 里程碑 B: 注入 guest 网络(SBX_IP/SBX_GW),让 init 配成 node-agent 期望的
         # 172.18.{tap_idx}.2,从而宿主能 SSH 到 guest 做 exec。
@@ -1012,6 +1228,7 @@ def _start_fc(sandbox_id: str, rootfs: str, tap: str, cpu: int,
         except Exception:
             pass
         _fc(sock, "PUT", "/actions", {"action_type": "InstanceStart"})
+        _pin_vcpu_threads(sandbox_id, pid)
     except Exception:
         _stop_vmm(
             sandbox_id,
@@ -1380,6 +1597,15 @@ def op_create(body: dict) -> dict:
                 f"{existing.get('state', 'unknown')}"
             )
 
+    # vCPU 准入放在拷 rootfs 之前:节点已满时尽快 409,控制面换节点。
+    return _with_vcpu_reservation(
+        sid, cpu,
+        lambda: _create_reserved(sid, body, tap_idx, cpu, mem_mib, kernel, env),
+    )
+
+
+def _create_reserved(sid: str, body: dict, tap_idx: int, cpu: int,
+                     mem_mib: int, kernel: str, env: dict) -> dict:
     d = f"{SBX_BASE}/{sid}"
     _no_symlink(d, "id")
     os.makedirs(d, exist_ok=True)
@@ -1423,6 +1649,7 @@ def op_create(body: dict) -> dict:
         "ip":      guest_ip,
         "dir":     d,
         "runtime_unit": runtime_unit,
+        "vcpus":   cpu,
     }
     with _LOCK:
         _VMS[sid] = vm
@@ -1470,6 +1697,7 @@ def _persist_runtime_metadata(sid: str, vm: dict) -> None:
         "ip": str(vm.get("ip", "")),
         "runtime_unit": str(vm.get("runtime_unit", "")),
         "owned_dirs": sorted(set(owned_dirs)),
+        "vcpus": int(vm.get("vcpus", 0) or 0),
     }
     target = _runtime_metadata_path(sid)
     temporary = (
@@ -1806,7 +2034,7 @@ def op_template_publish(body: dict) -> dict:
     with _BASE_HASH_CACHE_LOCK:
         _TEMPLATE_DIGESTS[(st.st_dev, st.st_ino)] = (st.st_size, st.st_mtime_ns, digest)
     meta = {"source_id": sid, "mem_bytes": st.st_size, "sha256": digest,
-            "published_at": _now_iso()}
+            "vcpus": int(vm.get("vcpus", 0) or 0), "published_at": _now_iso()}
     with open(f"{tdir}/template.json", "w") as stream:
         json.dump(meta, stream)
     return {"template": os.path.basename(tdir), "publish_s": round(publish_s, 3), **meta}
@@ -1826,6 +2054,14 @@ def op_create_from_template(body: dict) -> dict:
     with _LOCK:
         if sid in _VMS:
             raise RuntimeError(f"sandbox {sid} already exists")
+    return _with_vcpu_reservation(
+        sid, int(meta.get("vcpus") or 1),
+        lambda: _create_from_template_reserved(sid, tdir, tap_idx, meta, source_id),
+    )
+
+
+def _create_from_template_reserved(sid: str, tdir: str, tap_idx: int,
+                                   meta: dict, source_id: str) -> dict:
     st = os.stat(f"{tdir}/vm.mem")
     with _BASE_HASH_CACHE_LOCK:
         if (st.st_dev, st.st_ino) not in _TEMPLATE_DIGESTS:
@@ -1845,6 +2081,7 @@ def op_create_from_template(body: dict) -> dict:
         stream.write(source_id)
     tap, host_ip, guest_ip = _setup_tap(tap_idx)
     mem_mib = max(1, st.st_size // (1024 * 1024))
+    pid, runtime_unit = 0, ""
     try:
         pid, sock, runtime_unit = _launch_vmm(
             sid, "api-resume.sock", mem_mib, bind_dirs=[d], log_name="vm-resume.log",
@@ -1852,6 +2089,7 @@ def op_create_from_template(body: dict) -> dict:
         if not _wait_sock(sock):
             _stop_vmm(sid, {"pid": pid, "runtime_unit": runtime_unit})
             raise RuntimeError("firecracker resume socket 未就绪")
+        _prepin_vmm(sid, pid, int(meta.get("vcpus") or 1))
         t_load = time.monotonic()
         _fc(sock, "PUT", "/snapshot/load", {
             "snapshot_path": f"{snap_dir}/vm.snapshot.tpl",
@@ -1862,11 +2100,15 @@ def op_create_from_template(body: dict) -> dict:
             "vsock_override": {"uds_path": f"{d}/v.sock"},
         })
         load_s = time.monotonic() - t_load
+        pinned = _pin_vcpu_threads(sid, pid)
     except Exception:
+        if pid:
+            _stop_vmm(sid, {"pid": pid, "runtime_unit": runtime_unit})
         _teardown_tap(tap)
         raise
     vm = {"state": "running", "pid": pid, "sock": sock, "tap": tap, "tap_idx": tap_idx,
-          "ip": guest_ip, "dir": d, "runtime_unit": runtime_unit, "template": meta.get("source_id")}
+          "ip": guest_ip, "dir": d, "runtime_unit": runtime_unit, "template": meta.get("source_id"),
+          "vcpus": len(pinned) or int(meta.get("vcpus") or 1)}
     with _LOCK:
         _VMS[sid] = vm
     _persist_runtime_metadata(sid, vm)
@@ -2179,6 +2421,35 @@ def _existing_resume_result(sid: str, snap_dir: str = "") -> dict | None:
 
 
 def op_resume(body: dict) -> dict:
+    sid = _sandbox_id(body.get("id"))
+    return _with_vcpu_reservation(sid, _resume_vcpu_hint(sid, body),
+                                  lambda: _op_resume_impl(body))
+
+
+def _resume_vcpu_hint(sid: str, body: dict) -> int:
+    """resume 的 vCPU 数提示:请求里的 cpu > 本沙盒元数据 > 1。实际数以线程为准。"""
+    try:
+        if body.get("cpu") not in (None, ""):
+            return _int_in_range(body.get("cpu"), 1, MAX_VCPU, "cpu")
+    except RequestValidationError:
+        pass
+    return int(_load_runtime_metadata(sid).get("vcpus") or 1)
+
+
+def _with_vcpu_reservation(sid: str, vcpus: int, operation):
+    """先做 vCPU 准入(满则 409),操作失败且 VM 没在运行时释放预留。"""
+    _reserve_vcpus(sid, vcpus)
+    try:
+        return operation()
+    except Exception:
+        with _LOCK:
+            running = (_VMS.get(sid) or {}).get("state") == "running"
+        if not running:
+            _release_vcpus(sid)
+        raise
+
+
+def _op_resume_impl(body: dict) -> dict:
     sid        = _sandbox_id(body.get("id"))
     # 快照来源 id(snap_owner)可与 sid 不同(暖池 claim:warm_id → real_id),
     # 但 snapshot_local_path / rootfs_path / s3_prefix 三者必须指向同一个来源沙盒,
@@ -2295,6 +2566,7 @@ def op_resume(body: dict) -> dict:
             {"pid": pid, "runtime_unit": runtime_unit},
         )
         raise RuntimeError("firecracker resume socket 未就绪")
+    _prepin_vmm(sid, pid, _resume_vcpu_hint(sid, body))
 
     # 快照本身已含 vsock 设备配置（含 host UDS 路径 v.sock）。load 时 Firecracker
     # 会自动重建 vsock 并绑定该 UDS；若旧 v.sock 文件残留会导致
@@ -2326,6 +2598,7 @@ def op_resume(body: dict) -> dict:
             "resume_vm": True,
         })
         dt = time.monotonic() - t0
+        pinned = _pin_vcpu_threads(sid, pid)
     except Exception:
         _stop_vmm(
             sid,
@@ -2380,6 +2653,7 @@ def op_resume(body: dict) -> dict:
         "ip":      guest_ip,
         "dir":     d,
         "runtime_unit": runtime_unit,
+        "vcpus":   len(pinned) or _resume_vcpu_hint(sid, body),
     }
     try:
         _register_resumed_vm(sid, resumed_vm, snap_dir)
@@ -2539,6 +2813,7 @@ def op_health() -> dict:
         "instance_id": _instance_id(),
         "availability_zone": _availability_zone(),
         "state_volume_id": state_volume_id,
+        **_vcpu_usage(),
     }
 
 
@@ -2690,6 +2965,7 @@ def _heartbeat_once() -> None:
         "#draining": "draining",
         "#phase": "reclaim_phase",
         "#session": "reclaim_session_id",
+        "#vcpu_free": "vcpu_free",
     }
     values = {
         ":ip": {"S": _advertise_ip()},
@@ -2706,6 +2982,7 @@ def _heartbeat_once() -> None:
         ":draining": {"BOOL": draining},
         ":phase": {"S": reclaim_phase},
         ":session": {"S": reclaim_session_id},
+        ":vcpu_free": {"N": str(_vcpu_usage()["vcpu_free"])},
     }
     subprocess.run(
         ["aws", "dynamodb", "update-item",
@@ -2717,7 +2994,7 @@ def _heartbeat_once() -> None:
              "SET #ip=:ip, #free=:free, #vms=:vms, #seen=:seen, "
              "#pool=:pool, #iid=:iid, #az=:az, #vol=:vol, #role=:role, "
              "#recovery_group=:recovery_group, #draining=:draining, "
-             "#phase=:phase, #session=:session"
+             "#phase=:phase, #session=:session, #vcpu_free=:vcpu_free"
          ),
          "--expression-attribute-names", json.dumps(names),
          "--expression-attribute-values", json.dumps(values)],
@@ -2807,6 +3084,7 @@ def _recover_vms() -> int:
             socket_name = os.path.basename(sock)
             if socket_name in {"api.sock", "api-resume.sock"}:
                 _link_runtime_socket(sid, socket_name, sock)
+            _adopt_pinning(sid, recovered_pid)
             with _LOCK:
                 _VMS[sid] = {
                     "state": state,
@@ -2819,6 +3097,7 @@ def _recover_vms() -> int:
                     "tap": str(metadata.get("tap", "")),
                     "tap_idx": int(metadata.get("tap_idx", 0) or 0),
                     "ip": str(metadata.get("ip", "")),
+                    "vcpus": int(metadata.get("vcpus", 0) or 0),
                     "dir":   d,
                     "runtime_unit": (
                         str(runtime.get("unit", ""))
@@ -4258,6 +4537,8 @@ class Handler(BaseHTTPRequestHandler):
                                        "plan": None, "evacuated": False, "injected": None})
                 return self._send(200, {"reset": True})
             self._send(404, {"error": "not found"})
+        except VcpuCapacityError as e:
+            self._send(409, {"error": str(e), "reason": "vcpu_capacity_exceeded"})
         except RequestValidationError as e:
             self._deny(400, e.reason, kind="invalid_request", field=e.field)
         except KeyError:
