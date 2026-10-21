@@ -525,6 +525,69 @@ class TestFirecrackerDriver(unittest.TestCase):
                     placement_group="missing-group",
                 )
 
+    def test_vcpu_room_filter(self):
+        from sandbox_api.drivers.firecracker import _has_vcpu_room
+
+        self.assertTrue(_has_vcpu_room({}, 2))             # 老节点不上报
+        self.assertTrue(_has_vcpu_room({"vcpu_free": -1}, 2))  # 不限
+        self.assertTrue(_has_vcpu_room({"vcpu_free": 2}, 2))
+        self.assertFalse(_has_vcpu_room({"vcpu_free": 1}, 2))
+        self.assertTrue(_has_vcpu_room({"vcpu_free": 0}, 0))
+
+    def test_pick_node_reports_vcpu_full_cluster(self):
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+
+        drv = FirecrackerDriver()
+        live = [("10.0.1.10", 9000, "protected", "")]
+        with patch.object(
+            drv, "_active_nodes_from_registry",
+            side_effect=lambda vcpus=0, exclude=frozenset(): [] if vcpus else live,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "vcpu_capacity_exceeded"):
+                drv._pick_node(vcpus=1)
+
+    def test_fc_nodes_fallback_skips_vcpu_full_node(self):
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+
+        drv = FirecrackerDriver()
+        health = {"full": {"free_mem_mib": 9000, "vcpu_free": 0},
+                  "roomy": {"free_mem_mib": 100, "vcpu_free": 4}}
+        with (
+            patch.object(drv, "_active_nodes_from_registry", return_value=[]),
+            patch.object(drv, "_list_metal_nodes", return_value=["full", "roomy"]),
+            patch.object(drv, "_agent", side_effect=lambda n, m, p, *a, **k: health[n]),
+        ):
+            self.assertEqual(drv._pick_node(vcpus=1), "roomy")
+
+    def test_create_retries_on_vcpu_full_node(self):
+        from sandbox_api.drivers.firecracker import FirecrackerDriver
+        from sandbox_api.driver import SandboxSpec
+
+        drv = FirecrackerDriver()
+        picked: list[set] = []
+
+        def pick(**kwargs):
+            picked.append(set(kwargs["exclude"]))
+            return "full" if "full" not in kwargs["exclude"] else "roomy"
+
+        def agent(node, method, path, body=None, timeout=120):
+            if path == "/vm/create" and node == "full":
+                raise RuntimeError(
+                    "node-agent POST /vm/create → 409: "
+                    '{"reason": "vcpu_capacity_exceeded"}'
+                )
+            return {"state": "running", "ip": "172.18.0.2"}
+
+        with (
+            patch("sandbox_api.drivers.firecracker.db.get", return_value=None),
+            patch("sandbox_api.drivers.firecracker.db.alloc_tap_idx", return_value=5),
+            patch.object(drv, "_pick_node", side_effect=pick),
+            patch.object(drv, "_agent", side_effect=agent),
+        ):
+            result = drv.create("sbx-full", SandboxSpec(image="min", cpu=1, mem_mib=256))
+        self.assertEqual(result["node"], "roomy")
+        self.assertEqual(picked, [set(), {"full"}])
+
     @mock_aws
     def test_suspend_and_resume(self):
         _create_tables()

@@ -119,6 +119,8 @@ fi
 | `state_ebs_iops` / `state_ebs_throughput` | phase3 | 40000 / 2000 | 原 4000 / 1000；低 IOPS 下 Spot checkpoint 先撞卷 IOPS 上限 |
 | `sandbox_zram_size_gib` | phase3 | 64 | 沙盒节点 zram(zstd) swap，0 关闭；kubelet 同时设 `failSwapOn=false`、`swapBehavior=NoSwap`；内存超分越过 `sbx.slice` 上限时换出冷页而非 OOM 杀 VM |
 | `balloon_free_page_reporting` | stage2 | true | 新建 microVM 默认挂 virtio-balloon 并开启 free page reporting（node-agent env `BALLOON_FREE_PAGE_REPORTING`）；create 请求显式传 `balloon` 时以请求为准 |
+| `vmm_pin_vcpus` | stage2 | true | 新增；把每个 microVM 的 vCPU 线程固定到单个宿主 CPU（node-agent env `VMM_PIN_VCPUS`）。嵌套虚拟化（r8i/m8i/c8i）下不绑核时 guest vCPU 上限约 9×宿主 vCPU，会随机触发 `KVM_EXIT_FAIL_ENTRY` |
+| `vcpu_overcommit_ratio` | stage2 | 60 | 新增；每个宿主 CPU 允许提交的 guest vCPU 数（node-agent env `NODE_AGENT_VCPU_OVERCOMMIT_RATIO`），超出返回 409 `vcpu_capacity_exceeded` 且控制面换节点重试；0 = 不限。关闭 `vmm_pin_vcpus` 时请改为 8 |
 | `reclaim_auto_evacuate` | stage2 | true | 原 false；关闭则 Spot 中断只做 DRY-RUN |
 | `reclaim_snapshot_concurrency` | stage2 | 8 | 原 12 |
 | `spot_recovery_od_recycle_enabled` | stage2 | false | 原 true；OD 回收的卷交接阶段存在已知 bug，修复前保持关闭 |

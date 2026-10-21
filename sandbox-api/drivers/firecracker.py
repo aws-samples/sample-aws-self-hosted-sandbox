@@ -112,6 +112,18 @@ def _s3_prefix(snap_id: str) -> str:
     return f"s3://{S3_BUCKET}/sbx/{snap_id}/" if _s3_enabled() else ""
 
 
+# 节点 vCPU 满时 create 换节点重试的次数
+VCPU_FULL_RETRIES = int(os.environ.get("SANDBOX_VCPU_FULL_RETRIES", "3"))
+
+
+def _has_vcpu_room(node: dict, vcpus: int) -> bool:
+    """心跳里的 vcpu_free:缺失(老节点)或 -1(不限)视为有余量。"""
+    if vcpus <= 0 or node.get("vcpu_free") in (None, ""):
+        return True
+    free = int(node.get("vcpu_free"))
+    return free < 0 or free >= vcpus
+
+
 class FirecrackerDriver:
 
     def capabilities(self) -> Capabilities:
@@ -150,38 +162,51 @@ class FirecrackerDriver:
                     node_id = ""
                     tap_idx = 0
 
-        if not node_id:
-            # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时
-            # _pick_node 内部回退不限池。placement_group 若存在则始终为
-            # 硬约束，绝不跨恢复组回退。
-            node_id = self._pick_node(
-                pool=pool,
-                placement_group=requested_placement_group(spec),
-            )
         if not tap_idx:
             tap_idx = db.alloc_tap_idx()
-        if current is not None:
-            db.force_update(
-                sandbox_id,
-                {
-                    "node": node_id,
-                    "tap_idx": tap_idx,
-                    "runtime_operation": "create",
-                },
-            )
         rootfs  = f"{SBX_BASE}/{sandbox_id}/rootfs.ext4"
 
-        self._agent(node_id, "POST", "/vm/create", {
-            "id":          sandbox_id,
-            "rootfs_path": rootfs,
-            "tap_idx":     tap_idx,
-            "cpu":         spec.cpu,
-            "mem_mib":     spec.mem_mib,
-            "kernel":      KERNEL_PATH,
-            "env":         spec.env,
-            # 自定义镜像:image 归一化后的模板名 → node-agent 选 /opt/sbx/rootfs-{name}.ext4
-            "rootfs_template": normalize_image(spec.image),
-        })
+        # 节点 vCPU 已满(node-agent 409 vcpu_capacity_exceeded)时换节点重试。
+        # 心跳上报的 vcpu_free 有 30 s 延迟,并发创建时可能同时挑中同一个快满的节点。
+        full_nodes: set[str] = set()
+        for _attempt in range(VCPU_FULL_RETRIES + 1):
+            if not node_id:
+                # M2:按目标池挑节点(pool=None → 不限池)。目标池无活节点时
+                # _pick_node 内部回退不限池。placement_group 若存在则始终为
+                # 硬约束，绝不跨恢复组回退。
+                node_id = self._pick_node(
+                    pool=pool,
+                    placement_group=requested_placement_group(spec),
+                    vcpus=spec.cpu,
+                    exclude=full_nodes,
+                )
+            if current is not None:
+                db.force_update(
+                    sandbox_id,
+                    {
+                        "node": node_id,
+                        "tap_idx": tap_idx,
+                        "runtime_operation": "create",
+                    },
+                )
+            try:
+                self._agent(node_id, "POST", "/vm/create", {
+                    "id":          sandbox_id,
+                    "rootfs_path": rootfs,
+                    "tap_idx":     tap_idx,
+                    "cpu":         spec.cpu,
+                    "mem_mib":     spec.mem_mib,
+                    "kernel":      KERNEL_PATH,
+                    "env":         spec.env,
+                    # 自定义镜像:image 归一化后的模板名 → node-agent 选 /opt/sbx/rootfs-{name}.ext4
+                    "rootfs_template": normalize_image(spec.image),
+                })
+                break
+            except RuntimeError as exc:
+                if "vcpu_capacity_exceeded" not in str(exc) or _attempt == VCPU_FULL_RETRIES:
+                    raise
+                full_nodes.add(node_id)
+                node_id = ""
         # agent 回包含 guest_ip
         info = self._agent(node_id, "GET", f"/vm/{sandbox_id}")
         return {
@@ -432,13 +457,21 @@ class FirecrackerDriver:
         self,
         pool: str | None = None,
         placement_group: str | None = None,
+        vcpus: int = 0,
+        exclude: set[str] | frozenset[str] = frozenset(),
     ) -> str:
         # 优先用注册表里已上报的 free_mem_mib 排序,省去逐个 /health 往返;
         # 拿不到注册表(如本地测试用 FC_NODES)时回退到逐个探 /health。
         # pool:M2 池亲和(spot / protected)。先在目标池内挑;目标池无活节点则
         #   回退不限池(宁可跨池放置也不让 create 失败 —— 池分离是优化非硬约束)。
         # placement_group:恢复组硬约束；即使目标池无节点也只在同组内回退。
-        registry = self._active_nodes_from_registry()
+        # vcpus:跳过心跳上报 vcpu_free 不足的节点;exclude:本次已返回 vCPU 满的节点。
+        registry = self._active_nodes_from_registry(vcpus=vcpus, exclude=exclude)
+        if not registry and (vcpus or exclude) and self._active_nodes_from_registry():
+            # 有活节点,只是 vCPU 都满了:报容量不足,而不是"节点不可达"
+            raise RuntimeError(
+                f"vcpu_capacity_exceeded: no node has {vcpus} free vCPUs"
+            )
         if registry:
             picked = self._pick_from_registry(
                 registry, pool, placement_group
@@ -470,7 +503,11 @@ class FirecrackerDriver:
         best_node, best_mem = None, -1
         for node_id in nodes:
             try:
+                if node_id in exclude:
+                    continue
                 h = self._agent(node_id, "GET", "/health")
+                if not _has_vcpu_room(h, vcpus):
+                    continue
                 free = h.get("free_mem_mib", 0)
                 if free > best_mem:
                     best_mem, best_node = free, node_id
@@ -508,6 +545,8 @@ class FirecrackerDriver:
 
     def _active_nodes_from_registry(
         self,
+        vcpus: int = 0,
+        exclude: set[str] | frozenset[str] = frozenset(),
     ) -> list[tuple[str, int, str, str]]:
         """
         从 DynamoDB 心跳注册表拉活节点,返回
@@ -533,6 +572,8 @@ class FirecrackerDriver:
                 and (n.get("recovery_role") or "active") != "standby"
                 and not n.get("recovery_claim_id")
                 and not n.get("repatriation_claim_id")
+                and ident not in exclude
+                and _has_vcpu_room(n, vcpus)
             ):
                 node_pool = (n.get("pool") or "protected").strip().lower()
                 recovery_group = str(n.get("recovery_group") or "").strip()

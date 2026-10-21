@@ -144,6 +144,18 @@ variable "balloon_free_page_reporting" {
   description = "新建 microVM 默认挂 virtio-balloon 并开启 free page reporting,让 guest 释放的内存还给宿主(内存超分的前提)。真机实测:关闭时 guest 释放 3GiB 后宿主 RSS 不回落,开启后 10s 内降回 240MiB。"
 }
 
+variable "vmm_pin_vcpus" {
+  type        = bool
+  default     = true
+  description = "把每个 microVM 的 vCPU 线程固定到单个宿主 CPU。嵌套虚拟化(r8i/m8i/c8i)下 vCPU 跨 CPU 迁移会随机触发 KVM_EXIT_FAIL_ENTRY,不绑核时 guest vCPU 上限约 9×宿主 vCPU;绑核后 r8i.8xlarge 实测 60:1 0 失败(报告 §12)。"
+}
+
+variable "vcpu_overcommit_ratio" {
+  type        = number
+  default     = 60
+  description = "每个宿主 CPU 允许提交的 guest vCPU 数(node-agent 准入,超出返回 409,控制面换节点);0 = 不限。关闭 vmm_pin_vcpus 时请改为 8。"
+}
+
 variable "spot_recovery_enabled" {
   type        = bool
   default     = false
@@ -1130,6 +1142,14 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "BALLOON_FREE_PAGE_REPORTING"
             value = var.balloon_free_page_reporting ? "1" : "0"
+          }
+          env {
+            name  = "VMM_PIN_VCPUS"
+            value = var.vmm_pin_vcpus ? "true" : "false"
+          }
+          env {
+            name  = "NODE_AGENT_VCPU_OVERCOMMIT_RATIO"
+            value = tostring(var.vcpu_overcommit_ratio)
           }
           env {
             name  = "CLOUD_INIT_STATUS_PATH"
