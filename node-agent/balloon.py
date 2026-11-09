@@ -71,6 +71,20 @@ class BalloonConfig:
 
     @classmethod
     def from_env(cls) -> "BalloonConfig":
+        cfg = cls._from_env_raw()
+        default = cls()
+        # 直接设置环境变量会绕过 Terraform 的校验:不合法的组合退回默认值,
+        # 保证滞回成立(0 < low < high < 1)、比例都在 (0, 1] 内。
+        if not (0 < cfg.low_ratio < cfg.high_ratio < 1):
+            cfg.low_ratio, cfg.high_ratio = default.low_ratio, default.high_ratio
+        if not (0 < cfg.max_ratio <= 1):
+            cfg.max_ratio = default.max_ratio
+        if not (0 <= cfg.guest_reserve_pct < 1):
+            cfg.guest_reserve_pct = default.guest_reserve_pct
+        return cfg
+
+    @classmethod
+    def _from_env_raw(cls) -> "BalloonConfig":
         return cls(
             enabled=os.environ.get("BALLOON_AUTO_RECLAIM", "1").lower()
             in ("1", "true"),

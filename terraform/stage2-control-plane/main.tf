@@ -163,16 +163,22 @@ variable "balloon_auto_reclaim" {
 variable "balloon_reclaim_high" {
   type        = number
   default     = 0.80
-  description = "气球控制器进入回收模式的 sbx.slice memory.current/memory.max 比例(高水位)。"
+  description = "气球控制器进入回收模式的 sbx.slice working set / memory.max 比例(高水位)。"
+  validation {
+    condition     = var.balloon_reclaim_high > 0 && var.balloon_reclaim_high < 1
+    error_message = "balloon_reclaim_high must be within (0, 1)."
+  }
 }
 
 variable "balloon_reclaim_low" {
   type        = number
   default     = 0.65
   description = "气球控制器退出回收、开始归还内存的比例(低水位);与高水位之间保持不动(滞回)。"
+  # 只校验自身范围:引用其他变量的 validation 需要 Terraform >= 1.9,本栈声明 >= 1.5。
+  # "低水位 < 高水位"由 kubernetes_daemon_set_v1.node_agent 的 precondition 保证。
   validation {
-    condition     = var.balloon_reclaim_low > 0 && var.balloon_reclaim_low < var.balloon_reclaim_high && var.balloon_reclaim_high < 1
-    error_message = "require 0 < balloon_reclaim_low < balloon_reclaim_high < 1."
+    condition     = var.balloon_reclaim_low > 0 && var.balloon_reclaim_low < 1
+    error_message = "balloon_reclaim_low must be within (0, 1)."
   }
 }
 
@@ -1333,6 +1339,13 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           }
         }
       }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.balloon_reclaim_low < var.balloon_reclaim_high
+      error_message = "balloon_reclaim_low must be lower than balloon_reclaim_high (hysteresis)."
     }
   }
 }

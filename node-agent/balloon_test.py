@@ -174,6 +174,14 @@ class TestParsers(unittest.TestCase):
                           p["cache_bytes"], p["major_faults"]), (5, 4, 10, 3, 7))
         self.assertIsNone(p["swap_in_bytes"])
 
+    def test_config_from_env_rejects_bad_combinations(self):
+        with patch.dict(os.environ, {"BALLOON_RECLAIM_HIGH": "0.6",
+                                     "BALLOON_RECLAIM_LOW": "0.7",
+                                     "BALLOON_MAX_RATIO": "1.5"}):
+            cfg = B.BalloonConfig.from_env()
+        self.assertEqual((cfg.low_ratio, cfg.high_ratio), (0.65, 0.80))
+        self.assertEqual(cfg.max_ratio, 0.75)
+
     def test_config_from_env(self):
         with patch.dict(os.environ, {"BALLOON_AUTO_RECLAIM": "0",
                                      "BALLOON_RECLAIM_HIGH": "0.9",
@@ -302,6 +310,35 @@ class TestGlue(unittest.TestCase):
             release.set()
             t.join()
         self.assertTrue(any(c[2] == "/balloon/statistics" for c in calls))
+
+    def test_balloon_locks_pruned_for_gone_vms(self):
+        agent._VM_BALLOON_LOCKS.clear()
+        agent._VMS["a"] = {"state": "running", "sock": "/s/a", "mem_mib": 4096}
+        agent._balloon_lock("a")
+        agent._balloon_lock("gone")
+        with patch.object(agent, "_fc", self._fake_fc([], None)):
+            agent.balloon_tick(now=1.0)
+        self.assertIn("a", agent._VM_BALLOON_LOCKS)
+        self.assertNotIn("gone", agent._VM_BALLOON_LOCKS)
+        # 被其他线程(生命周期操作)持有的锁不能被清理
+        import threading
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with agent._vm_lifecycle("busy-gone"):
+                held.set()
+                release.wait(5)
+        t = threading.Thread(target=holder)
+        t.start()
+        held.wait(5)
+        try:
+            agent._prune_balloon_locks()
+            self.assertIn("busy-gone", agent._VM_BALLOON_LOCKS)
+        finally:
+            release.set()
+            t.join()
+        agent._prune_balloon_locks()
+        self.assertNotIn("busy-gone", agent._VM_BALLOON_LOCKS)
 
     def test_manual_set_holds(self):
         agent._VMS["a"] = {"state": "running", "sock": "/s/a", "mem_mib": 4096}

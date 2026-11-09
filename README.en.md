@@ -586,7 +586,7 @@ python3 node-agent/reclaim_test.py
 python3 node-agent/balloon_test.py
 python3 node-agent/pinning_test.py
 # Expected (Python 3.12): control plane 63/63 + CRD/operator 16/16 + recovery 15/15 + node-agent auth 3/3
-#           + observability 23/23 + reclaim 13/13 + balloon 26/26 + pinning 10/10 PASS
+#           + observability 23/23 + reclaim 13/13 + balloon 28/28 + pinning 10/10 PASS
 ```
 
 ---

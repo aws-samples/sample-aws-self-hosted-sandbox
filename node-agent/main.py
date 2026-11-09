@@ -205,7 +205,7 @@ BALLOON_FREE_PAGE_REPORTING = os.environ.get(
     "BALLOON_FREE_PAGE_REPORTING", "1"
 ).lower() in ("1", "true")
 BALLOON_STATS_INTERVAL_S = max(
-    0, int(os.environ.get("BALLOON_STATS_INTERVAL_S", "5"))
+    0, balloon_ctl._env_int("BALLOON_STATS_INTERVAL_S", 5)  # 非整数时退回 5,不在启动时崩溃
 )
 _DEFAULT_BALLOON = {
     "amount_mib": 0,
@@ -516,6 +516,18 @@ _VM_BALLOON_LOCKS: dict[str, threading.RLock] = {}
 def _balloon_lock(sandbox_id: str) -> threading.RLock:
     with _LOCK:
         return _VM_BALLOON_LOCKS.setdefault(sandbox_id, threading.RLock())
+
+
+def _prune_balloon_locks() -> None:
+    """清掉已不在 _VMS 里、且没人持有的 VM 的气球锁,避免只增不减。"""
+    with _LOCK:
+        for sid in [k for k in _VM_BALLOON_LOCKS if k not in _VMS]:
+            lock = _VM_BALLOON_LOCKS[sid]
+            if lock.acquire(blocking=False):
+                try:
+                    _VM_BALLOON_LOCKS.pop(sid, None)
+                finally:
+                    lock.release()
 
 
 @contextmanager
@@ -3175,6 +3187,7 @@ def balloon_tick(now: float | None = None) -> list[balloon_ctl.Action]:
         record_balloon_adjustment(NODE_ID, action.reason)
         per_vm.get(action.sid, {})["target_mib"] = action.target_mib
 
+    _prune_balloon_locks()
     recent = list(_BALLOON_STATE.get("recent_actions") or [])
     for action in applied:
         recent.append({"at": round(now, 3), "id": action.sid,
