@@ -22,12 +22,12 @@
 
 ### Overview
 
-A production-grade AI Agent sandbox platform built on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and a Kubernetes-managed platform control plane.
+A reference implementation of an AI Agent sandbox platform on AWS, replicating Fly.io's Firecracker microVM architecture — with lower cost, full data sovereignty, and a Kubernetes-managed platform control plane. Core orchestration (reconcile / leader election / snapshot durability / observability) is verified on real hardware; remaining production-hardening items (jailer, egress policy, node-agent auth, per-tenant quotas) are tracked in [docs/fc-生产就绪-gap分析.md](docs/fc-生产就绪-gap分析.md).
 
 - **True microVM isolation**: Each sandbox runs in an independent Firecracker guest kernel — identical behavior to bare metal
 - **Host-managed Firecracker backend**: node-agent orchestrates TAP, snapshots, and API calls, while host systemd + jailer run every VMM in an independent cgroup/chroot. Snapshots land on persistent state EBS and are uploaded to S3 by default (configurable).
 - **Separated control and data planes**: the control plane stays on On-Demand Graviton system nodes; Firecracker runs only on tainted sandbox nodes, using either bare-metal hosts or nested-virtualization-capable Intel x86 instances (`i7i.8xlarge` is the current default); see the [heterogeneous node-pool E2E report](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
-- **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS, resume in ~1.2s (same-node)
+- **Snapshot-driven cost control**: Idle sandboxes snapshot to persistent EBS; same-node resume is sub-second to ~1.2s on c6g.metal (0.13s warm-pool claim), 3.5–10s on i7i in the strict E2E that includes vsock recovery
 - **Fly Machines-style API**: create/wait/suspend/resume/exec/locate with idempotency, optimistic locking, capability model
 - **Port exposure & dev tooling**: reach any in-VM port via `/s/{id}/{port}` (path routing, WebSocket-capable), interactive web terminal, file upload/download — all through the Portal (see API section below)
 - **Custom images**: `image` field selects a prebuilt named rootfs template (e.g. `web` = demo site auto-served on :80); see [docs/自定义rootfs设计.md](docs/自定义rootfs设计.md)
@@ -71,9 +71,9 @@ Playground to run create / suspend / resume / exec / destroy and see each call's
 | **Arbitrary port exposure** | ✅ Path routing `/s/{id}/{port}` + shared NLB (WebSocket supported) | ✅ | ✅ | ❌ |
 | **Interactive web terminal / file transfer** | ✅ Built into Portal (PTY-over-WS + base64 over exec) | ✅ | Partial | ❌ |
 | **24×7 persistent** | ✅ | ✅ | ✅ | ❌ TTL enforced |
-| **Snapshot suspend/resume** | ✅ 1.2s measured | ✅ | ✅ | ❌ |
+| **Snapshot suspend/resume** | ✅ sub-second to ~1.2s same-host (c6g.metal); 3.5–10s on i7i strict E2E | ✅ | ✅ | ❌ |
 | **Auto-sleep / auto-wake** | ✅ Idle → `slept`; gateway request transparently resumes (opt-in via `autostop`/`autostart`) | ✅ | ✅ auto_stop/auto_start | ❌ |
-| **Credential isolation** | ✅ LiteLLM IRSA (verified) | ✅ | ✅ | N/A |
+| **Credential isolation** | ✅ LiteLLM IRSA gateway (verified in-cluster; in-guest wiring pending) | ✅ | ✅ | N/A |
 | **Observability** | ✅ Prometheus/Alertmanager/Grafana; optional AMP + AMG | Managed | Managed | CloudWatch |
 | **Data sovereignty** | ✅ Stays in your AWS account | ❌ 3rd party | ❌ 3rd party | ✅ |
 | **K8s ecosystem** | Platform services run on EKS; sandboxes are not Pods | ❌ | ❌ | ❌ |
@@ -304,7 +304,7 @@ curl -s $BASE_URL/sandboxes/{id}/exec -X POST -d '{"cmd":"echo hello"}'
 # Suspend (snapshot + free memory)
 curl -s -X POST $BASE_URL/sandboxes/{id}/suspend
 
-# Resume (~1.2s)
+# Resume (same-host: sub-second to ~1.2s from local EBS; cross-host: pulls from S3, uploaded by default)
 curl -s -X POST $BASE_URL/sandboxes/{id}/resume
 
 # Destroy
@@ -391,7 +391,7 @@ You are the ops engineer for this AWS sandbox platform. Platform overview:
   External access: http://api.sbx.<domain> (ingress-nginx NLB; POC use port-forward)
 - State storage: DynamoDB (claude-sbx-sandboxes / events / tap-idx / nodes / locks)
 - Credential isolation: LiteLLM (litellm namespace) holds Bedrock IRSA; sandboxes have no credentials
-- Snapshots: persistent state EBS (base + Diff incremental memory snapshots), spot evacuation + cross-node recovery
+- Snapshots: persistent state EBS (base + Diff incremental memory snapshots), uploaded to S3 by default (SNAPSHOT_TO_S3); spot evacuation is opt-in (RECLAIM_AUTO_EVACUATE, default DRY-RUN) and cross-node recovery is semi-automatic (manual volume attach / resume)
 - Observability: Prometheus/Alertmanager/Grafana in the monitoring namespace; optional AMP + AMG
 
 Common ops tasks:
@@ -439,7 +439,7 @@ Monitoring:
 | **Total (sandbox Spot + On-Demand system, target mode)** | | **~$751/mo** |
 
 > **Spot is the platform's core cost model**: c6g.metal spot ≈ 29% of on-demand (measured us-east-1 AZs $0.65–$0.74/hr, queried 2026-07);
-> when spot is reclaimed, snapshot evacuation + cross-node recovery preserves memory state (see the 50-sandbox test below). **Spot prices fluctuate** — use live quotes.
+> when spot is reclaimed, snapshot evacuation + cross-node recovery preserves memory state (capability validated in the 50-sandbox test below; the automatic orchestration loop is not finished yet — see "Snapshot persistence & cross-node recovery"). **Spot prices fluctuate** — use live quotes.
 > Without spot, on-demand can use a 1-yr Savings Plan for ~42% off. Use [AWS Pricing Calculator](https://calculator.aws) for exact figures.
 > Keep system nodes On-Demand. Move only sandbox data nodes to Spot after interruption handling,
 > snapshot evacuation, and cross-node recovery are fully automated.
@@ -506,13 +506,34 @@ single-VM idle footprint and a concurrency assumption. A 400-microVM saturated-n
 
 > **vCPU / Memory Overcommit further reduces per-sandbox cost:** Firecracker microVMs support CPU oversubscription — idle sandboxes consume nearly zero CPU, and active sandboxes are burst-oriented. Measured idle footprint is only ~50 MB per VM (far below the allocated 1.5 GiB), which means you can provision more sandboxes than raw memory math suggests and fill the machine based on actual working-set, not allocation. Combined with snapshot-based idle recovery, the effective sandbox density — and thus per-sandbox cost — can be significantly lower than the table above. The right overcommit ratio depends on your workload profile and should be validated through load testing.
 
+### Memory Reclaim: virtio-balloon (keeps memory overcommit from decaying)
+
+Overcommit only works if you pack by real usage, but the host cannot tell which guest pages are expendable: a guest at "90% used" may be mostly page cache. Every microVM gets a virtio-balloon by default, so **the guest itself chooses the cheapest pages to hand back** instead of the host swapping blindly:
+
+| Mechanism | What it does | Default |
+|---|---|---|
+| **Free page reporting** | Memory the guest actually frees (process exit, deleted files) goes back to the host continuously | on |
+| **Balloon statistics** | Guest reports MemAvailable / page cache / major faults every 5 s, used for decisions and metrics | on (pre-boot) |
+| **Pressure-driven inflation** | When `sbx.slice` passes 80%, inflate within each guest's self-reported available memory to reclaim the **page cache** that FPR cannot touch; idle VMs first; release slowly below 65% | on |
+| **Safety valves** | Per-VM floor max(256 MiB, 10%); deflate and cool down immediately on major-fault spikes, swap-in, or `deflate_on_oom` | on |
+
+**Why it matters (measured on m8i.2xlarge, [report](docs/balloon-内存回收-真机测试报告-2026-11-09.md)):**
+
+- **FPR cannot reclaim page cache; inflation can**: a 4 GiB sandbox holding 3.3 GiB of file cache kept 3.5 GiB of host memory with FPR alone; inflating **reclaimed 2.6 GiB in 1 s**, and it stayed reclaimed after deflating.
+- **No sustained host swapping**: with 8 sandboxes filling caches at once and the controller off, the host pushed guest cache into zram (**5.1 GiB for 126 s**, slice at 91%). With it on, the sustained phase holds at **65%** with about **1 GiB** swapped and only 4 to 10 s above 1 GiB, 0 OOM, 15 to 19 GiB reclaimed. The burst itself still hits the limit (occasional exec stalls of tens of seconds, with or without the controller) and is absorbed by zram.
+- **Guests are not starved**: a guest asking for 2.5 GiB with its balloon full got the memory with 0 OOM while the controller deflated step by step.
+- **Snapshot-safe**: suspend/resume while inflated keeps memory sha256 intact and preserves balloon state and statistics.
+- **Observable**: low-cardinality `fc_balloon_*` / `fcnode_vmm_*` metrics; `GET /balloon/status` shows per-VM guest available/cache and host anon/file.
+
+> Trade-offs: reclaimed memory is cold guest cache, so re-reading files is slower afterwards (2.5 s → 4.7 s measured); tune with `balloon_reclaim_high` / `balloon_reclaim_low`. The balloon depends on a cooperating guest driver, so it is **an optimization, never admission control**; `sbx.slice` MemoryMax + zram remain the hard guarantee. Free page hinting stays off (Firecracker documents a memory-corruption race), and there is no pre-snapshot inflation because Full snapshots write the whole guest memory anyway.
+
 ### Key Benchmark Numbers
 
 | Metric | Measured | Environment |
 |---|---|---|
 | microVM cold start | ~0.31s | c6g.metal, Firecracker v1.16 |
 | Snapshot resume | **~0.13s (same-host Full load)** | warm pool resumes on origin node; cross-host via persistent EBS migration (see 50-sandbox test below) |
-| Snapshot storage | persistent state EBS (base + Diff, not S3) | spot volume survives reclaim, migrates to another node |
+| Snapshot storage | persistent state EBS (base + Diff) + S3 upload by default (`SNAPSHOT_TO_S3`) | cross-node resume downloads from S3, or the surviving spot volume migrates to another node |
 | Idle memory footprint | ~50 MB/VM | 512 MiB allocated |
 | Max concurrent VMs (tested) | 60 (not the ceiling) | c6g.metal 128 GiB |
 | npm install time | 18s (JuiceFS) / 4s (local ext4) | 7160 files, 8 deps |
@@ -525,37 +546,47 @@ single-VM idle footprint and a concurrency assumption. A 400-microVM saturated-n
 
 To avoid misunderstanding vs. the implementation, the current boundaries:
 
-- **Snapshots only land on the node's local persistent state EBS (`/var/lib/sbx/{id}/snap`), never S3.**
-  Neither suspend nor spot evacuation uploads to S3; the `snapshot_s3` field is always empty. Cross-node
-  recovery relies on that `DeleteOnTermination=false` state volume surviving and being attached to a new
-  node — **not on downloading snapshots from S3**.
-- **The S3 fallback path in code is currently dormant**: resume/`op_resume` still keeps a "pull from
-  `s3_prefix` if no local snapshot" branch, but since nothing ever writes snapshots to S3 (`upload_s3` is
-  never set true, `snapshot_s3` is always empty), that branch is never triggered. It's a reserved hook for a
-  future optional S3 archive — **it does not mean an S3 copy exists today**.
-- **Cross-node recovery is not yet fully automated**: node-agent's spot-reclaim auto-evacuation defaults to
-  **DRY-RUN** (records a plan only, takes no snapshot); set `RECLAIM_AUTO_EVACUATE=1` to actually snapshot to
-  EBS. The "on node death, auto-detach volume → attach to new node → batch resume" step (Block 2 cross-node
-  orchestration) is **not implemented yet**. In the 50-sandbox test, the volume detach/attach and batch
-  resume were **triggered manually / semi-automatically** to validate the capability — not an automatic
-  production flow.
+- **Snapshots are uploaded to S3 as the authoritative copy by default (can be disabled).** On suspend, the
+  memory snapshot (base + diff) is first written to the node's local persistent state EBS
+  (`/var/lib/sbx/{id}/snap`, sub-second same-node resume), then the **whole snap_dir is synced to S3**
+  (`s3://<bucket>/sbx/{id}/`) and the prefix is written back to `snapshot_s3`. The switch `SNAPSHOT_TO_S3`
+  (default `1`; Terraform variable `snapshot_to_s3`) set to `0` keeps snapshots on EBS only (saves the upload
+  time / bandwidth). `SNAPSHOT_S3_BUCKET` must be configured for the upload to happen (without a bucket it
+  silently degrades to local-only).
+- **Cross-node recovery has two paths**: ① (S3 enabled, default) after the node dies, download snap_dir from
+  S3 → merge diff → load; ② the `DeleteOnTermination=false` EBS state volume survives and is detached /
+  attached to a new node. With S3 upload enabled, recovery via ① works even if the node and its state volume
+  are both lost. The "pull from `s3_prefix` if no local snapshot" branch in `op_resume` is now actually
+  exercised. Note that `rootfs.ext4` is not part of snap_dir and is not uploaded; a cross-node restore that
+  cannot find the sandbox's rootfs falls back to a fresh template disk.
+- **Spot auto-evacuation is still opt-in / semi-automatic**: node-agent's spot-reclaim auto-evacuation
+  defaults to **DRY-RUN** (records a plan only, takes no snapshot); set `RECLAIM_AUTO_EVACUATE=1` to actually
+  snapshot (to EBS, and to S3 when enabled). The "on node death, auto-detach volume / auto-pull from S3 and
+  batch resume" orchestration loop is **not implemented yet**. In the 50-sandbox test, the volume
+  detach/attach and batch resume were **triggered manually / semi-automatically** to validate the
+  capability — not an automatic production flow.
 
-> In one line: **same-node suspend/resume is fully automatic and never touches S3; the primitives for
-> cross-node recovery (EBS volume survival + exact memory resume) are proven, but the "auto-detect spot
-> reclaim → auto-migrate volume → auto-resume" orchestration loop is not finished.**
+> In one line: **same-node suspend/resume is sub-second; snapshots are uploaded to S3 by default (can be
+> disabled), so cross-node recovery can download from S3 instead of depending solely on the EBS volume
+> surviving; but the "auto-detect spot reclaim → auto-evacuate → auto-resume" orchestration loop is not
+> finished.**
 
 ### Local Smoke Test (No AWS Required)
 
 ```bash
+# Run from the repo root; Python version in .python-version (3.12, same as the images)
 python3 -m pip install -r requirements-dev.txt
-python3 sandbox-api/smoke_test.py
-python3 sandbox-api/crd_test.py
+python3 scripts/check_stdlib_shadowing.py   # no module may shadow the stdlib (also run by pre-commit)
+python3 -m sandbox_api.smoke_test           # control plane imported as a package, same as in the container
+python3 -m sandbox_api.crd_test
+python3 -m sandbox_api.recovery_test
+python3 -m sandbox_api.node_agent_auth_test
 python3 node-agent/observability_test.py
 python3 node-agent/reclaim_test.py
-python3 sandbox-api/recovery_test.py
-PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
-# Expected: control plane 57/57 + CRD/operator 16/16 + node-agent 22/22
-#           + reclaim 13/13 + recovery 13/13 + node-agent auth 2/2 PASS
+python3 node-agent/balloon_test.py
+python3 node-agent/pinning_test.py
+# Expected (Python 3.12): control plane 63/63 + CRD/operator 16/16 + recovery 15/15 + node-agent auth 3/3
+#           + observability 23/23 + reclaim 13/13 + balloon 28/28 + pinning 10/10 PASS
 ```
 
 ---
@@ -575,4 +606,4 @@ After cloning, **run once** to enable the pre-commit AI code review + doc auto-s
 
 ---
 
-*This project is a production-grade reference implementation. Use it as a foundation for building your own agent sandbox platform on AWS.*
+*This project is a reference implementation with real-hardware-verified orchestration; use it as a foundation for building your own agent sandbox platform on AWS, and complete the hardening items in [docs/fc-生产就绪-gap分析.md](docs/fc-生产就绪-gap分析.md) before exposing it to untrusted tenants.*

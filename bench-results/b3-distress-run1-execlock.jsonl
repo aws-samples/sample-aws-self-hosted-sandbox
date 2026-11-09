@@ -1,0 +1,6 @@
+{"ts": 1794197385.022, "kind": "create", "tag": "distress", "id": "bl-distress", "http": 200, "s": 0.253}
+{"ts": 1794197402.167, "kind": "inflate_request", "tag": "distress", "id": "bl-distress", "target_mib": 3183, "resp": {"http": 200, "id": "bl-distress", "target_mib": 3183, "hold_s": 0.0}}
+{"ts": 1794197403.179, "kind": "vm_state", "tag": "distress", "label": "inflated", "id": "bl-distress", "host_mib": 2523, "host_anon_mib": 892, "host_file_mib": 1610, "balloon_target_mib": 3183, "balloon_actual_mib": 3183, "guest_available_mib": 527, "guest_free_mib": 153, "guest_cached_mib": 12, "guest_buffers_mib": 559, "guest_anon_mib": 11}
+{"ts": 1794197432.143, "kind": "big_alloc", "tag": "distress", "id": "bl-distress", "rc": 0, "s": 28.964, "stdout": "allocated\n", "stderr": ""}
+{"ts": 1794197432.167, "kind": "vm_state", "tag": "distress", "label": "after_alloc", "id": "bl-distress", "host_mib": 4452, "host_anon_mib": 2820, "host_file_mib": 1611, "balloon_target_mib": 3183, "balloon_actual_mib": 1256, "guest_available_mib": 2533, "guest_free_mib": 2644, "guest_cached_mib": 8, "guest_buffers_mib": 0, "guest_anon_mib": 11, "guest_oom_lines": "0"}
+{"ts": 1794197432.168, "kind": "controller_actions", "tag": "distress", "actions": []}

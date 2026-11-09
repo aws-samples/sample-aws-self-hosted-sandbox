@@ -55,7 +55,7 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlparse
@@ -77,9 +77,13 @@ from observability import (
     record_snapshot_legacy_migration,
     record_snapshot_transfer,
     record_snapshot_verify,
+    record_balloon_adjustment,
+    refresh_balloon_metrics,
     refresh_node_metrics,
     start_server_span,
 )
+
+import balloon as balloon_ctl
 
 import agent_auth
 
@@ -187,17 +191,27 @@ def _cached_rootfs_template(src: str) -> str:
         return src
 
 
-# 默认给每个新建 VM 挂 virtio-balloon 并开启 free page reporting:guest 释放的
-# 内存会还给宿主(真机实测 3.2GiB→240MiB);不开时宿主 RSS 只涨不降,内存超分
-# 随时间失效。create 请求显式传 balloon 时以请求为准。
+# 默认给每个新建 VM 挂 virtio-balloon(只能 boot 前配置),三件事各自可开关:
+#   - free page reporting:guest 释放的空闲页还给宿主(真机实测 3.2GiB→240MiB);
+#     不开时宿主 RSS 只涨不降,内存超分随时间失效。但它不碰 guest page cache。
+#   - 统计(stats_polling_interval_s>0):guest 上报 MemAvailable/cache/major fault,
+#     是控制器决策与可观测性的输入。只能 boot 前开启,boot 后无法从 0 打开。
+#   - deflate_on_oom:guest 将 OOM 时先从气球拿页,而不是触发 OOM killer。
+# 主动充气(回收 page cache)由 balloon.py 的宿主压力控制器驱动,见 start_balloon_loop。
+# create 请求显式传 balloon 时以请求为准。free page hinting 是 Firecracker 的
+# developer-preview,官方文档注明存在可能破坏 guest 内存的竞态,刻意不启用。
+BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "1").lower() in ("1", "true")
 BALLOON_FREE_PAGE_REPORTING = os.environ.get(
     "BALLOON_FREE_PAGE_REPORTING", "1"
 ).lower() in ("1", "true")
+BALLOON_STATS_INTERVAL_S = max(
+    0, balloon_ctl._env_int("BALLOON_STATS_INTERVAL_S", 5)  # 非整数时退回 5,不在启动时崩溃
+)
 _DEFAULT_BALLOON = {
     "amount_mib": 0,
     "deflate_on_oom": True,
-    "stats_polling_interval_s": 0,
-    "free_page_reporting": True,
+    "stats_polling_interval_s": BALLOON_STATS_INTERVAL_S,
+    "free_page_reporting": BALLOON_FREE_PAGE_REPORTING,
 }
 
 
@@ -491,6 +505,50 @@ def _vm_operation_lock(sandbox_id: str):
                 _VM_OP_LOCK_USERS.pop(sandbox_id, None)
                 if _VM_OP_LOCKS.get(sandbox_id) is lock:
                     _VM_OP_LOCKS.pop(sandbox_id, None)
+
+
+# 每 VM 一把"气球锁":生命周期操作(create/destroy/suspend/resume/checkpoint…)阻塞持有,
+# 后台气球控制器非阻塞尝试。exec 只走 vsock、不碰 Firecracker API,不持有它——
+# 否则 guest 跑长命令(恰恰最需要内存时)控制器会一直被挡住(真机测试发现)。
+_VM_BALLOON_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _balloon_lock(sandbox_id: str) -> threading.RLock:
+    with _LOCK:
+        return _VM_BALLOON_LOCKS.setdefault(sandbox_id, threading.RLock())
+
+
+def _prune_balloon_locks() -> None:
+    """清掉已不在 _VMS 里、且没人持有的 VM 的气球锁,避免只增不减。"""
+    with _LOCK:
+        for sid in [k for k in _VM_BALLOON_LOCKS if k not in _VMS]:
+            lock = _VM_BALLOON_LOCKS[sid]
+            if lock.acquire(blocking=False):
+                try:
+                    _VM_BALLOON_LOCKS.pop(sid, None)
+                finally:
+                    lock.release()
+
+
+@contextmanager
+def _vm_lifecycle(sandbox_id: str):
+    lock = _balloon_lock(sandbox_id)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _try_balloon_lock(sandbox_id: str):
+    lock = _balloon_lock(sandbox_id)
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
 
 
 # ---------- tap 网络 ----------
@@ -1633,7 +1691,7 @@ def _create_reserved(sid: str, body: dict, tap_idx: int, cpu: int,
             guest_ip=guest_ip,
             host_ip=host_ip,
             balloon=body.get("balloon") or (
-                _DEFAULT_BALLOON if BALLOON_FREE_PAGE_REPORTING else None
+                _DEFAULT_BALLOON if BALLOON_ENABLED else None
             ),
         )
     except Exception:
@@ -1650,6 +1708,8 @@ def _create_reserved(sid: str, body: dict, tap_idx: int, cpu: int,
         "dir":     d,
         "runtime_unit": runtime_unit,
         "vcpus":   cpu,
+        "mem_mib": mem_mib,
+        "last_exec_ts": time.time(),
     }
     with _LOCK:
         _VMS[sid] = vm
@@ -1816,7 +1876,7 @@ def _live_runtime_socket(sandbox_dir: str) -> str | None:
 
 def op_destroy(body: dict) -> dict:
     sid = _sandbox_id(body.get("id"))
-    with _vm_operation_lock(sid):
+    with _vm_operation_lock(sid), _vm_lifecycle(sid):
         return _op_destroy_locked(sid)
 
 
@@ -2710,6 +2770,8 @@ def op_exec(body: dict) -> dict:
 
     with _LOCK:
         vm = _VMS.get(sid)
+        if vm:
+            vm["last_exec_ts"] = time.time()  # 气球控制器据此优先回收空闲 VM
     if not vm or vm["state"] != "running":
         raise RuntimeError(f"sandbox {sid} not running")
 
@@ -2832,6 +2894,7 @@ def _refresh_metrics() -> None:
             state = vm.get("state", "unknown")
             states[state] = states.get(state, 0) + 1
     scratch_free, scratch_total = _scratch_bytes()
+    refresh_balloon_metrics(NODE_ID, _BALLOON_STATE)
     refresh_node_metrics(
         NODE_ID,
         states,
@@ -2903,6 +2966,302 @@ def _free_mem_mib() -> int:
     except Exception:
         pass
     return 0
+
+
+# ---------- virtio-balloon 内存回收控制器 ----------
+# 策略逻辑在 balloon.py(纯函数,有单测);这里只做 I/O:读宿主 cgroup / PSI、
+# 拉各 VM 的 Firecracker 气球统计、下发 PATCH /balloon、刷新指标与状态。
+
+BALLOON_CFG = balloon_ctl.BalloonConfig.from_env()
+VMM_SLICE = os.environ.get("VMM_SLICE", "sbx.slice")
+# node-agent 是 hostPID 的 privileged Pod:经 /proc/1/root 读宿主 cgroupfs
+# (容器自己的 /sys/fs/cgroup 是 cgroup namespace 内视图,看不到 sbx.slice)。
+HOST_CGROUP_ROOT = os.environ.get(
+    "HOST_CGROUP_ROOT", "/proc/1/root/sys/fs/cgroup"
+)
+_BALLOON_CTL = balloon_ctl.ControllerState()
+_BALLOON_CTL_LOCK = threading.Lock()
+_BALLOON_STATE: dict = {
+    "enabled": BALLOON_CFG.enabled, "mode": "normal", "at": None,
+    "host": {}, "totals": {}, "vms": {}, "recent_actions": [],
+    "vms_with_stats": 0, "vms_without_stats": 0, "ticks": 0,
+}
+_BALLOON_RECENT_MAX = 50
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return stream.read()
+    except OSError:
+        return None
+
+
+def _meminfo() -> dict[str, int]:
+    out: dict[str, int] = {}
+    text = _read_text("/proc/meminfo") or ""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            out[parts[0].rstrip(":")] = int(parts[1]) * 1024
+    return out
+
+
+def _host_vmm_memory() -> dict:
+    """sbx.slice 的 memory.current / memory.max / swap / PSI;读不到则退回 meminfo。"""
+    base = f"{HOST_CGROUP_ROOT}/{VMM_SLICE}"
+    info = _meminfo()
+    mem_total = info.get("MemTotal", 0)
+    current = _read_text(f"{base}/memory.current")
+    if current is not None and current.strip().isdigit():
+        raw_max = (_read_text(f"{base}/memory.max") or "max").strip()
+        swap = (_read_text(f"{base}/memory.swap.current") or "0").strip()
+        usage = int(current.strip())
+        stat = _cgroup_memory_stat(base)
+        # 压力口径用 working set(= usage - inactive_file,与 kubelet/cAdvisor 一致):
+        # guest 读写磁盘时 Firecracker 经宿主 page cache 读写 rootfs.ext4,这部分干净
+        # 缓存算进 memory.current 但宿主内核随时可回收,不应触发充气。
+        working_set = max(0, usage - stat.get("inactive_file", 0))
+        return {
+            "source": "cgroup",
+            "current_bytes": working_set,
+            "usage_bytes": usage,
+            "anon_bytes": stat.get("anon", 0),
+            "file_bytes": stat.get("file", 0),
+            "max_bytes": int(raw_max) if raw_max.isdigit() else mem_total,
+            "swap_bytes": int(swap) if swap.isdigit() else 0,
+            "psi_some_avg10": balloon_ctl.parse_psi_some_avg10(
+                _read_text(f"{base}/memory.pressure") or ""
+            ),
+            "host_mem_total_bytes": mem_total,
+            "host_mem_available_bytes": info.get("MemAvailable", 0),
+        }
+    return {
+        "source": "meminfo",
+        "current_bytes": max(0, mem_total - info.get("MemAvailable", 0)),
+        "max_bytes": mem_total,
+        "swap_bytes": max(0, info.get("SwapTotal", 0) - info.get("SwapFree", 0)),
+        "psi_some_avg10": 0.0,
+        "host_mem_total_bytes": mem_total,
+        "host_mem_available_bytes": info.get("MemAvailable", 0),
+    }
+
+
+def _cgroup_memory_stat(path: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in (_read_text(f"{path}/memory.stat") or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            out[parts[0]] = int(parts[1])
+    return out
+
+
+def _vm_host_memory(vm: dict) -> dict | None:
+    """该 VM 的 systemd service cgroup 内存:usage / anon(≈guest RAM) / file(宿主缓存)。"""
+    unit = vm.get("runtime_unit") or ""
+    if not unit or "/" in unit:
+        return None
+    path = f"{HOST_CGROUP_ROOT}/{VMM_SLICE}/{unit}"
+    text = _read_text(f"{path}/memory.current")
+    if not text or not text.strip().isdigit():
+        return None
+    stat = _cgroup_memory_stat(path)
+    return {"usage": int(text.strip()), "anon": stat.get("anon", 0),
+            "file": stat.get("file", 0)}
+
+
+def _vm_mem_mib(vm: dict) -> int:
+    """配置内存;resume/自恢复的 VM 没记录时向 Firecracker 查一次并缓存。"""
+    if vm.get("mem_mib"):
+        return int(vm["mem_mib"])
+    try:
+        cfg = _fc(vm["sock"], "GET", "/machine-config", timeout=2)
+        mib = int(cfg.get("mem_size_mib") or 0)
+    except Exception:
+        mib = 0
+    if mib:
+        vm["mem_mib"] = mib
+    return mib
+
+
+def _balloon_snapshot_vm(sid: str, vm: dict) -> dict | None:
+    """读取一个 running VM 的气球统计;没挂气球 / 没开统计返回 None。"""
+    try:
+        raw = _fc(vm["sock"], "GET", "/balloon/statistics", timeout=2)
+    except Exception:
+        return None
+    parsed = balloon_ctl.parse_stats(raw)
+    parsed["mem_mib"] = _vm_mem_mib(vm)
+    host = _vm_host_memory(vm)
+    parsed["host_bytes"] = host["usage"] if host else None
+    parsed["host_anon_bytes"] = host["anon"] if host else None
+    parsed["host_file_bytes"] = host["file"] if host else None
+    return parsed
+
+
+def _set_balloon_target(sock: str, amount_mib: int) -> None:
+    _fc(sock, "PATCH", "/balloon", {"amount_mib": int(amount_mib)}, timeout=5)
+
+
+def balloon_tick(now: float | None = None) -> list[balloon_ctl.Action]:
+    """控制器一个周期:采集 → 规划 → 下发。返回实际下发成功的调整。"""
+    now = time.time() if now is None else now
+    host = _host_vmm_memory()
+    with _LOCK:
+        running = [
+            (sid, vm) for sid, vm in _VMS.items()
+            if vm.get("state") == "running" and vm.get("sock")
+        ]
+    inputs: list[balloon_ctl.VmMem] = []
+    per_vm: dict[str, dict] = {}
+    socks: dict[str, str] = {}
+    without_stats = 0
+    totals = {"target": 0, "actual": 0, "guest_available": 0,
+              "guest_cache": 0, "guest_free": 0, "vm_host": 0}
+    for sid, vm in running:
+        with _try_balloon_lock(sid) as acquired:
+            if not acquired:
+                continue  # 正在 suspend/destroy 等生命周期操作,本 tick 跳过
+            snap = _balloon_snapshot_vm(sid, vm)
+        if snap is None:
+            without_stats += 1
+            continue
+        socks[sid] = vm["sock"]
+        per_vm[sid] = {
+            "mem_mib": snap["mem_mib"],
+            "target_mib": snap["target_mib"],
+            "actual_mib": snap["actual_mib"],
+            "guest_available_mib": (snap["available_bytes"] or 0) // balloon_ctl.MIB,
+            "guest_cache_mib": (snap["cache_bytes"] or 0) // balloon_ctl.MIB,
+            "guest_free_mib": (snap["free_bytes"] or 0) // balloon_ctl.MIB,
+            "major_faults": snap["major_faults"],
+            "host_mib": (snap["host_bytes"] // balloon_ctl.MIB
+                         if snap["host_bytes"] is not None else None),
+            "host_anon_mib": (snap["host_anon_bytes"] // balloon_ctl.MIB
+                              if snap["host_anon_bytes"] is not None else None),
+            "host_file_mib": (snap["host_file_bytes"] // balloon_ctl.MIB
+                              if snap["host_file_bytes"] is not None else None),
+            "idle_s": round(now - float(vm.get("last_exec_ts") or now), 1),
+        }
+        totals["target"] += snap["target_mib"] * balloon_ctl.MIB
+        totals["actual"] += snap["actual_mib"] * balloon_ctl.MIB
+        totals["guest_available"] += snap["available_bytes"] or 0
+        totals["guest_cache"] += snap["cache_bytes"] or 0
+        totals["guest_free"] += snap["free_bytes"] or 0
+        totals["vm_host"] += snap["host_bytes"] or 0
+        if snap["mem_mib"] <= 0:
+            continue
+        inputs.append(balloon_ctl.VmMem(
+            sid=sid, mem_mib=snap["mem_mib"],
+            target_mib=snap["target_mib"], actual_mib=snap["actual_mib"],
+            available_bytes=snap["available_bytes"],
+            major_faults=snap["major_faults"],
+            swap_in_bytes=snap["swap_in_bytes"],
+            idle_s=now - float(vm.get("last_exec_ts") or now),
+        ))
+
+    applied: list[balloon_ctl.Action] = []
+    with _BALLOON_CTL_LOCK:
+        host_mem = balloon_ctl.HostMem(
+            current_bytes=host["current_bytes"], max_bytes=host["max_bytes"],
+            psi_some_avg10=host["psi_some_avg10"],
+        )
+        if BALLOON_CFG.enabled:
+            actions = balloon_ctl.plan(_BALLOON_CTL, host_mem, inputs,
+                                       BALLOON_CFG, now)
+        else:
+            balloon_ctl.update_mode(_BALLOON_CTL, host_mem, BALLOON_CFG)
+            actions = []
+        mode = _BALLOON_CTL.mode
+    for action in actions:
+        with _try_balloon_lock(action.sid) as acquired:
+            if not acquired:
+                continue
+            try:
+                _set_balloon_target(socks[action.sid], action.target_mib)
+            except Exception as exc:
+                log_event("warning", "balloon_set_failed", sandbox_id=action.sid,
+                          error_type=type(exc).__name__)
+                continue
+        applied.append(action)
+        record_balloon_adjustment(NODE_ID, action.reason)
+        per_vm.get(action.sid, {})["target_mib"] = action.target_mib
+
+    _prune_balloon_locks()
+    recent = list(_BALLOON_STATE.get("recent_actions") or [])
+    for action in applied:
+        recent.append({"at": round(now, 3), "id": action.sid,
+                       "target_mib": action.target_mib, "reason": action.reason})
+    _BALLOON_STATE.update({
+        "enabled": BALLOON_CFG.enabled,
+        "mode": mode,
+        "at": round(now, 3),
+        "host": host,
+        "host_ratio": round(host_mem.ratio, 4),
+        "totals": totals,
+        "vms": per_vm,
+        "vms_with_stats": len(per_vm),
+        "vms_without_stats": without_stats,
+        "recent_actions": recent[-_BALLOON_RECENT_MAX:],
+        "ticks": int(_BALLOON_STATE.get("ticks", 0)) + 1,
+        "config": {
+            "high_ratio": BALLOON_CFG.high_ratio,
+            "low_ratio": BALLOON_CFG.low_ratio,
+            "psi_some_avg10": BALLOON_CFG.psi_some_avg10,
+            "step_mib": BALLOON_CFG.step_mib,
+            "release_step_mib": BALLOON_CFG.release_step_mib,
+            "interval_s": BALLOON_CFG.interval_s,
+        },
+    })
+    return applied
+
+
+def op_balloon_set(body: dict) -> dict:
+    """手动设定气球目标(运维/测试用);保持 hold_s 秒内控制器不接管。"""
+    sid = _sandbox_id(body.get("id"))
+    with _LOCK:
+        vm = _VMS.get(sid)
+    if not vm or vm.get("state") != "running":
+        raise RuntimeError(f"sandbox {sid} not running")
+    mem_mib = _vm_mem_mib(vm) or MAX_MEM_MIB
+    amount = _int_in_range(body.get("amount_mib"), 0, mem_mib, "amount_mib")
+    hold_s = float(_int_in_range(
+        body.get("hold_s", int(BALLOON_CFG.manual_hold_s)), 0, 86400, "hold_s"
+    ))
+    _set_balloon_target(vm["sock"], amount)
+    with _BALLOON_CTL_LOCK:
+        track = _BALLOON_CTL.vms.setdefault(sid, balloon_ctl.VmTrack())
+        track.manual_until = time.time() + hold_s
+        track.stall = 0
+    record_balloon_adjustment(NODE_ID, "manual")
+    return {"id": sid, "target_mib": amount, "hold_s": hold_s}
+
+
+def op_balloon_get(sid: str) -> dict:
+    sid = _sandbox_id(sid)
+    with _LOCK:
+        vm = _VMS.get(sid)
+    if not vm:
+        raise KeyError(sid)
+    if vm.get("state") != "running":
+        return {"id": sid, "state": vm.get("state"), "stats": None}
+    try:
+        config = _fc(vm["sock"], "GET", "/balloon", timeout=2)
+    except Exception:
+        config = None
+    snap = _balloon_snapshot_vm(sid, vm)
+    return {"id": sid, "state": "running", "config": config, "stats": snap}
+
+
+def start_balloon_loop() -> None:
+    def _loop():
+        while True:
+            try:
+                balloon_tick()
+            except Exception as exc:
+                print(f"[balloon] tick error: {exc}", file=sys.stderr, flush=True)
+            time.sleep(BALLOON_CFG.interval_s)  # nosemgrep: arbitrary-sleep -- 控制器周期
+    threading.Thread(target=_loop, daemon=True, name="balloon-ctl").start()
 
 
 # ---------- 心跳注册(P0-3) ----------
@@ -3813,7 +4172,7 @@ def _checkpoint_one(
         remaining = monotonic_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("checkpoint deadline exhausted before start")
-        with _vm_operation_lock(sid):
+        with _vm_operation_lock(sid), _vm_lifecycle(sid):
             info = op_suspend({
                 "id": sid,
                 "snapshot_local_path": f"{SBX_BASE}/{sid}/snap",
@@ -4441,6 +4800,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/reclaim/status":
                 return self._send(200, _RECLAIM_STATE)
+            if path == "/balloon/status":
+                return self._send(200, _BALLOON_STATE)
             if path == "/recovery/status":
                 configured_role, recovery_group, _ = (
                     _node_recovery_identity()
@@ -4460,6 +4821,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "vm":
                 return self._send(200, op_get(parts[1]))
+            if len(parts) == 3 and parts[0] == "vm" and parts[2] == "balloon":
+                return self._send(200, op_balloon_get(parts[1]))
             self._send(404, {"error": "not found"})
         except RequestValidationError as e:
             self._deny(400, e.reason, kind="invalid_request", field=e.field)
@@ -4487,9 +4850,17 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._deny(400, "bad_json", kind="invalid_request")
         try:
+            if path == "/vm/balloon" and body.get("id"):
+                # 不进 op 锁:长 exec 不应阻塞运维/控制器调整气球
+                sid = _sandbox_id(body.get("id"))
+                with _vm_lifecycle(sid):
+                    return self._send(200, self._run_vm_operation(
+                        "balloon", lambda: op_balloon_set(body)))
             if path.startswith("/vm/") and body.get("id"):
                 sid = _sandbox_id(body.get("id"))
-                with _vm_operation_lock(sid):
+                lifecycle = (nullcontext() if path == "/vm/exec"
+                             else _vm_lifecycle(sid))
+                with _vm_operation_lock(sid), lifecycle:
                         if path == "/vm/create":
                             return self._send(200, self._run_vm_operation(
                                 "create", lambda: op_create(body)))
@@ -4625,6 +4996,13 @@ if __name__ == "__main__":
 
     # 心跳注册:控制面据此发现活节点(P0-3)
     start_heartbeat_loop()
+
+    # virtio-balloon 宿主压力控制器(统计 + 按需充/放气)
+    if BALLOON_ENABLED:
+        start_balloon_loop()
+        print(f"[balloon] controller={'on' if BALLOON_CFG.enabled else 'observe-only'} "
+              f"stats={BALLOON_STATS_INTERVAL_S}s fpr={'on' if BALLOON_FREE_PAGE_REPORTING else 'off'} "
+              f"high={BALLOON_CFG.high_ratio} low={BALLOON_CFG.low_ratio}", flush=True)
 
     # Block 1:spot 回收信号监听 → 自动疏散(默认 DRY-RUN)
     start_reclaim_watch_loop()

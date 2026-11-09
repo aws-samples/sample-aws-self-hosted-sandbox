@@ -213,7 +213,7 @@ resource "kubernetes_deployment" "firecracker_operator" {
         container {
           name    = "operator"
           image   = var.control_plane_image
-          command = ["python3", "-m", "sandbox_api.operator"]
+          command = ["python3", "-m", "sandbox_api.fc_operator"]
           env_from {
             config_map_ref {
               name = kubernetes_config_map.control_plane.metadata[0].name
