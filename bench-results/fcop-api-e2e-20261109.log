@@ -1,0 +1,47 @@
+
+========================================
+  Sandbox Control Plane E2E Test
+  Driver: firecracker
+========================================
+  ---- Using provided API URL: http://localhost:18000
+  ---- T1: Service health
+  PASS GET / → 200 (driver=firecracker)
+  ---- T2: Capabilities endpoint
+  PASS GET /capabilities → 200 (suspend_resume=True)
+  ---- T3: Create sandbox
+  PASS POST /sandboxes → 201 (id=dd047fcc)
+  ---- T4: Wait for running state
+  ---- Waiting for sandbox dd047fcc → running (timeout 120s)
+    state=running
+  PASS sandbox dd047fcc reached running
+  ---- T5: Get sandbox
+  PASS GET /sandboxes/dd047fcc → 200 (state=running)
+  ---- T6: List sandboxes
+  PASS GET /sandboxes → 200 (count=1)
+  ---- T7: Idempotency key
+  PASS Idempotency: same id returned (dd047fcc)
+  ---- T8: Locate sandbox (VMM info)
+  PASS GET /sandboxes/dd047fcc/locate → 200
+  ---- T9: Exec in sandbox
+  PASS POST /exec → 200 (stdout='sandbox-ok')
+  ---- T10: Suspend / Resume (FC driver only)
+  PASS POST /suspend → 200 (snapshot=s3://my-sandbox-snapshots-427169985960/sbx/dd047fcc/)
+  PASS POST /resume → 200 (restore_time=7.7432s)
+  ---- Waiting for sandbox dd047fcc → running (timeout 30s)
+    state=running
+  PASS POST-resume exec → 200 (state preserved)
+  ---- T12: Wait endpoint with short timeout on nonexistent state
+  PASS wait timeout → 408
+  ---- T13: Destroy sandbox
+  PASS DELETE /sandboxes/dd047fcc → 200
+  ---- T14: GET after destroy → 404
+  PASS GET after destroy → 404
+
+  ---- T16: Control plane auth
+  PASS Auth enforced → 401 without key
+  ---- T17: LiteLLM health (if port-forward active)
+  ---- LiteLLM not reachable on localhost:14000 (port-forward not active), skip T17
+========================================
+  ALL TESTS PASSED
+========================================
+

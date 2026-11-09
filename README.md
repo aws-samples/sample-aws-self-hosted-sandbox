@@ -27,9 +27,9 @@
 - **真实 microVM 隔离**：每个沙盒运行在独立的 Firecracker guest 内核，与裸机行为完全一致
 - **宿主管理的 Firecracker 后端**：node-agent 负责 tap/snapshot/API 编排，VMM 由宿主 systemd + jailer 以独立 cgroup/chroot 运行；快照落持久状态 EBS，**默认再上传 S3 作权威副本(可关,`SNAPSHOT_TO_S3`)**，跨机恢复可从 S3 下载或靠 EBS 卷幸存（见下方"快照落盘与跨机恢复"说明）
 - **控制面 / 数据面分离**：控制面固定在 On-Demand Graviton system 节点；Firecracker 数据面独占带 taint 的 sandbox 节点，可使用裸金属实例，或支持嵌套虚拟化的 Intel x86 实例（当前默认 `i7i.8xlarge`）；[异构节点池真机 E2E 已通过](docs/控制面数据面分离-i7i真机测试报告-2026-08-11.md)
-- **快照驱动成本控制**：空闲沙盒快照挂起释放内存，访问时 ~1.2s 恢复
+- **快照驱动成本控制**：空闲沙盒快照挂起释放内存；同机恢复 c6g.metal 实测亚秒~1.2s（暖池 claim 0.13s），i7i 严格 e2e（含 vsock 恢复）3.5~10s
 - **Fly Machines 风格 API**：create/wait/suspend/resume/exec/locate，幂等键、乐观锁、capability 模型
-- **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key
+- **凭据零进沙盒**：Bedrock 凭据仅在 LiteLLM Pod 的 IRSA 角色，沙盒永远看不到真实 key（网关已部署并在集群内验证；把 LiteLLM 地址 / per-sandbox 虚拟 key 注入 guest 的接线尚未实现，`POST /sandboxes` 的 `env` 字段当前为 no-op）
 - **平台可观测性**：低基数 Prometheus 指标、CloudWatch 集中 JSON 日志、OpenTelemetry/X-Ray 跨组件 tracing、5 类告警、8 面板 Dashboard、快照 SHA-256 校验；支持 AMP remote-write 与 AMG 自动配置
 
 ### 适用场景
@@ -85,7 +85,7 @@ root 可绑 80 端口、dnf 装包、嵌套 docker            ✅ 完整 root �
 | **合计（sandbox spot + system On-Demand，目标模式）** | | **~$751/月** |
 
 > **spot 是本平台的核心成本模型**：c6g.metal spot 约为按需的 ~29%（实测 us-east-1 各 AZ $0.65–$0.74/hr，2026-07 查询），
-> spot 被回收时靠快照疏散 + 跨机恢复保住内存状态（见下方 50 满载实测）。**spot 价格实时浮动**，以实际报价为准。
+> spot 被回收时靠快照疏散 + 跨机恢复保住内存状态（能力已在下方 50 满载实测中验证；全自动编排闭环尚未完成，见"快照落盘与跨机恢复"）。**spot 价格实时浮动**，以实际报价为准。
 > 若不用 spot，按需可购 1 年期 Savings Plan 降约 42%。实际价格请以 [AWS Pricing Calculator](https://calculator.aws) 为准。
 > 生产节点池应分开采购：system 节点始终使用 On-Demand；仅 sandbox 数据节点在中断恢复链路闭环后使用 Spot。
 
@@ -144,12 +144,33 @@ Savings Plan、All Upfront**；“等效月价”是一次性预付总额除以 
 | Savings Plan + 快照回收 | — | 同上 | **~$2–3/沙盒·月** |
 
 - `400+` 和对应摊算成本来自单 VM 空载足迹与并发假设推导，尚未完成单节点 400 台满载实测。
-- **resume 延迟 1.2s 实测**，用户无感知，快照挂起对用户透明
+- **同机 resume 延迟实测亚秒~1.2s（c6g.metal）/ 3.5~10s（i7i 严格 e2e，含 vsock 恢复）**，快照挂起对用户透明
 - 单台机器即可支撑小规模 SaaS，多台横向扩展线性增长（节点间无共享状态）
 
 > **超卖（vCPU/内存 Overcommit）可进一步摊薄成本：** Firecracker microVM 支持 vCPU 超售——空闲沙盒几乎不消耗 CPU，活跃沙盒又是突发型负载。实测空载每 VM 实际驻留仅 ~50 MB（远低于分配的 1.5 GiB），这意味着可以按"分配值"超配、以"实际驻留"来装箱。结合快照空闲回收，实际可承载的沙盒数远高于内存物理限制所推算的数字，每沙盒摊算成本可以进一步降低。具体超售比例取决于业务负载特征，建议通过压测确定。
 
 > 与 Fly.io 的详细成本对比（1000 沙盒场景，含带宽与非计算费用分析）见 **[docs/cost-comparison.md](docs/cost-comparison.md)**。
+
+#### 2.5 内存回收：virtio-balloon（让内存超分不随时间失效）
+
+内存超分要靠"按实际驻留装箱"，可宿主并不知道 guest 里哪些内存是可以丢的：guest 显示"用了 90%"，大部分可能只是 page cache。平台给每个 microVM 默认挂 virtio-balloon，让 **guest 自己挑最便宜的页交还宿主**，不需要宿主盲目换页：
+
+| 机制 | 作用 | 默认 |
+|---|---|---|
+| **Free page reporting** | guest 真正释放的内存（进程退出、删文件）持续还给宿主 | 开 |
+| **气球统计** | guest 每 5 s 上报 MemAvailable、page cache、major fault，宿主据此决策并上报指标 | 开（boot 前配置） |
+| **压力驱动充气** | sbx.slice 使用率越过 80% 时，按 guest 自报的可用内存充气，回收 FPR 拿不走的 **page cache**；空闲 VM 优先；降到 65% 以下再慢慢放气 | 开 |
+| **安全阀** | 每 VM 保底 max(256 MiB, 10%)；guest major fault 激增、swap-in 或 `deflate_on_oom` 触发时立即放气并冷却 | 开 |
+
+**为什么值得开（真机实测，m8i.2xlarge，[报告](docs/balloon-内存回收-真机测试报告-2026-11-09.md)）：**
+
+- **FPR 管不到 page cache，充气能管**：一个 4 GiB 沙盒攒了 3.3 GiB 文件缓存，只靠 FPR，宿主一直为它付 3.5 GiB；充气 **1 秒回收 2.6 GiB**，放气后也不回涨。
+- **整机不再长时间 swap**：8 个沙盒同时攒缓存，不开控制器时宿主把 guest 缓存换进 zram，**5.1 GiB、持续 126 s**，slice 使用率 91%；开启后持续阶段使用率压到 **65%**，换出降到约 **1 GiB**、超过 1 GiB 的时长只有 4 到 10 s，0 OOM，最多回收 15 到 19 GiB。突发写入的瞬间仍会顶到上限（exec 偶发卡顿几十秒，开关两种情况都有），由 zram 兜底。
+- **guest 要内存时不会被饿死**：气球充满后 guest 突然申请 2.5 GiB，申请成功，0 OOM，控制器逐步放气让路。
+- **快照兼容**：充气状态下 suspend/resume，内存 sha256 一致，气球状态和统计都保留。
+- **可观测**：`fc_balloon_*` 和 `fcnode_vmm_*` 低基数指标，`GET /balloon/status` 可以看到每个 VM 的 guest 可用内存、缓存，以及宿主侧 anon / file。
+
+> 代价与边界：被回收的是 guest 的冷缓存，之后重读文件会慢一些（实测 2.5 s → 4.7 s）；高低水位可以通过 `balloon_reclaim_high` / `balloon_reclaim_low` 调。气球依赖 guest 驱动配合，**只做优化、不做准入**，硬保障仍是 `sbx.slice` MemoryMax + zram。free page hinting 因 Firecracker 标注存在内存损坏竞态而不启用；Full 快照会写满整块内存，所以不做"打快照前充气"。
 
 #### 3. 暖池（Warm Pool）：create 永远秒级，冷启动对用户透明
 
@@ -282,7 +303,7 @@ DynamoDB 保留为 REST/Portal 兼容投影、幂等索引、事件、活跃信�
 | **交互式 Web 终端 / 文件传输** | ✅ Portal 内置(PTY-over-WS + base64 over exec) | ✅ | 部分 | ❌ |
 | **24×7 长驻** | ✅ | ✅ | ✅ | ❌ 有 TTL |
 | **快照 suspend/resume** | ✅ 实测 1.2s | ✅ | ✅ | ❌ |
-| **凭据隔离** | ✅ LiteLLM IRSA（已落地）| ✅ | ✅ | N/A |
+| **凭据隔离** | ✅ LiteLLM IRSA 网关（集群内已验证；guest 内接线待实现）| ✅ | ✅ | N/A |
 | **控制面自愈** | ✅ reconcile + leader + 心跳发现 | ✅ ~20s sync loop | ✅ 去中心化 flyd | ✅ 托管 |
 | **可观测性** | ✅ Prometheus/Alertmanager/Grafana；可选 AMP + AMG | 托管 | 托管 | CloudWatch |
 | **数据主权** | ✅ 数据留 AWS 账号内 | ❌ 第三方 | ❌ 第三方 | ✅ |
@@ -428,7 +449,7 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 - 状态存储：DynamoDB（claude-sbx-sandboxes / events / tap-idx / nodes / locks）
 - 高可用编排：控制面 leader-only reconcile loop（对账自愈）+ node-agent 心跳注册表 + DynamoDB leader 锁
 - 凭据隔离：LiteLLM（litellm namespace）持有 Bedrock IRSA，沙盒无凭据
-- 快照：持久状态 EBS（base + Diff 增量内存快照），spot 疏散跨机恢复
+- 快照：持久状态 EBS（base + Diff 增量内存快照），默认再上传 S3（SNAPSHOT_TO_S3）；spot 疏散为 opt-in（RECLAIM_AUTO_EVACUATE，默认 DRY-RUN），跨机恢复为半自动（手动 attach 卷 / 触发 resume）
 - 可观测性：monitoring namespace 的 Prometheus/Alertmanager/Grafana；可选 AMP + AMG
 
 常见运维操作：
@@ -470,16 +491,19 @@ health=`OK` 且临时账号残留为 0。部署参数和验证命令见
 ### 本地冒烟测试
 
 ```bash
-# 无需 AWS，本地直接跑
+# 无需 AWS，本地直接跑。在仓库根目录执行；Python 版本见 .python-version(3.12，与镜像一致)
 python3 -m pip install -r requirements-dev.txt
-python3 sandbox-api/smoke_test.py
-python3 sandbox-api/crd_test.py
+python3 scripts/check_stdlib_shadowing.py   # 先查有没有与标准库同名的模块(pre-commit 也会跑)
+python3 -m sandbox_api.smoke_test           # 控制面按包导入(-m)，和容器里的启动方式一致
+python3 -m sandbox_api.crd_test
+python3 -m sandbox_api.recovery_test
+python3 -m sandbox_api.node_agent_auth_test
 python3 node-agent/observability_test.py
 python3 node-agent/reclaim_test.py
-python3 sandbox-api/recovery_test.py
-PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
-# 期望：控制面 57/57 + CRD/operator 16/16 + node-agent 22/22
-#      + reclaim 13/13 + recovery 13/13 + node-agent auth 2/2 PASS
+python3 node-agent/balloon_test.py
+python3 node-agent/pinning_test.py
+# 期望(Python 3.12)：控制面 63/63 + CRD/operator 16/16 + recovery 15/15 + node-agent auth 3/3
+#      + observability 23/23 + reclaim 13/13 + balloon 26/26 + pinning 10/10 PASS
 ```
 
 ---
@@ -516,7 +540,7 @@ PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
 | 控制面 / 数据面分离 | **PASS** | `2 × m7g.large` system + `1 × i7i.8xlarge` sandbox |
 | i7i x86 生命周期 | **ALL TESTS PASSED** | create/exec/suspend/resume/post-resume exec/destroy/auth |
 | FC exec（vsock 通道） | rc=0，guest kernel 5.10.223 | c6g.metal，exec 在 microVM 内执行 |
-| FC suspend→resume | 快照落持久 EBS（不传 S3）/ resume 亚秒 | 内存态跨快照精确保留（数据保真已验证）|
+| FC suspend→resume | 快照落持久 EBS，默认再上传 S3（`SNAPSHOT_TO_S3`）/ 同机 resume 亚秒 | 内存态跨快照精确保留（数据保真已验证）|
 | 节点心跳注册 | 每 30s 写 nodes 表，`_pick_node` 从表选点 | 替换硬编码 FC_NODES |
 | leader 故障转移 | 删 leader pod → 另一副本秒级接管（owner 转移）| DynamoDB 条件写租约 + rvn |
 | reconcile 漂移检测 | running 但 runtime 消失 → 自动标 orphaned | 后台 20s 对账 |
@@ -572,4 +596,4 @@ PYTHONPATH=. python3 sandbox-api/node_agent_auth_test.py
 
 ---
 
-*本项目是生产级参考实现，可作为在 AWS 上自建 Agent 沙盒平台的基础。*
+*本项目是编排层已真机验证的参考实现，可作为在 AWS 上自建 Agent 沙盒平台的基础；面向不可信租户上线前，请先完成 [docs/fc-生产就绪-gap分析.md](docs/fc-生产就绪-gap分析.md) 中的安全加固项（jailer、出口策略、node-agent 鉴权、租户配额）。*

@@ -92,6 +92,37 @@ FCNODE_SCRATCH = Gauge(
     "Sandbox state filesystem bytes by capacity kind.",
     ("node", "kind"),
 )
+# virtio-balloon 内存回收(低基数:按节点聚合,不带 sandbox 标签)
+FC_BALLOON_MEMORY = Gauge(
+    "fc_balloon_memory_bytes",
+    "Balloon and guest memory summed over running VMs on this node.",
+    ("node", "kind"),  # kind=target|actual|guest_available|guest_cache|guest_free
+)
+FC_BALLOON_VMS = Gauge(
+    "fc_balloon_vms",
+    "Running VMs by balloon statistics availability.",
+    ("node", "stats"),  # stats=ok|unavailable
+)
+FC_BALLOON_MODE = Gauge(
+    "fc_balloon_reclaim_active",
+    "1 when the balloon controller is in reclaim mode (host memory pressure).",
+    ("node",),
+)
+FC_BALLOON_ADJUSTMENTS = Counter(
+    "fc_balloon_adjustments_total",
+    "Balloon target changes issued by the controller.",
+    ("node", "reason"),  # reclaim|release|distress|oom|stall|manual
+)
+FCNODE_VMM_MEMORY = Gauge(
+    "fcnode_vmm_memory_bytes",
+    "sbx.slice (all Firecracker VMMs) cgroup memory.",
+    ("node", "kind"),  # kind=current|max|swap
+)
+FCNODE_VMM_MEMORY_PRESSURE = Gauge(
+    "fcnode_vmm_memory_pressure_some_avg10",
+    "sbx.slice memory PSI some avg10 (percent).",
+    ("node",),
+)
 NODE_HEARTBEAT_ERRORS = Counter(
     "node_heartbeat_errors_total",
     "Failed node heartbeat writes.",
@@ -310,6 +341,30 @@ def refresh_node_metrics(
         max(0, scratch_total_bytes - scratch_free_bytes)
     )
     FCNODE_SCRATCH.labels(node, "total").set(scratch_total_bytes)
+
+
+def refresh_balloon_metrics(node: str, snapshot: dict) -> None:
+    """snapshot 来自 main._BALLOON_STATE(控制器每 tick 刷新)。"""
+    totals = snapshot.get("totals") or {}
+    for kind in ("target", "actual", "guest_available", "guest_cache",
+                 "guest_free"):
+        FC_BALLOON_MEMORY.labels(node, kind).set(int(totals.get(kind, 0)))
+    FC_BALLOON_VMS.labels(node, "ok").set(int(snapshot.get("vms_with_stats", 0)))
+    FC_BALLOON_VMS.labels(node, "unavailable").set(
+        int(snapshot.get("vms_without_stats", 0))
+    )
+    FC_BALLOON_MODE.labels(node).set(1 if snapshot.get("mode") == "reclaim" else 0)
+    host = snapshot.get("host") or {}
+    FCNODE_VMM_MEMORY.labels(node, "current").set(int(host.get("current_bytes", 0)))
+    FCNODE_VMM_MEMORY.labels(node, "max").set(int(host.get("max_bytes", 0)))
+    FCNODE_VMM_MEMORY.labels(node, "swap").set(int(host.get("swap_bytes", 0)))
+    FCNODE_VMM_MEMORY_PRESSURE.labels(node).set(
+        float(host.get("psi_some_avg10", 0.0))
+    )
+
+
+def record_balloon_adjustment(node: str, reason: str) -> None:
+    FC_BALLOON_ADJUSTMENTS.labels(node, reason).inc()
 
 
 def metrics_payload() -> tuple[bytes, str]:

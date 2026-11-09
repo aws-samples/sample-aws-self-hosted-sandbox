@@ -1,0 +1,22 @@
+========================================
+  Route A CRD E2E
+========================================
+  ---- CRD, operator, API and unchanged node-agent topology
+deployment "firecracker-operator" successfully rolled out
+deployment "sandbox-control-plane" successfully rolled out
+  PASS node-agent DaemonSet unchanged and ready (1/1)
+  ---- Create through existing POST /sandboxes
+  PASS REST create returned 201 id=f1349704
+  PASS CR desired=Running status.phase=running reason=none
+  ---- Exec through existing API
+  PASS exec still reaches the Firecracker guest
+  ---- Manual suspend through CRD desired state
+  PASS REST suspend contract unchanged
+  PASS CR desired=Suspended status.phase=suspended reason=manual
+  ---- Resume through CRD desired state
+  PASS REST resume contract unchanged
+  PASS CR desired=Running status.phase=running reason=none
+  ---- Delete through CR finalizer
+  PASS REST delete completed and finalizer removed the CR
+========================================
+  CRD E2E: ALL PASSED

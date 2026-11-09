@@ -38,7 +38,7 @@ from sandbox_api.crd import (
     FirecrackerSandboxStore,
     object_from_record,
 )
-from sandbox_api.operator import FirecrackerSandboxOperator
+from sandbox_api.fc_operator import FirecrackerSandboxOperator
 
 
 def _create_tables() -> None:

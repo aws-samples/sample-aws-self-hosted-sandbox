@@ -1,7 +1,8 @@
 # Git Hooks —— AI Code Review + 文档自动同步
 
-提交前由 `pre-commit` 依次完成两件事：
+提交前由 `pre-commit` 依次完成三件事：
 
+0. **标准库同名检查** —— 运行 `scripts/check_stdlib_shadowing.py`，发现与 Python 标准库同名的模块（如 `operator.py`、`queue.py`）即阻断提交。这类文件会在 `python3 dir/x.py` 时遮蔽标准库，导致连 `import json` 都失败（`sandbox-api/operator.py` 曾因此让控制面单测全部导入失败，已改名为 `fc_operator.py`）。任何 Python 3 版本都能跑（3.10+ 用 `sys.stdlib_module_names`，更低版本扫描标准库目录）。
 1. **AI Code Review** —— 用 Claude CLI 审查暂存改动，发现 **严重问题（安全漏洞 / 明确 bug / 误提交密钥）** 时阻断提交。
 2. **文档自动同步** —— 用 Claude CLI 依据本次改动按需同步项目文档，并把更新后的文档重新加入暂存区，随本次提交一起提交。**此步骤永不阻断提交。** 覆盖范围：
    - `README.md`（中文）与 `README.en.md`（English）—— 两个独立文件，同步更新、内容保持一致；

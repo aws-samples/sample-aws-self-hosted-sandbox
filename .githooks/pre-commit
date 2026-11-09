@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # pre-commit hook —— 提交前依次执行：
+#   0) 检查与 Python 标准库同名的模块（发现即阻断提交）；
 #   1) Claude AI code review（发现严重问题时阻断提交）；
 #   2) 依据本次改动自动同步项目文档（README 中/英文 + docs/deploy.md 等，不阻断提交）。
 # 本 hook 位于版本库内的 .githooks/,由 core.hooksPath 生效(运行 scripts/install-hooks.sh 启用)。
@@ -8,6 +9,18 @@
 set -uo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# ---- 0. 与 Python 标准库同名的模块（可阻断，毫秒级）--------------------------
+# operator.py / queue.py 这类文件会在 `python3 dir/x.py` 时遮蔽标准库，导致导入失败。
+PY="$(command -v python3.12 || command -v python3 || true)"
+if [[ -n "$PY" ]]; then
+  "$PY" "$REPO_ROOT/scripts/check_stdlib_shadowing.py" || {
+    echo "[pre-commit] 发现与标准库同名的 Python 模块，已阻断提交（改名后重试）。" >&2
+    exit 1
+  }
+else
+  echo "[pre-commit] 未找到 python3，跳过标准库同名检查。" >&2
+fi
 
 # ---- 1. AI code review（可阻断）---------------------------------------------
 # 允许临时跳过：SKIP_CODE_REVIEW=1 git commit ...

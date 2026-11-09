@@ -17,7 +17,7 @@ sandbox-api/
   smoke_test.py     # 本地冒烟测试(moto mock,无需真实 AWS)
 
 node-agent/
-  main.py           # on-host 执行手(tap/jailer/FC snapshot/S3)
+  main.py           # on-host 执行手(tap/FC/snapshot/S3；jailer 默认关闭 USE_BARE_FC=1)
   Dockerfile        # node-agent 镜像(跟随 sandbox 数据节点架构)
 ```
 
@@ -39,11 +39,16 @@ node-agent/
 ## 本地冒烟测试(无需 AWS)
 
 ```bash
-pip install "moto[dynamodb]" boto3
 cd <project-root>
-python3 sandbox-api/smoke_test.py
+python3 -m pip install -r requirements-dev.txt
+python3 -m sandbox_api.smoke_test
 # 期望: 全部 PASS
 ```
+
+> 本目录不要放与 Python 标准库同名的模块（如 `operator.py`、`queue.py`）。直接执行
+> `python3 sandbox-api/x.py` 时，本目录会排在 `sys.path` 最前面，从而遮蔽标准库。
+> operator 入口已改名为 `fc_operator.py`（`python3 -m sandbox_api.fc_operator`），
+> 检查脚本是 `scripts/check_stdlib_shadowing.py`。
 
 ## 部署到 EKS
 
@@ -95,15 +100,16 @@ bash scripts/e2e_test.sh --api-key "$API_KEY"
 |---|---|---|
 | DYNAMODB_TABLE | sandboxes | 主状态表名 |
 | AWS_REGION | us-east-1 | |
-| SANDBOX_IMAGE | (必填) | 沙盒容器镜像 |
-| LITELLM_URL | http://litellm... | LiteLLM 网关(凭据隔离) |
+| SANDBOX_IMAGE | (必填) | 默认沙盒镜像标识；FC 后端按名归一化为 rootfs 模板(`min`/`web`)，非 `min` 跳过暖池 |
+| LITELLM_URL | http://litellm... | LiteLLM 网关地址（部署配置预留；当前控制面代码未读取，guest 内接线待实现）|
 | SANDBOX_DOMAIN | sbx.example.com | 通配符子域名根 |
-| SNAPSHOT_S3_BUCKET | | rootfs 分发及未来 S3 归档预留；当前快照权威存储是持久 EBS |
+| SNAPSHOT_S3_BUCKET | | 快照 S3 桶：suspend 默认同步上传 snap_dir（`SNAPSHOT_TO_S3=1`），未配桶则仅落持久 EBS；也用于 rootfs 分发 |
+| SNAPSHOT_TO_S3 | 1 | 设 0 则快照只保留在持久 EBS，不上传 S3 |
 | FC_NODES | | 心跳表为空时的 fallback；只填 `sandbox=true` 节点内网 IP |
 | WARM_POOL_SIZE | 5 | 暖池沙盒数 |
 | NODE_AGENT_PORT | 8002 | node-agent 监听端口 |
 | NODE_AGENT_AUTH_KEY / NODE_AGENT_AUTH_KEY_FILE | （必填,Terraform 生成） | 控制面/operator 到 node-agent 的 HMAC-SHA256 密钥(≥32 字节) |
 
 本地测试还应运行 `smoke_test.py`、`crd_test.py`、`recovery_test.py`、
-`node-agent/observability_test.py`、`node-agent/reclaim_test.py` 和
-`node_agent_auth_test.py`；真实 E2E 仍需验证 resume 后 exec、状态保留及节点升级。
+`node_agent_auth_test.py`(均以 `python3 -m sandbox_api.<name>` 运行)，以及
+`node-agent/` 下的 `observability_test.py`、`reclaim_test.py`、`balloon_test.py`、`pinning_test.py`；真实 E2E 仍需验证 resume 后 exec、状态保留及节点升级。

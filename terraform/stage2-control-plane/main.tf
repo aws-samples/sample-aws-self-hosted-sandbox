@@ -144,6 +144,38 @@ variable "balloon_free_page_reporting" {
   description = "新建 microVM 默认挂 virtio-balloon 并开启 free page reporting,让 guest 释放的内存还给宿主(内存超分的前提)。真机实测:关闭时 guest 释放 3GiB 后宿主 RSS 不回落,开启后 10s 内降回 240MiB。"
 }
 
+variable "balloon_stats_interval_s" {
+  type        = number
+  default     = 5
+  description = "virtio-balloon 统计上报周期(秒),0 关闭。guest 上报 MemAvailable/page cache/major fault,是气球控制器决策与 fc_balloon_* 指标的输入。只能在 VM boot 前开启,改动只影响之后新建的 microVM。"
+  validation {
+    condition     = var.balloon_stats_interval_s >= 0 && var.balloon_stats_interval_s <= 60
+    error_message = "balloon_stats_interval_s must be within 0..60."
+  }
+}
+
+variable "balloon_auto_reclaim" {
+  type        = bool
+  default     = true
+  description = "开启宿主内存压力驱动的气球控制器:sbx.slice 使用率越过 balloon_reclaim_high(或 PSI 越过阈值)时按 guest 自报可用内存充气,回收 free page reporting 拿不走的 page cache;降到 balloon_reclaim_low 以下再慢慢放气。关闭时只采集统计、不调整气球。"
+}
+
+variable "balloon_reclaim_high" {
+  type        = number
+  default     = 0.80
+  description = "气球控制器进入回收模式的 sbx.slice memory.current/memory.max 比例(高水位)。"
+}
+
+variable "balloon_reclaim_low" {
+  type        = number
+  default     = 0.65
+  description = "气球控制器退出回收、开始归还内存的比例(低水位);与高水位之间保持不动(滞回)。"
+  validation {
+    condition     = var.balloon_reclaim_low > 0 && var.balloon_reclaim_low < var.balloon_reclaim_high && var.balloon_reclaim_high < 1
+    error_message = "require 0 < balloon_reclaim_low < balloon_reclaim_high < 1."
+  }
+}
+
 variable "vmm_pin_vcpus" {
   type        = bool
   default     = true
@@ -1044,7 +1076,7 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
             value = local.node_agent_allowed_caller_cidrs
           }
           env {
-            name  = "DENIED_CALLER_CIDR"
+            name = "DENIED_CALLER_CIDR"
             # tap_idx<=255 用 172.18.x,>255 映射到 172.19.x(见 node-agent _tap_addresses)
             value = "172.18.0.0/16,172.19.0.0/16"
           }
@@ -1142,6 +1174,22 @@ resource "kubernetes_daemon_set_v1" "node_agent" {
           env {
             name  = "BALLOON_FREE_PAGE_REPORTING"
             value = var.balloon_free_page_reporting ? "1" : "0"
+          }
+          env {
+            name  = "BALLOON_STATS_INTERVAL_S"
+            value = tostring(var.balloon_stats_interval_s)
+          }
+          env {
+            name  = "BALLOON_AUTO_RECLAIM"
+            value = var.balloon_auto_reclaim ? "1" : "0"
+          }
+          env {
+            name  = "BALLOON_RECLAIM_HIGH"
+            value = tostring(var.balloon_reclaim_high)
+          }
+          env {
+            name  = "BALLOON_RECLAIM_LOW"
+            value = tostring(var.balloon_reclaim_low)
           }
           env {
             name  = "VMM_PIN_VCPUS"
